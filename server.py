@@ -59,6 +59,9 @@ CREATE INDEX IF NOT EXISTS idx_dispatched ON tasks(state, dispatched_at);
 -- /status 的近5分計數、來源分佈、最近成功排序都靠這個複合索引，避免全表掃描
 -- （connect() 每次都跑 executescript，既有 DB 重啟後也會自動補上此索引）
 CREATE INDEX IF NOT EXISTS idx_state_updated ON tasks(state, updated_at);
+-- 派工「越舊營收月越優先」：讓 WHERE state='undone' ORDER BY roc_year,roc_month
+-- 直接走索引順序，免 TEMP B-TREE 排序（見 lease）
+CREATE INDEX IF NOT EXISTS idx_undone_age ON tasks(state, roc_year, roc_month);
 """
 
 
@@ -241,15 +244,19 @@ class Store:
         with self._lock:
             conn.execute("BEGIN IMMEDIATE;")
             try:
+                # 惰性回收：先把逾時的 dispatched 全部收回 undone（走 idx_dispatched，很快）。
+                # 拆成獨立 UPDATE（而非塞進 SELECT 的 OR）是為了讓下面的挑選能純走
+                # WHERE state='undone'，靠 idx_undone_age 免 TEMP B-TREE 排序。
+                conn.execute(
+                    "UPDATE tasks SET state='undone', dispatched_at=NULL, worker_id=NULL"
+                    " WHERE state='dispatched'"
+                    "   AND (dispatched_at IS NULL OR dispatched_at < ?)",
+                    (cutoff,))
+                # 挑最舊的 undone（越舊營收月越優先，跨所有股票齊步推進）。
                 rows = conn.execute(
-                    """
-                    SELECT id FROM tasks
-                     WHERE state='undone'
-                        OR (state='dispatched' AND (dispatched_at IS NULL OR dispatched_at < ?))
-                     ORDER BY state='dispatched' DESC, id      -- 逾時的優先撿回
-                     LIMIT ?
-                    """,
-                    (cutoff, n),
+                    "SELECT id FROM tasks WHERE state='undone'"
+                    " ORDER BY roc_year, roc_month, id LIMIT ?",
+                    (n,),
                 ).fetchall()
                 ids = [r["id"] for r in rows]
                 if ids:
@@ -263,7 +270,8 @@ class Store:
                     )
                     batch = conn.execute(
                         f"""SELECT id, stock_id, name, roc_year, roc_month
-                              FROM tasks WHERE id IN ({qmarks})""",
+                              FROM tasks WHERE id IN ({qmarks})
+                             ORDER BY roc_year, roc_month, id""",  # 回傳也照年齡序
                         ids,
                     ).fetchall()
                 else:
