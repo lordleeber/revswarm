@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# 執行期產物（可由 build/init 重建，不進版控）
+revswarm.db
+revswarm.db-wal
+revswarm.db-shm
+*.db
+*.db-wal
+*.db-shm
+revenue_dates.csv
+all.csv
