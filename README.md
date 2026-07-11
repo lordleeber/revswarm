@@ -80,7 +80,8 @@ python3 export.py --out revenue_dates.csv
 |---|---|---|
 | POST | `/lease?n=30&worker=<id>` | 原子租一批任務（`n` 上限 200），順便惰性回收逾時租約 |
 | POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?}]}`；status ∈ success/failed/rate_limited |
-| GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率 |
+| GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
+| GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
 | GET | `/healthz` | 存活探針（免 token）|
 | POST | `/admin/requeue-failed` | 把所有 `failed` 重開成 `undone`，做「最後一輪」（改西元年常能救回）|
 
@@ -160,6 +161,11 @@ python3 worker.py --server http://<server位址>:8000
 
 ### 看進度（任一台）
 
+瀏覽器打開狀態頁（最直覺，會自動更新）：
+```
+http://<server位址>:8000/status?token=<你的 REVSWARM_TOKEN>
+```
+或用終端機看 JSON：
 ```bash
 source .env     # 載入 REVSWARM_TOKEN
 watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server位址>:8000/stats | python3 -m json.tool"

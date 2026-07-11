@@ -20,6 +20,7 @@ endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可�
 """
 
 import argparse
+import html
 import json
 import os
 import sqlite3
@@ -66,6 +67,120 @@ def connect(db_path):
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
+
+
+def derive_stats(by_state, recent_success):
+    """由各 state 計數 + 近 5 分鐘成功數，導出進度/成功率/吞吐/ETA。stats 與 dashboard 共用。"""
+    total = sum(by_state.values())
+    done = by_state.get("success", 0) + by_state.get("failed", 0)
+    rate_per_min = recent_success / 5.0
+    remaining = total - done
+    eta_min = (remaining / rate_per_min) if rate_per_min > 0 else None
+    return {
+        "total": total,
+        "by_state": by_state,
+        "done": done,
+        "progress_pct": round(100.0 * done / total, 2) if total else 0.0,
+        "success": by_state.get("success", 0),
+        "failed": by_state.get("failed", 0),
+        "success_rate_pct": round(
+            100.0 * by_state.get("success", 0) / done, 2) if done else None,
+        "recent_success_5min": recent_success,
+        "throughput_per_min": round(rate_per_min, 1),
+        "eta_min": round(eta_min, 1) if eta_min is not None else None,
+    }
+
+
+_STATUS_CSS = """
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0d1117;color:#c9d1d9;font:15px/1.5 -apple-system,
+ "Segoe UI",Roboto,"Noto Sans TC",sans-serif}
+.wrap{max-width:960px;margin:0 auto;padding:24px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:#8b949e;font-size:13px;margin-bottom:20px}
+.bar{height:26px;background:#161b22;border-radius:6px;overflow:hidden;
+ border:1px solid #30363d}
+.bar > span{display:block;height:100%;background:linear-gradient(90deg,#238636,#2ea043);
+ text-align:right;color:#fff;font-size:12px;line-height:26px;padding-right:8px;
+ white-space:nowrap;min-width:2.5em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+ gap:12px;margin:18px 0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px}
+.card .k{color:#8b949e;font-size:12px}
+.card .v{font-size:22px;font-weight:600;margin-top:2px}
+.v.ok{color:#3fb950}.v.bad{color:#f85149}.v.warn{color:#d29922}.v.dim{color:#8b949e}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #21262d}
+th{color:#8b949e;font-weight:500}
+td.t{color:#8b949e;max-width:280px;overflow:hidden;text-overflow:ellipsis;
+ white-space:nowrap}
+.foot{color:#484f58;font-size:12px;margin-top:22px}
+h2{font-size:15px;color:#c9d1d9;margin:22px 0 4px}
+"""
+
+
+def _humanize_min(m):
+    if m is None:
+        return "—"
+    if m < 60:
+        return f"{m:.0f} 分"
+    if m < 1440:
+        return f"{m / 60:.1f} 小時"
+    return f"{m / 1440:.1f} 天"
+
+
+def render_status_html(d, refresh_sec=10):
+    """把 dashboard() 的資料渲染成自足的深色狀態頁（含 meta refresh 自動更新）。"""
+    esc = html.escape
+    by = d["by_state"]
+    cards = [
+        ("進度", f'{d["progress_pct"]}%', "dim"),
+        ("完成 / 總數", f'{d["done"]} / {d["total"]}', "dim"),
+        ("success", by.get("success", 0), "ok"),
+        ("failed", by.get("failed", 0), "bad"),
+        ("undone", by.get("undone", 0), "dim"),
+        ("dispatched", by.get("dispatched", 0), "warn"),
+        ("成功率", "—" if d["success_rate_pct"] is None else f'{d["success_rate_pct"]}%', "dim"),
+        ("吞吐 / 分", d["throughput_per_min"], "dim"),
+        ("近 5 分成功", d["recent_success_5min"], "dim"),
+        ("預估剩餘", _humanize_min(d["eta_min"]), "dim"),
+    ]
+    cards_html = "".join(
+        f'<div class="card"><div class="k">{esc(str(k))}</div>'
+        f'<div class="v {cls}">{esc(str(v))}</div></div>'
+        for k, v, cls in cards)
+
+    src = d.get("source_counts", {})
+    src_html = " &nbsp;·&nbsp; ".join(
+        f"{esc(str(k))}: <b>{v}</b>" for k, v in sorted(src.items())) or "—"
+
+    rows = d.get("recent", [])
+    rows_html = "".join(
+        f'<tr><td>{esc(r["stock_id"])}</td><td>{esc(r["name"])}</td>'
+        f'<td>{r["roc_year"]}/{r["roc_month"]:02d}</td>'
+        f'<td>{esc(r["announce_date"] or "")}</td>'
+        f'<td>{esc(r["source"] or "")}</td>'
+        f'<td class="t">{esc((r["raw_title"] or "")[:60])}</td></tr>'
+        for r in rows) or '<tr><td colspan="6" class="t">（還沒有成功資料）</td></tr>'
+
+    pct = d["progress_pct"]
+    return f"""<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="{int(refresh_sec)}">
+<title>revswarm status · {pct}%</title><style>{_STATUS_CSS}</style></head>
+<body><div class="wrap">
+<h1>revswarm 爬取進度</h1>
+<div class="sub">每 {int(refresh_sec)} 秒自動更新 · JSON 版見 <code>/stats</code></div>
+<div class="bar"><span style="width:{max(pct, 3)}%">{pct}%</span></div>
+<div class="grid">{cards_html}</div>
+<h2>來源分佈（success）</h2><div class="sub">{src_html}</div>
+<h2>最近成功</h2>
+<table><thead><tr><th>代號</th><th>名稱</th><th>營收月</th><th>公布日</th>
+<th>來源</th><th>標題（provenance）</th></tr></thead><tbody>{rows_html}</tbody></table>
+<div class="foot">revswarm · ts={int(time.time())}</div>
+</div></body></html>"""
 
 
 class Store:
@@ -199,28 +314,31 @@ class Store:
         with self._lock:
             by_state = {r["state"]: r["c"] for r in conn.execute(
                 "SELECT state, COUNT(*) c FROM tasks GROUP BY state")}
-            recent_cut = int(time.time()) - 300
             recent_success = conn.execute(
                 "SELECT COUNT(*) c FROM tasks WHERE state='success' AND updated_at>=?",
-                (recent_cut,)).fetchone()["c"]
-        total = sum(by_state.values())
-        done = by_state.get("success", 0) + by_state.get("failed", 0)
-        rate_per_min = recent_success / 5.0        # 近 5 分鐘成功數 → 吞吐/ETA
-        remaining = total - done
-        eta_min = (remaining / rate_per_min) if rate_per_min > 0 else None
-        return {
-            "total": total,
-            "by_state": by_state,
-            "done": done,
-            "progress_pct": round(100.0 * done / total, 2) if total else 0.0,
-            "success": by_state.get("success", 0),
-            "failed": by_state.get("failed", 0),
-            "success_rate_pct": round(
-                100.0 * by_state.get("success", 0) / done, 2) if done else None,
-            "recent_success_5min": recent_success,
-            "throughput_per_min": round(rate_per_min, 1),
-            "eta_min": round(eta_min, 1) if eta_min is not None else None,
-        }
+                (int(time.time()) - 300,)).fetchone()["c"]
+        return derive_stats(by_state, recent_success)
+
+    def dashboard(self):
+        """/status 用：stats + 來源分佈(q_roc/q_ad) + 最近成功樣本。"""
+        conn = self.conn
+        with self._lock:
+            by_state = {r["state"]: r["c"] for r in conn.execute(
+                "SELECT state, COUNT(*) c FROM tasks GROUP BY state")}
+            recent_success = conn.execute(
+                "SELECT COUNT(*) c FROM tasks WHERE state='success' AND updated_at>=?",
+                (int(time.time()) - 300,)).fetchone()["c"]
+            source_counts = {(r["source"] or "?"): r["c"] for r in conn.execute(
+                "SELECT source, COUNT(*) c FROM tasks WHERE state='success'"
+                " GROUP BY source")}
+            recent = [dict(r) for r in conn.execute(
+                "SELECT stock_id, name, roc_year, roc_month, announce_date, source,"
+                " raw_title, updated_at FROM tasks WHERE state='success'"
+                " ORDER BY updated_at DESC LIMIT 15")]
+        d = derive_stats(by_state, recent_success)
+        d["source_counts"] = source_counts
+        d["recent"] = recent
+        return d
 
     # --- 管理：把所有 failed 重開做「最後一輪」（todo.txt 5.1）----------
     def requeue_failed(self):
@@ -255,11 +373,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, code, text):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _authed(self):
         if not self.token:
             return True     # 未設 token = 本機測試模式
-        got = self.headers.get("Authorization", "")
-        return got == f"Bearer {self.token}"
+        if self.headers.get("Authorization", "") == f"Bearer {self.token}":
+            return True
+        # 瀏覽器看 /status 方便：也接受 ?token=<token>
+        q = parse_qs(urlparse(self.path).query)
+        return q.get("token", [None])[0] == self.token
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -277,9 +406,21 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/healthz":
             return self._send(200, {"ok": True, "ts": int(time.time())})
         if not self._authed():
+            # /status 是給瀏覽器看的，401 也回 HTML 提示怎麼帶 token
+            if u.path == "/status":
+                return self._send_html(
+                    401, "<h3>unauthorized</h3><p>加上 <code>?token=你的TOKEN</code>"
+                    "，或用 header <code>Authorization: Bearer &lt;token&gt;</code>。</p>")
             return self._send(401, {"error": "unauthorized"})
         if u.path == "/stats":
             return self._send(200, self.store.stats())
+        if u.path == "/status":
+            q = parse_qs(u.query)
+            try:
+                refresh = max(2, min(int(q.get("refresh", ["10"])[0]), 300))
+            except ValueError:
+                refresh = 10
+            return self._send_html(200, render_status_html(self.store.dashboard(), refresh))
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -338,6 +479,8 @@ def main():
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"revswarm server 啟動  http://{args.host}:{args.port}  db={args.db}  {auth}")
     print(f"  lease TTL={LEASE_TTL}s  單次 lease 上限={MAX_LEASE}")
+    tok_hint = f"?token={args.token}" if args.token else ""
+    print(f"  狀態頁: http://{args.host}:{args.port}/status{tok_hint}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
