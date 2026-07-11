@@ -319,12 +319,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    revlib.load_env()          # 先載 .env，讓 REVSWARM_TOKEN 免手打
     ap = argparse.ArgumentParser(description="revswarm 工作佇列 server")
     ap.add_argument("--db", default="revswarm.db")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"),
-                    help="Bearer token；預設讀環境變數 REVSWARM_TOKEN，皆無則不驗證")
+                    help="Bearer token；預設讀 .env / 環境變數 REVSWARM_TOKEN，皆無則不驗證")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):

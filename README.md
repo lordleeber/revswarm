@@ -56,15 +56,16 @@ python3 build_stocks.py                      # → stocks.csv (1848/1848)
 # 2. 展開任務到 SQLite（冪等，可重跑補新股）
 python3 init_tasks.py                         # → revswarm.db (134,904 undone)
 
-# 3. 啟動 server（設一組 token 給跨機 worker 用）
-export REVSWARM_TOKEN=$(head -c16 /dev/urandom | base64)
-python3 server.py --host 0.0.0.0 --port 8000  # 讀 $REVSWARM_TOKEN
+# 3. 啟動 server（token 寫在 .env，server 自動讀，不用手打）
+echo "REVSWARM_TOKEN=$(head -c16 /dev/urandom | base64 | tr -d '\n')" > .env
+python3 server.py --host 0.0.0.0 --port 8000  # 自動讀 .env 的 REVSWARM_TOKEN
 
 # 4. 在「每一台」worker 機器上跑（複製 worker.py + revlib.py 過去）
-export REVSWARM_TOKEN=<同上那組>
+echo "REVSWARM_TOKEN=<與 server .env 同一組>" > .env
 python3 worker.py --server http://<SERVER_IP>:8000
 
 # 5. 隨時看進度
+source .env
 curl -s -H "Authorization: Bearer $REVSWARM_TOKEN" http://<SERVER_IP>:8000/stats | python3 -m json.tool
 
 # 6. 匯出研究資料
@@ -100,9 +101,77 @@ worker 偵測到連續 `rate_limited` 會指數退避，超過門檻就判定「
 
 ## 部署（讓多台 worker 連到 server）
 
-- **VPS**：server 放公網 VPS，開 port + 設 `--token`。最簡單。
-- **Tailscale**：server 與 workers 都加入同一 tailnet，用 100.x 內網 IP，免開公網 port（推薦）。
-- **ngrok**：`ngrok http 8000` 臨時對外，把 https URL 給 workers。
+worker **沒有自動探索**，一定要用 `--server http://<位址>:<port>` 明確告訴它 server 在哪。
+所以部署 = 「① 找出 server 的可連位址 → ② 起 server → ③ 每台 worker 指過去」。
+
+三種連法：
+- **Tailscale（推薦）**：server 與 workers 加入同一 tailnet，用 `100.x` IP，跨網路/NAT 都通、免開公網 port。
+- **同區網 LAN**：workers 與 server 在同一區網，用 server 的區網 IP。
+- **VPS / ngrok**：server 放公網 VPS 開 port，或 `ngrok http 8000` 臨時對外把 URL 給 workers。
+
+### ① 找出 server 的可連位址（在 server 機器上跑）
+
+```bash
+tailscale ip -4     # Tailscale IP（100.x）；有裝就優先用這個
+hostname -I         # 所有內網 IP；同區網用其中的區網位址（如 172.x / 192.168.x）
+curl -s ifconfig.me # 公網 IP（僅在有對外開 port 時適用）
+```
+Tailscale IP 是該機器**固定**的位址，記一次即可；tailnet 若開了 MagicDNS 也可直接用主機名
+（`--server http://<hostname>:8000`）。
+
+### ② 起 server（server 機器）
+
+token 寫在 repo 目錄的 **`.env`**（`REVSWARM_TOKEN=...`），server/worker 啟動時自動讀，
+不用每次手打環境變數。`.env` 已被 `.gitignore` 排除、不會進版控。
+
+```bash
+cd /path/to/revswarm
+# 產生 token 寫進 .env（只需一次）
+echo "REVSWARM_TOKEN=$(head -c16 /dev/urandom | base64 | tr -d '\n')" > .env
+cat .env                                        # ← 複製這串 token 給 worker
+
+# 前景跑（Ctrl-C 停）；自動讀 .env
+python3 server.py --host 0.0.0.0 --port 8000
+```
+
+想「關掉終端機也繼續跑」用 tmux（可隨時 attach 回去看即時輸出）：
+```bash
+tmux new -d -s revswarm "cd /path/to/revswarm && python3 server.py --host 0.0.0.0 --port 8000"
+tmux attach -t revswarm            # 回去看畫面（Ctrl-b 再按 d 脫離，server 繼續跑）
+tmux kill-session -t revswarm      # 要停止 server 時
+```
+`--host 0.0.0.0` 是關鍵：監聽所有介面（含 Tailscale/區網），不是只綁 `127.0.0.1`。
+
+### ③ 每台 worker（其他機器）
+
+```bash
+# 複製 worker 需要的兩個檔（用 scp 從 server 拉，或任何方式）
+mkdir -p ~/revswarm && cd ~/revswarm
+scp <user>@<server位址>:/path/to/revswarm/worker.py .
+scp <user>@<server位址>:/path/to/revswarm/revlib.py .
+
+# token 寫進 .env（與 server 同一組），worker 自動讀
+echo "REVSWARM_TOKEN=<貼上 server 那串 token>" > .env
+
+curl http://<server位址>:8000/healthz          # 回 {"ok":true,...} 才代表連得到
+python3 worker.py --server http://<server位址>:8000
+```
+多台 worker 就在每台重複本步驟（多機 = 多 IP，分攤 Yahoo 封鎖）。
+
+### 看進度（任一台）
+
+```bash
+source .env     # 載入 REVSWARM_TOKEN
+watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server位址>:8000/stats | python3 -m json.tool"
+```
+
+### 故障排除
+
+| 症狀 | 原因 / 解法 |
+|---|---|
+| worker 回 `401` | 兩邊 `.env` 的 `REVSWARM_TOKEN` 不一致；worker 的要跟 server 那組一模一樣 |
+| `curl /healthz` 連不到 | server 沒加 `--host 0.0.0.0`；或 worker 不在同一 tailnet（`tailscale status` 看得到 server 嗎）；或防火牆擋了 port |
+| worker 一直印 `×`（rate_limited） | 該機 IP 被 Yahoo 擋；worker 會自動退避長睡，屬正常。多開不同網路的 worker 分攤 |
 
 ⚠️ 大量爬 Yahoo 可能違反其 ToS，也會招致更強封鎖。**務必節制、分散、加延遲。**
 

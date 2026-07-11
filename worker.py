@@ -200,9 +200,11 @@ def run(args):
 
 
 def main():
+    revlib.load_env()          # 先載 .env，讓 REVSWARM_TOKEN 免手打
     ap = argparse.ArgumentParser(description="revswarm worker")
     ap.add_argument("--server", required=True, help="server base URL, 如 http://1.2.3.4:8000")
-    ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"))
+    ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"),
+                    help="Bearer token；預設讀 .env / 環境變數 REVSWARM_TOKEN")
     ap.add_argument("--worker-id", default=None, help="預設 hostname-pid")
     ap.add_argument("--batch", type=int, default=30, help="每次租多少筆")
     ap.add_argument("--delay", type=float, default=3.0, help="每筆任務間基礎延遲秒")

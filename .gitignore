@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 
+# 秘密：token 放這，別進版控
+.env
+
 # 執行期產物（可由 build/init 重建，不進版控）
 revswarm.db
 revswarm.db-wal

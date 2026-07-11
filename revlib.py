@@ -9,7 +9,43 @@ server 與 worker 都依賴這裡的窗邏輯，確保「worker 抓到的日期�
 純函式、只用標準庫，沒有網路副作用；worker 的抓取(curl)放在 worker.py。
 """
 
+import os
 import re
+
+
+# --- .env 自動載入 ---------------------------------------------------------
+def load_env(path=None):
+    """
+    把 .env（每行 KEY=VALUE）載入 os.environ，方便 server/worker 免打一長串環境變數。
+    - 不覆蓋「已存在」的環境變數（顯式 export 或 --token 仍優先）。
+    - 找不到檔案就靜默略過。支援 # 註解、export 前綴、單/雙引號。
+    - 預設在「cwd」與「本檔所在目錄」各找一個 .env。
+    """
+    if path:
+        candidates = [path]
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [os.path.join(os.getcwd(), ".env"), os.path.join(here, ".env")]
+    seen = set()
+    for p in candidates:
+        p = os.path.abspath(p)
+        if p in seen or not os.path.isfile(p):
+            continue
+        seen.add(p)
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+
 
 # --- 任務範圍設定 ----------------------------------------------------------
 # 民國 109/1 ~ 115/1（含），= 73 個月。roc_* 指「營收所屬」月份。
