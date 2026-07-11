@@ -51,11 +51,15 @@ def fetch(query, timeout=25):
              "--data-urlencode", f"p={query}",
              "-A", UA,
              "-H", "Accept-Language: zh-TW,zh;q=0.9"],
-            capture_output=True, text=True, timeout=timeout + 8,
+            # Yahoo 頁是 UTF-8：務必明確指定，否則 Windows 會用系統 locale
+            # (如 cp950) 解碼 → UnicodeDecodeError、stdout 變 None。errors=replace
+            # 讓少數壞位元組不致中斷解析。
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout + 8,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None, False
-    if r.returncode != 0:
+    if r.returncode != 0 or r.stdout is None:
         return None, False
     out = r.stdout
     # 拆出最後一行的 http_code
