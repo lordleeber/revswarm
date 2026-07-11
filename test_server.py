@@ -107,5 +107,32 @@ class TestDashboardQuery(unittest.TestCase):
         self.assertEqual(d["recent"][0]["stock_id"], "1301")
 
 
+class TestAuth(unittest.TestCase):
+    TOK = "s3cret"
+
+    def test_no_token_configured_allows_all(self):
+        self.assertTrue(server.check_auth(None, "", None, False))
+        self.assertTrue(server.check_auth("", "whatever", "x", True))
+
+    def test_bearer_header(self):
+        self.assertTrue(server.check_auth(self.TOK, f"Bearer {self.TOK}", None, False))
+        self.assertFalse(server.check_auth(self.TOK, "Bearer wrong", None, False))
+        self.assertFalse(server.check_auth(self.TOK, "", None, False))
+
+    def test_query_token_only_when_allowed(self):
+        # 唯讀 GET：allow_query_token=True 才接受 ?token=
+        self.assertTrue(server.check_auth(self.TOK, "", self.TOK, True))
+        self.assertFalse(server.check_auth(self.TOK, "", "wrong", True))
+        # 會改狀態的 POST：allow_query_token=False，即使 token 正確也拒絕
+        self.assertFalse(server.check_auth(self.TOK, "", self.TOK, False))
+
+    def test_clamp_refresh(self):
+        self.assertEqual(server.clamp_refresh("10"), 10)
+        self.assertEqual(server.clamp_refresh("1"), 5)      # 下限 5
+        self.assertEqual(server.clamp_refresh("9999"), 300)  # 上限 300
+        self.assertEqual(server.clamp_refresh("abc"), 10)    # 非數字 → 預設
+        self.assertEqual(server.clamp_refresh(None), 10)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

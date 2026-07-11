@@ -20,6 +20,7 @@ endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可�
 """
 
 import argparse
+import hmac
 import html
 import json
 import os
@@ -55,6 +56,9 @@ CREATE TABLE IF NOT EXISTS tasks(
 );
 CREATE INDEX IF NOT EXISTS idx_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_dispatched ON tasks(state, dispatched_at);
+-- /status 的近5分計數、來源分佈、最近成功排序都靠這個複合索引，避免全表掃描
+-- （connect() 每次都跑 executescript，既有 DB 重啟後也會自動補上此索引）
+CREATE INDEX IF NOT EXISTS idx_state_updated ON tasks(state, updated_at);
 """
 
 
@@ -67,6 +71,36 @@ def connect(db_path):
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
+
+
+def _tok_eq(a, b):
+    """常數時間比較，避免 token 比對的計時側信道。"""
+    return a is not None and b is not None and hmac.compare_digest(str(a), str(b))
+
+
+def check_auth(configured_token, auth_header, query_token, allow_query_token):
+    """
+    純函式的驗證判斷，方便單元測試。
+    - 未設 token → 一律放行（本機測試模式）。
+    - 接受 header `Authorization: Bearer <token>`。
+    - 只有 allow_query_token=True（唯讀 GET）才接受 `?token=<token>`；
+      會改狀態的 POST 一律不吃查詢字串 token，避免 token 經 URL/log/Referer 外洩。
+    """
+    if not configured_token:
+        return True
+    if auth_header.startswith("Bearer ") and _tok_eq(auth_header[len("Bearer "):], configured_token):
+        return True
+    if allow_query_token and _tok_eq(query_token, configured_token):
+        return True
+    return False
+
+
+def clamp_refresh(raw, default=10):
+    """/status 自動刷新秒數：下限 5（避免輪詢風暴與 worker 搶鎖）、上限 300。"""
+    try:
+        return max(5, min(int(raw), 300))
+    except (ValueError, TypeError):
+        return default
 
 
 def derive_stats(by_state, recent_success):
@@ -381,14 +415,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _authed(self):
-        if not self.token:
-            return True     # 未設 token = 本機測試模式
-        if self.headers.get("Authorization", "") == f"Bearer {self.token}":
-            return True
-        # 瀏覽器看 /status 方便：也接受 ?token=<token>
+    def _authed(self, allow_query_token=False):
+        # allow_query_token 只在唯讀 GET 開啟；POST（會改狀態）維持只吃 header。
         q = parse_qs(urlparse(self.path).query)
-        return q.get("token", [None])[0] == self.token
+        return check_auth(self.token, self.headers.get("Authorization", ""),
+                          q.get("token", [None])[0], allow_query_token)
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -405,7 +436,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/healthz":
             return self._send(200, {"ok": True, "ts": int(time.time())})
-        if not self._authed():
+        # GET 皆唯讀，允許瀏覽器用 ?token= 方便看 /status、/stats
+        if not self._authed(allow_query_token=True):
             # /status 是給瀏覽器看的，401 也回 HTML 提示怎麼帶 token
             if u.path == "/status":
                 return self._send_html(
@@ -416,10 +448,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self.store.stats())
         if u.path == "/status":
             q = parse_qs(u.query)
-            try:
-                refresh = max(2, min(int(q.get("refresh", ["10"])[0]), 300))
-            except ValueError:
-                refresh = 10
+            refresh = clamp_refresh(q.get("refresh", ["10"])[0])
             return self._send_html(200, render_status_html(self.store.dashboard(), refresh))
         return self._send(404, {"error": "not found"})
 
@@ -479,7 +508,8 @@ def main():
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"revswarm server 啟動  http://{args.host}:{args.port}  db={args.db}  {auth}")
     print(f"  lease TTL={LEASE_TTL}s  單次 lease 上限={MAX_LEASE}")
-    tok_hint = f"?token={args.token}" if args.token else ""
+    # 不把 token 明文印進 log；請自行接 ?token=<你的 REVSWARM_TOKEN>
+    tok_hint = "?token=<REVSWARM_TOKEN>" if args.token else ""
     print(f"  狀態頁: http://{args.host}:{args.port}/status{tok_hint}")
     try:
         httpd.serve_forever()
