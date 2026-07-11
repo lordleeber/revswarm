@@ -78,7 +78,7 @@ python3 export.py --out revenue_dates.csv
 
 | method | path | 說明 |
 |---|---|---|
-| POST | `/lease?n=30&worker=<id>` | 原子租一批任務（`n` 上限 200），順便惰性回收逾時租約 |
+| POST | `/lease?n=30&worker=<id>` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約 |
 | POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?}]}`；status ∈ success/failed/rate_limited |
 | GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
 | GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |

@@ -107,6 +107,69 @@ class TestDashboardQuery(unittest.TestCase):
         self.assertEqual(d["recent"][0]["stock_id"], "1301")
 
 
+class TestLeaseOrder(unittest.TestCase):
+    """派工排序：越舊營收月越優先；逾時 dispatched 會被回收並依年齡排入。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _ins(self, stock, ry, rm, state="undone", dispatched_at=None):
+        self.store.conn.execute(
+            "INSERT INTO tasks(stock_id,name,roc_year,roc_month,state,dispatched_at,"
+            "updated_at) VALUES(?,?,?,?,?,?,0)", (stock, "測", ry, rm, state, dispatched_at))
+
+    def test_oldest_first_regardless_of_insert_order(self):
+        # 故意「新月份先插入」，使 id 順序與年齡相反；派工仍須最舊優先。
+        for ry, rm in [(115, 1), (112, 6), (110, 1), (109, 3), (109, 1), (109, 2)]:
+            self._ins("X", ry, rm)
+        self.store.conn.commit()
+        batch = self.store.lease(3, "w")
+        got = [(t["roc_year"], t["roc_month"]) for t in batch]
+        self.assertEqual(got, [(109, 1), (109, 2), (109, 3)])
+
+    def test_same_month_across_stocks_before_next_month(self):
+        # 兩檔的 109/1 都要排在任何 109/2 之前（齊步推進）。
+        self._ins("A", 109, 2)
+        self._ins("A", 109, 1)
+        self._ins("B", 109, 1)
+        self.store.conn.commit()
+        batch = self.store.lease(2, "w")
+        self.assertTrue(all(t["roc_month"] == 1 for t in batch))
+
+    def test_timed_out_dispatched_reclaimed(self):
+        # 一筆最舊的 109/1 卡在逾時 dispatched → lease 應回收並優先派出。
+        self._ins("A", 110, 1)                    # 較新的 undone
+        self._ins("A", 109, 1, state="dispatched",
+                  dispatched_at=int(time.time()) - 700)   # 逾時（>600s）
+        self.store.conn.commit()
+        batch = self.store.lease(1, "w")
+        self.assertEqual((batch[0]["roc_year"], batch[0]["roc_month"]), (109, 1))
+
+    def test_active_lease_not_reclaimed(self):
+        # 未逾時的 dispatched（剛派出去、還在租約內）絕不可被回收/重派，
+        # 否則兩隻 worker 會拿到同一筆 → 雙重派工。這裡守的就是那條線。
+        self._ins("A", 109, 1, state="dispatched",
+                  dispatched_at=int(time.time()))          # 新鮮租約（未逾時）
+        self._ins("A", 110, 1)                             # 另有一筆 undone
+        self.store.conn.commit()
+        batch = self.store.lease(5, "w2")
+        # 只應拿到 110/1；109/1 仍鎖在有效租約，不得因「最舊」被搶走
+        self.assertEqual([(t["roc_year"], t["roc_month"]) for t in batch], [(110, 1)])
+        st = self.store.conn.execute(
+            "SELECT state FROM tasks WHERE roc_year=109 AND roc_month=1").fetchone()[0]
+        self.assertEqual(st, "dispatched")
+
+
 class TestAuth(unittest.TestCase):
     TOK = "s3cret"
 
