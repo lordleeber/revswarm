@@ -13,3 +13,8 @@ revswarm.db-shm
 *.db-shm
 revenue_dates.csv
 all.csv
+
+# MOPS 交叉驗證產物（可由 mops_validate.py 重建）
+mops_baseline.csv
+mops_baseline.csv.done
+mops_validation.csv

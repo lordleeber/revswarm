@@ -44,6 +44,7 @@
 | `worker.py` | 爬蟲 worker（curl --http1.1、民國+西元雙查、窗過濾、退避）|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
 | `export.py` | 把 DB 的 success 匯出成研究用 CSV |
+| `mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
 
 **零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `worker.py` + `revlib.py`。
 
@@ -187,6 +188,22 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 - 想擴 worker：多開機器/IP 即可，任務佇列會自動分配、不重派（原子租約已驗證 8 併發 0 重複）。
 - 卡在 `dispatched` 的（worker 掛了）10 分鐘後自動回收，不用手動處理。
 - 全部跑完後 `failed` 那批可 `POST /admin/requeue-failed` 再掃一輪，改抓西元年常能救回。
+
+## 交叉驗證（MOPS，選配）
+
+Yahoo 是唯一資料源；MOPS「歷史重大訊息」(t05st01) 只涵蓋約 32 家自願揭露月營收的公司，
+但那些是**官方申報日、精確到時分**，是最高信度的黃金基準。`mops_validate.py` 拿它來抽驗 Yahoo：
+
+```bash
+python3 mops_validate.py                       # 驗 revswarm 目前已成功的股票
+python3 mops_validate.py --codes 2330 2454 1301 6505
+python3 mops_validate.py --codes-file data/active_stocks.txt   # 建全量基準(建議 tmux)
+```
+
+只讀 `revswarm.db`（不干擾線上爬取），MOPS 結果快取到 `mops_baseline.csv`（可續跑），
+逐筆比對寫入 `mops_validation.csv`，並印出：一致率、不一致清單（Yahoo 可能抓錯）、
+以及「MOPS 有、Yahoo 卻判 failed」的**可回收**案例（可搭 `/admin/requeue-failed` 重掃）。
+> 實測抽驗台積電/台塑/聯發科等，重疊月份與 MOPS 官方申報日 **100% 一致**。
 
 ## 已驗證（端到端小規模測試）
 
