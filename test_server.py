@@ -155,6 +155,20 @@ class TestLeaseOrder(unittest.TestCase):
         batch = self.store.lease(1, "w")
         self.assertEqual((batch[0]["roc_year"], batch[0]["roc_month"]), (109, 1))
 
+    def test_active_lease_not_reclaimed(self):
+        # 未逾時的 dispatched（剛派出去、還在租約內）絕不可被回收/重派，
+        # 否則兩隻 worker 會拿到同一筆 → 雙重派工。這裡守的就是那條線。
+        self._ins("A", 109, 1, state="dispatched",
+                  dispatched_at=int(time.time()))          # 新鮮租約（未逾時）
+        self._ins("A", 110, 1)                             # 另有一筆 undone
+        self.store.conn.commit()
+        batch = self.store.lease(5, "w2")
+        # 只應拿到 110/1；109/1 仍鎖在有效租約，不得因「最舊」被搶走
+        self.assertEqual([(t["roc_year"], t["roc_month"]) for t in batch], [(110, 1)])
+        st = self.store.conn.execute(
+            "SELECT state FROM tasks WHERE roc_year=109 AND roc_month=1").fetchone()[0]
+        self.assertEqual(st, "dispatched")
+
 
 class TestAuth(unittest.TestCase):
     TOK = "s3cret"
