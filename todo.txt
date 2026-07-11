@@ -1,0 +1,267 @@
+================================================================================
+ revswarm — 分散式爬蟲：收集台股「每月營收公布日期」
+ handoff / todo  (建立於 2026-07-11，承接前一段探索對話)
+================================================================================
+
+這份文件是自足的交接文件。新對話從這裡開始即可，不需要前面的脈絡。
+包含：專案目標、資料源探索的結論(重要,別重走冤枉路)、可直接用的爬取配方、
+架構設計(server+worker)、schema/API、必做的補強、建置步驟、現有可重用資產。
+
+
+================================================================================
+1. 專案目標
+================================================================================
+為「營收公布日 vs 股價反應」事件研究，收集台股每月營收的【精確公布日期】。
+- 範圍：約 1848 檔股票 (上市+上櫃+興櫃)，民國 109/1 ~ 115/1 (=73 個月)
+        → 約 134,904 個 (股票 x 月份) 任務
+- 需求：日期精確到「日」(有時間更好，但 day-level 已足夠事件研究)
+- 股票清單現有：/home/nvidia/poyi/playground/active_stocks.txt  (1848 個代號，一行一個)
+
+
+================================================================================
+2. 資料源探索結論 (⚠️ 重要：這些是踩過雷得到的，別重走)
+================================================================================
+
+2.1 為什麼不用 MOPS：
+  - MOPS「歷史重大訊息」t05st01 只涵蓋「自願把月營收發成重大訊息」的公司，
+    抽樣全 1848 檔用單一年度掃描，只有約 32 家有資料 (台積電/聯發科/台塑/中鋼/
+    台塑化…)。這 32 家有精確到「時、分」的時間戳，可當免費精確樣本，但涵蓋太少。
+  - MOPS 的結構化營收報表 (t21sc04_ifrs 彙總表 / t05st10_ifrs 逐檔) 與 Yahoo/
+    MoneyDJ 的結構化營收頁：都【只有年月+金額，沒有公布日期】。
+  → 結論：公布日期只存在於「新聞文章」裡。
+
+2.2 選定資料源 = Yahoo 台灣「搜尋」(tw.search.yahoo.com/search)
+  - 搜尋「{公司名} {年}年{月}月」會把該月營收的新聞文章帶出來，文章日期就是公布日。
+  - 日期準確度已驗證：MoneyDJ/Yahoo 文章日期 == MOPS 申報日期(同一天)。
+    例：台積電 2022年1月營收，MOPS 申報 2022-02-10 13:41，MoneyDJ 文章 2022-02-10 13:56。
+  - 涵蓋所有公司(連 MOPS 重大訊息查不到的穩懋等都有)。
+
+2.3 查詢字串的兩個關鍵教訓：
+  (a) 【不要】在查詢後面加「營收」兩個字！
+      加了會讓 Yahoo 去比對「最近的營收新聞」→ 回傳近期(錯年份)文章，recall 慘掉。
+      正確：  "台積電 109年8月"          (對)
+      錯誤：  "台積電 109年8月營收"       (recall 掉一半)
+  (b) 【民國年】和【西元年】兩種都要查，取聯集 — 它們釣到不同來源、互補：
+      - 民國年 "穩懋 109年1月"  → 釣到 MoneyDJ 文章 (標題用民國年:「穩懋 109年1月營收…」)
+      - 西元年 "台塑 2020年6月"  → 釣到 Yahoo股市【公告】(標題用西元年:「【公告】台塑 2020年6月合併營收…」)
+      實測：先民國年、漏抓的再西元年，救回一大半漏抓。合併涵蓋率估 ~90%+。
+
+2.4 「窗過濾」— 消滅髒資料的關鍵 (實測可把髒資料清成 0)：
+  月營收依規定次月10日前申報，遇假日順延。所以正確公布日一定落在：
+      營收月的「次月」的 1~15 號。
+    - roc_month <= 11 : 公布日應在 西元(roc_year+1911) 年、(roc_month+1) 月、1~15 日
+    - roc_month == 12 : 公布日應在 西元(roc_year+1912) 年、1 月、1~15 日
+    (11、13 號常見=週末順延；15 號=1月營收遇春節順延。>15 號的一律丟棄)
+  任何抓到但不在此窗的日期 = 丟棄(當作沒抓到)。這保證 0 髒資料。
+  ⚠️ server 端也要用這個窗再驗證一次 worker 回傳的日期，不要全信 worker。
+
+2.5 解析陷阱 — 公司名是子字串會撞：
+  「統一」 vs 「統一超」、「台塑」 vs 「台塑化」。必須【精確名稱比對】：
+  鎖定標題形如「{名稱} {年}年{月}月」或「【公告】{名稱} {年}年{月}月」，
+  且名稱後面緊接空白/年，不可被更長的名稱吃掉。
+
+2.6 rate-limit / 封鎖 (這是唯一真正的操作瓶頸，也是為何要做分散式)：
+  - 純腳本 curl 對 Yahoo 必須加 --http1.1！(HTTP/2 在某些環境會 SSL unexpected eof、
+    連不上，回 HTTP 000。加 --http1.1 就正常 200。)
+  - 單一 IP 持續高頻查詢 → 連線被 reset (SSL EOF / 回傳 size=0 / 非200)。實測狂打一天
+    後單 IP 幾乎全被擋。→ 解法就是把 worker 分散到多台機器/多個 IP (= revswarm 的核心)。
+  - rate-limited 的訊號：curl 失敗 / 非200 / 頁面 < ~2000 bytes。
+    ⚠️ 這種【不可】回報 failed，要退避重試 (見架構)。
+
+2.7 pilot 實測數據 (10檔 x 民國109年，供參考):
+  - 修正查詢(不加營收)+窗過濾：連得上的請求 ~78% 正確、0 髒。
+  - 西元年補查再救回漏抓的約一半。
+  - 每次查詢純抓取 ~0.8~1.5s (不含退避)。單IP會被封是主要限制。
+
+
+================================================================================
+3. 爬取配方 (worker 對「單一 (股票,月份) 任務」該做的事) — 可直接照做
+================================================================================
+輸入：stock_id, name, roc_year, roc_month   (roc_* 是「營收所屬」月份)
+
+步驟：
+(1) 算期望窗 expected_window(roc_year, roc_month):
+      if roc_month <= 11: wy = roc_year+1911 ; wm = roc_month+1
+      else              : wy = roc_year+1912 ; wm = 1
+      合法日 = wy 年 wm 月 1~15 日
+
+(2) 依序嘗試查詢字串 (中一個就停)：
+      q1 = f"{name} {roc_year}年{roc_month}月"          # 民國年 → MoneyDJ
+      q2 = f"{name} {roc_year+1911}年{roc_month}月"      # 西元年 → Yahoo【公告】
+
+(3) 抓取 (務必 --http1.1)：
+      curl -sS --http1.1 -m 25 -G "https://tw.search.yahoo.com/search" \
+        --data-urlencode "p={query}" \
+        -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" \
+        -H "Accept-Language: zh-TW,zh;q=0.9"
+
+(4) 分類回應：
+      - curl 非0 退出 / http!=200 / len(html) < 2000  → RATE_LIMITED (退避、稍後重試，不算 failed)
+      - 否則 → 進行解析
+
+(5) 解析 (窗過濾 + 精確名稱)：
+      - 找頁面所有日期： 20\d{2}年\d{1,2}月\d{1,2}日  (也處理 20\d{2}/\d{1,2}/\d{1,2}、20\d{2}-\d{2}-\d{2})
+      - 只留落在 expected_window (wy年wm月、日1~15) 的日期
+      - 優先取「最接近一個精確標題錨點」的窗內日期；錨點 regex 例：
+          f"{re.escape(name)}[ ]?{roc_year}年\\s*{roc_month}月營收"      (民國/MoneyDJ)
+          f"【公告】{re.escape(name)}[ ]?{roc_year+1911}年\\s*{roc_month}月"  (西元/Yahoo)
+        名稱後須接空白或數字，避免「統一」吃到「統一超」。
+      - 有窗內日期 → SUCCESS(date, source, raw_title)
+      - 兩個查詢都試完、頁面正常但無窗內日期 → FAILED (真的找不到)
+
+(6) 禮貌與退避：每次查詢間 delay + 隨機抖動 (建議 3~5s)。偵測到 RATE_LIMITED → 指數退避
+    (甚至該 worker 暫停一陣子，因為多半是整個 IP 被擋)。
+
+已驗證可用的解析核心 (Python 片段，供 worker 參考)：
+------------------------------------------------------------
+import re, subprocess, time
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+def expected_window(ry, rm):
+    return (ry+1911, rm+1) if rm<=11 else (ry+1912, 1)
+def fetch(q):
+    r=subprocess.run(["curl","-sS","--http1.1","-m","25","-G",
+        "https://tw.search.yahoo.com/search","--data-urlencode",f"p={q}",
+        "-A",UA,"-H","Accept-Language: zh-TW,zh;q=0.9"],
+        capture_output=True,text=True,timeout=30)
+    h=r.stdout
+    if not h or len(h)<2000: return None       # RATE_LIMITED 訊號
+    return h
+def parse(h, name, ry, rm):
+    wy,wm=expected_window(ry,rm)
+    anchors=[m.start() for m in re.finditer(rf'(?:【公告】)?{re.escape(name)}[ ]?\d+年\s*{rm}月', h)]
+    cand=[]
+    for dm in re.finditer(r'(20\d{2})年(\d{1,2})月(\d{1,2})日', h):
+        y,mm,dd=int(dm.group(1)),int(dm.group(2)),int(dm.group(3))
+        if y==wy and mm==wm and 1<=dd<=15:
+            cand.append((dm.start(), f"{y:04d}-{mm:02d}-{dd:02d}"))
+    if not cand: return None
+    if anchors:
+        return min(cand,key=lambda c:min(abs(c[0]-a) for a in anchors))[1]
+    return cand[0][1]
+------------------------------------------------------------
+
+
+================================================================================
+4. 架構：分散式工作佇列 (server 派工 + 多機 worker)
+================================================================================
+概念：server 持有全部 (股票,月份) 任務；worker 可在任何機器啟動，向 server 租一批任務，
+爬到就回報 success/failed，被限流就回報 rate_limited(放回佇列，不算失敗)。多機=多IP，
+繞過單IP被封。
+
+State machine:  undone → dispatched → (success | failed)
+  - dispatched 超過 10 分鐘沒回覆 → 自動變回 undone (租約逾時)
+  - failed = 「真的找不到」(兩種年份都試過)，不再重試
+  - rate_limited ≠ failed：立刻放回 undone，worker 退避
+
+4.1 SQLite schema (建議)：
+------------------------------------------------------------
+CREATE TABLE tasks(
+  id            INTEGER PRIMARY KEY,
+  stock_id      TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  roc_year      INTEGER NOT NULL,   -- 營收所屬(民國)年
+  roc_month     INTEGER NOT NULL,   -- 營收所屬月
+  state         TEXT NOT NULL DEFAULT 'undone',   -- undone|dispatched|success|failed
+  announce_date TEXT,               -- 'YYYY-MM-DD' (success 時)
+  source        TEXT,               -- 'moneydj' | 'yahoo' | ...
+  raw_title     TEXT,               -- provenance，抓到的標題原文
+  attempts      INTEGER DEFAULT 0,
+  fail_count    INTEGER DEFAULT 0,
+  dispatched_at INTEGER,            -- epoch 秒，用於租約逾時
+  worker_id     TEXT,
+  updated_at    INTEGER,
+  UNIQUE(stock_id, roc_year, roc_month)
+);
+CREATE INDEX idx_state ON tasks(state);
+-- 建議開 WAL：PRAGMA journal_mode=WAL;
+------------------------------------------------------------
+
+4.2 API endpoints (FastAPI 建議)：
+  POST /lease?n=30&worker=<id>
+     - 惰性回收+原子鎖定：一次交易內挑 n 筆 state='undone'
+       OR (state='dispatched' AND dispatched_at < now-600)，標記 dispatched、記 worker/時間，回傳批次
+     - SQLite 原子作法：BEGIN IMMEDIATE; 或 UPDATE ... WHERE id IN (SELECT ... LIMIT n) RETURNING *;
+     - 回傳每筆含 {id, stock_id, name, roc_year, roc_month}
+  POST /result   body: {id, worker, status, date?, source?, title?}
+     - status=success：server 用 2.4 的窗再驗一次 date；通過才存 success(idempotent，
+       已 success 就忽略重複/逾時的遲到回報，不可把 success 降級)
+     - status=failed ：attempts+1、fail_count+1；設 state=failed
+                       (worker 只在「兩種年份都試過仍無」時才送 failed)
+     - status=rate_limited：立刻放回 undone (release 租約)，不計失敗
+  GET  /stats
+     - 各 state 計數、進度%、ETA、近期成功率
+
+4.3 worker 迴圈：
+  loop:
+    batch = POST /lease?n=30
+    if empty: sleep, continue
+    for task in batch:
+        依「第3節配方」爬取
+        分類 → 收集 success / failed / rate_limited
+        若連續多筆 rate_limited → 判定本機 IP 被擋，指數退避 (甚至長睡)
+        每筆間 delay+jitter
+    POST /result (可批次回報)
+
+
+================================================================================
+5. 必做的補強 (前一輪 review 的重點，別漏)
+================================================================================
+🔴 關鍵：
+  1. failed 不可太早判：worker 必須「民國年+西元年」兩種都試過都沒中才回 failed。
+     (實測很多漏抓改西元年就找到) 保留把所有 failed 重開做「最後一輪」的管理指令。
+  2. worker 要可靠區分 rate_limited(連線失敗/非200/頁<2000B) vs 真failed(正常頁但無窗內日期)。
+  3. 派工必須原子操作 (BEGIN IMMEDIATE / UPDATE...RETURNING)，避免兩隻 worker 拿到同一筆。
+  4. 租約回收用「惰性回收」(派工 SQL 順便撿逾時的)，免背景執行緒。
+  5. server 端用窗(2.4)再驗證 date 才存 success，防 worker bug 污染。
+🟡 實務：
+  6. 任務要帶「公司名稱」；解析要精確名稱比對(統一≠統一超)。
+  7. 派工用批次(一次20~50筆)減少 server 往返(13.5萬筆別一筆一次)。
+  8. 記錄 source 與 raw_title (provenance，研究資料要可追溯)。
+  9. worker 自我限速(delay+jitter)+偵測封鎖後退避；別讓單 worker 燒掉自己 IP。
+  10. server 要能被任意機器連到 + 簡單 token 驗證 (避免亂入)。部署: VPS / tailscale / ngrok。
+  11. ⚠️ 大量爬 Yahoo 可能違反其 ToS，也會招致更強封鎖 — 務必節制、分散、加延遲。
+
+
+================================================================================
+6. 建置步驟 (下一段對話要做的)
+================================================================================
+[ ] 1. 建 code→name 對照表 stocks.csv (1848 檔)。來源: 證交所 ISIN
+       (isin.twse.com.tw) 或 TWSE/TPEX OpenAPI。欄位: stock_id, name, market(sii/otc/rotc)。
+       (worker 查詢需要中文簡稱)
+[ ] 2. server: FastAPI + SQLite，實作 /lease /result /stats + 第4節 schema/邏輯 + 第5節補強。
+[ ] 3. init 腳本: 讀 active_stocks.txt + stocks.csv，展開 1848 x (109/1~115/1)=~135k 筆 tasks(undone)。
+[ ] 4. worker: 依第3節配方 (curl --http1.1、民國+西元雙查、窗過濾、精確名稱、退避)，
+       可帶 --server URL 在任意機器跑。
+[ ] 5. 小規模端到端測試 (先幾檔)，確認 server/worker/租約/回收/驗窗都對，再放量。
+[ ] 6. (可選) 把那 32 家 MOPS 精確資料(含時分)併入，當高信度基準/交叉驗證。
+[ ] 7. (可選) 監看儀表板 (讀 /stats)。
+
+技術備忘：
+  - curl 打 Yahoo 一定要 --http1.1 (否則 HTTP/2 SSL EOF)。
+  - Yahoo 搜尋 URL: https://tw.search.yahoo.com/search?p=<查詢>  (用 --data-urlencode 處理中文)
+  - Python 標準庫足夠 (urllib 對 Yahoo 可能也有 h2 問題，保險起見 worker 直接呼叫 curl --http1.1)。
+
+
+================================================================================
+7. 現有可重用資產 (在 /home/nvidia/poyi/playground/)
+================================================================================
+  - active_stocks.txt          : 1848 檔股票代號 (一行一個)。→ 複製進 revswarm。
+  - mops_revenue_dates.py       : MOPS t05st01 爬蟲 (那32家自願揭露公司的精確日期+時間+盤後旗標)。
+                                  可當「高信度基準/交叉驗證」用，或當 fallback。內含 MOPS API 細節:
+                                  POST https://mops.twse.com.tw/mops/api/t05st01
+                                  body={"companyId","year"(民國),"month":"all","firstDay":"","lastDay":""}
+                                  (firstDay/lastDay 兩個 key 即使空字串也必須存在)
+  - 2330.csv                    : 台積電 109~115 月營收公布日範例輸出(含精確時分)。
+
+MOPS 那條路的「純月營收」判準(若之後要用 t05st01 資料)：
+  主旨含營收/營業額/營業收入+指定年月，且不含盈餘/損益/更正/差異，且公布日<=15。
+  (中鋼「自結合併營收及稅前盈餘」那種要排除；台塑「合併營業額」在10號前要保留)
+
+
+================================================================================
+8. 一句話總結給新對話
+================================================================================
+做一個 server(FastAPI+SQLite 工作佇列，undone/dispatched/success/failed，10分租約、惰性回收、
+原子派工、窗驗證)，加可跨機跑的 worker(curl --http1.1 搜 Yahoo、民國+西元雙查、次月1~15號窗過濾、
+精確名稱比對、rate_limited退避不算failed)，把 1848 檔 x 109/1~115/1 的月營收公布日爬回來。
+資料源與所有雷點見上。先做 stocks.csv + server + init + worker，小規模驗證後放量。
