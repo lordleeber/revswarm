@@ -171,3 +171,38 @@ def validate_date(date_str, roc_year, roc_month):
     if in_window(y, mo, d, roc_year, roc_month):
         return f"{y:04d}-{mo:02d}-{d:02d}"
     return None
+
+
+# --- 從 raw_title 順手抽營收（交叉校驗用，非權威）--------------------------
+# raw_title 的兩種主要來源格式：
+#   MoneyDJ  ：「台化 109年8月營收189.84億、年減26.94% - MoneyDJ理財網」
+#   Yahoo公告：「【公告】福壽 2020年1月合併營收10.17億元 年增-15.24%」
+# 抽出的是「單月(合併)營收」金額 + 年增率。來源非官方、金額四捨五入（億/萬 兩位），
+# 僅供交叉校驗，不可當權威值（權威到元請用 MOPS 月營收）。
+_REV_AMT = re.compile(r'(?:合併)?營收\s*([\d,]+(?:\.\d+)?)\s*(億|萬)')
+_REV_YOY = re.compile(r'年\s*(增|減)?\s*(-?[\d.]+)\s*%')
+# 自結損益/EPS 等非「月營收公告」的雜訊，見到就不抽（比照 mops_validate 的排除）
+_REV_SKIP = re.compile(r'自結|稅前|稅後|盈餘|損益|每股|EPS')
+
+
+def parse_revenue(text):
+    """從 raw_title 抽 (revenue_yuan:int, yoy_pct:float|None)；抽不到回 None。
+
+    - revenue_yuan：單月(合併)營收，億/萬 正規化為「元」（int）。
+    - yoy_pct：年增率（正=增、負=減）；抽不到年增率但有金額時為 None。
+    - 屬自結損益等非月營收公告 → 回 None。
+    """
+    if not text or _REV_SKIP.search(text):
+        return None
+    m = _REV_AMT.search(text)
+    if not m:
+        return None
+    amt = float(m.group(1).replace(",", "")) * (1e8 if m.group(2) == "億" else 1e4)
+    yoy = None
+    my = _REV_YOY.search(text)
+    if my:
+        val = float(my.group(2))
+        if my.group(1) == "減":          # 「年減26.94%」→ 負；「年增-15.24%」數字自帶負號
+            val = -abs(val)
+        yoy = val
+    return int(round(amt)), yoy

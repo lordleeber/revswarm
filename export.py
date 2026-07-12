@@ -17,7 +17,7 @@ import sqlite3
 import sys
 
 FIELDS = ["stock_id", "name", "roc_year", "roc_month",
-          "announce_date", "state", "source", "raw_title"]
+          "announce_date", "revenue", "yoy", "state", "source", "raw_title"]
 
 
 def main():
@@ -33,7 +33,7 @@ def main():
     where = "" if args.all else "WHERE state='success'"
     rows = conn.execute(
         f"""SELECT stock_id, name, roc_year, roc_month, announce_date,
-                   state, source, raw_title
+                   revenue, yoy, state, source, raw_title
               FROM tasks {where}
              ORDER BY stock_id, roc_year, roc_month""").fetchall()
 
