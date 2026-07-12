@@ -127,6 +127,14 @@
 
   .kbd{font-family:ui-monospace,monospace; background:#1b2434; border:1px solid #2a3550; border-bottom-width:2px;
     border-radius:6px; padding:.05em .45em; font-size:.85em; color:#cdd9ea}
+
+  /* run steps */
+  .run-steps{margin:16px 0}
+  .rstep{display:flex; gap:14px; align-items:flex-start; padding:14px 0; border-top:1px solid var(--line)}
+  .rstep:first-child{border-top:none}
+  .rstep .sn{flex:0 0 auto; width:28px; height:28px; border-radius:8px; display:grid; place-items:center;
+    font-weight:800; color:#0b0f16; background:linear-gradient(135deg,var(--socks),var(--worker)); font-size:.9rem}
+  .rstep .rb{flex:1; min-width:0}
   @media(max-width:660px){
     .grid,.cmp{grid-template-columns:1fr}
     .hero h1{font-size:1.7rem}
@@ -218,6 +226,14 @@ ssh -D 1080 -N -f -o ExitOnForwardFailure=yes &lt;user&gt;@&lt;VM_外部IP&gt;
 gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForwardFailure=yes</pre>
   </div>
 
+  <div class="note" style="border-left-color:var(--vm)"><b>那 1080 是「在 VM 上開的 port」嗎？不是——它在本機。</b>
+    <code class="k">-D 1080</code> 是叫<b>本機的 SSH client</b> 在 <code class="k">127.0.0.1:1080</code>
+    （loopback，外界連不到）開一個 SOCKS proxy。<b>VM 端不 listen 任何新 port</b>，全程只用它開機就有的
+    <code class="k">sshd</code>（port 22）：SOCKS 收到的請求沿「既有那條 SSH 連線」送到 VM 的 sshd，
+    由 sshd 代替你向 Yahoo 發連線、從 VM 的 IP 出去。所以<b>不必在 GCP 開任何防火牆規則</b>，
+    也沒有服務被暴露到公網——只是「借 VM 的對外連線能力」，不是在 VM 上架一個對外服務。
+    （第 6 節有實測證據。）</div>
+
   <div class="note"><b>為什麼是 <code class="k">socks5h</code> 而不是 <code class="k">socks5</code>？</b>
     尾巴那個 <code class="k">h</code> 代表「hostname 也交給 proxy 解析」——連 DNS 查詢都在 VM 端做，
     整條請求（含網域解析）都從 VM 出去。用 <code class="k">socks5</code> 的話 DNS 仍在本機解，
@@ -287,8 +303,32 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
   <p>正因為 <code class="k">_req()</code> 那條沒動，<b>server 只在 tailnet（無公網）也照樣運作</b>：
     worker 仍用 Tailscale 連 server，只有爬 Yahoo 那條繞到 VM。兩件事解耦。</p>
 
-  <!-- ===== 5. 驗證 ===== -->
-  <h2 id="verify"><span class="n">5</span>驗證：實測輸出逐行標注</h2>
+  <!-- ===== 5. 怎麼跑起來 ===== -->
+  <h2 id="run"><span class="n">5</span>實際怎麼跑起來（順序）</h2>
+  <p>心智模型先擺正：<b>通道是一個常駐的背景服務，不是你要一直開著的終端機。</b>
+    把它跑在 tmux 裡（本專案慣例：長跑用 tmux），detach 後照樣活著——關掉終端機、甚至登出 SSH 都不影響。
+    worker 也是長跑，一樣丟另一個 tmux。所以是<b>兩個 session</b>：一個跑通道、一個跑 worker。</p>
+
+  <div class="run-steps">
+    <div class="rstep"><span class="sn">1</span><div class="rb"><b>先起通道</b>（若已在跑就跳過）——背景常駐、斷線自動重連。
+      <div class="code" style="margin:8px 0 0"><div class="code-hd"><span>本機</span><span class="tag">tmux: socks</span></div>
+<pre>tmux new-session -d -s socks '~/rev-socks-tunnel.sh 2>&amp;1 | tee -a ~/rev-socks.log'</pre></div></div></div>
+    <div class="rstep"><span class="sn">2</span><div class="rb"><b>確認通道通了</b>再往下（走 proxy 應回 VM 的 IP，而非本機 IP）。
+      <div class="code" style="margin:8px 0 0"><div class="code-hd"><span>本機</span><span class="tag">verify</span></div>
+<pre>curl -s --proxy socks5h://127.0.0.1:1080 https://api.ipify.org   <span class="c"># → 35.229.164.167</span></pre></div></div></div>
+    <div class="rstep"><span class="sn">3</span><div class="rb"><b>再跑 worker</b>（另一個 tmux，帶上 <code class="k">WORKER_PROXY</code>）。
+      <div class="code" style="margin:8px 0 0"><div class="code-hd"><span>本機</span><span class="tag">tmux: worker</span></div>
+<pre>tmux new-session -d -s worker \
+  'WORKER_PROXY=socks5h://127.0.0.1:1080 python3 worker.py --server http://&lt;SERVER&gt;:8000 --token &lt;TOKEN&gt;'</pre></div></div></div>
+  </div>
+
+  <div class="note"><b>順序為什麼要緊？</b>
+    worker 若在通道還沒起來時先跑，curl 連 <code class="k">:1080</code> 會被拒 → worker 判定
+    <code class="k">rate_limited</code> 退避（浪費時間，但不會崩）。通道自動重連，偶爾斷線 worker 會退避、
+    通道回來就自動續爬。所以「先通道、後 worker」不是硬規定，而是省掉開頭那段空轉。</div>
+
+  <!-- ===== 6. 驗證 ===== -->
+  <h2 id="verify"><span class="n">6</span>驗證：實測輸出逐行標注</h2>
   <p>以下都是這次開發<b>真跑出來</b>的輸出，不是想像的。</p>
 
   <h3>先證明通道確實換了 IP</h3>
@@ -321,13 +361,26 @@ PROXY(no env) = None                            <span class="prompt">③</span><
     <li data-m="③">不給環境變數時 <code class="k">PROXY=None</code> → 向後相容成立，舊部署不受影響。</li>
   </ul>
 
+  <h3>順帶證明：VM 沒開任何 port，1080 只在本機</h3>
+  <div class="term">
+    <div class="term-hd">問 VM「有沒有人在聽 1080」＋看本機 1080 綁在哪個位址</div>
+<pre><span class="prompt">$</span> gcloud compute ssh streaming-vm --zone=asia-east1-c --command="ss -ltn | grep -w 1080 || echo none"
+[VM] 1080 沒有任何程式在聽                          <span class="prompt">④</span>
+<span class="prompt">$</span> ss -ltn | grep -w 1080          <span class="c"># 這行是在本機看</span>
+LISTEN 0 128   <span class="ip-me">127.0.0.1:1080</span>   0.0.0.0:*            <span class="prompt">⑤</span></pre>
+  </div>
+  <ul class="annot">
+    <li data-m="④">VM 上<b>沒有</b>任何程式聽 1080——沒在 VM 開 port、沒動防火牆，只用了它既有的 sshd(22)。</li>
+    <li data-m="⑤">1080 只在<b>本機</b>，而且綁 <span class="ip-me">127.0.0.1</span>（loopback）→ 外界連不到，零暴露。</li>
+  </ul>
+
   <div class="note"><b>讓通道自己活著。</b>SSH 會斷。實務上把
     <code class="k">ssh -D …</code> 放進一個 <span class="kbd">while true; do … ; sleep 3; done</span>
     重連迴圈、跑在 tmux 裡（本專案慣例：長跑用 tmux 不用 nohup）。通道斷線期間 curl 會連不上
     <code class="k">:1080</code> → worker 視為 rate_limited 退避，不會噴錯崩掉，通道回來就自動續爬。</div>
 
-  <!-- ===== 6. 常見錯誤 ===== -->
-  <h2 id="pitfalls"><span class="n">6</span>常見錯誤</h2>
+  <!-- ===== 7. 常見錯誤 ===== -->
+  <h2 id="pitfalls"><span class="n">7</span>常見錯誤</h2>
   <div class="grid">
     <div class="mist">
       <div class="sym">用了 <code class="k">socks5://</code>（少了 h）</div>
@@ -361,8 +414,8 @@ PROXY(no env) = None                            <span class="prompt">③</span><
     </div>
   </div>
 
-  <!-- ===== 7. 小結 ===== -->
-  <h2 id="wrap"><span class="n">7</span>小結與下一步</h2>
+  <!-- ===== 8. 小結 ===== -->
+  <h2 id="wrap"><span class="n">8</span>小結與下一步</h2>
   <p>這一步的精華不在 code（只有三行），而在<b>看懂 worker 有兩條通道、只該改一條</b>。
     產物：<code class="k">WORKER_PROXY</code> / <code class="k">--proxy</code>，讓爬取從任意 SOCKS 出口出去，
     向後相容、與 server 連線解耦。搭配一台雲端 VM 的 SSH SOCKS 通道，就能不多養 worker 而換一顆 IP。</p>
