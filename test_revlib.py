@@ -66,6 +66,17 @@ class TestParseRevenue(unittest.TestCase):
             R.parse_revenue("大將 109年1月營收2038萬、年增16204.80% - MoneyDJ理財網"),
             (20380000, 16204.8))
 
+    def test_畸形數字不拋例外(self):
+        # 畸形數字（多小數點、只有逗號）不得讓 float() 拋 ValueError；
+        # 解不出的部分安靜略過，而非炸掉 server 回報熱路徑。
+        # 年增畸形 → 金額仍取得、yoy 視為 None
+        self.assertEqual(
+            R.parse_revenue("某股 109年1月營收5億、年增1.2.3%"), (500000000, None))
+        # 金額畸形（只有逗號）→ 整筆 None
+        self.assertIsNone(R.parse_revenue("某股 109年1月營收,億、年增5%"))
+        # 金額多小數點 → 抽不到合法金額 → None
+        self.assertIsNone(R.parse_revenue("某股 109年1月營收1.2.3億、年增5%"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

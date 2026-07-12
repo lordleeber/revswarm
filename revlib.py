@@ -179,8 +179,10 @@ def validate_date(date_str, roc_year, roc_month):
 #   Yahoo公告：「【公告】福壽 2020年1月合併營收10.17億元 年增-15.24%」
 # 抽出的是「單月(合併)營收」金額 + 年增率。來源非官方、金額四捨五入（億/萬 兩位），
 # 僅供交叉校驗，不可當權威值（權威到元請用 MOPS 月營收）。
-_REV_AMT = re.compile(r'(?:合併)?營收\s*([\d,]+(?:\.\d+)?)\s*(億|萬)')
-_REV_YOY = re.compile(r'年\s*(增|減)?\s*(-?[\d.]+)\s*%')
+# 數字部分收緊為「必以數字開頭、至多一組小數」，保證後面 float() 不會因畸形字串
+# （如 "1.2.3"、只有逗號）拋 ValueError——這函式跑在 server 回報熱路徑、吃外部內容。
+_REV_AMT = re.compile(r'(?:合併)?營收\s*(\d[\d,]*(?:\.\d+)?)\s*(億|萬)')
+_REV_YOY = re.compile(r'年\s*(增|減)?\s*(-?\d+(?:\.\d+)?)\s*%')
 # 自結損益/EPS 等非「月營收公告」的雜訊，見到就不抽（比照 mops_validate 的排除）
 _REV_SKIP = re.compile(r'自結|稅前|稅後|盈餘|損益|每股|EPS')
 
