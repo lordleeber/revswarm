@@ -101,6 +101,26 @@ python3 worker.py --server URL \
 worker 偵測到連續 `rate_limited` 會指數退避，超過門檻就判定「本機 IP 被擋」，
 把該批剩餘任務以 rate_limited 放回、長睡一陣子。**別讓單一 worker 燒掉自己的 IP。**
 
+### 換 IP 出口（選配：`--proxy` / `WORKER_PROXY`）
+
+不想多開機器、但想換一顆對外 IP 時，可讓 worker **爬 Yahoo 的 `curl` 走 SOCKS proxy**。
+最省的做法是對一台雲端 VM 開 SSH 動態轉發（VM 端零安裝，只用它自帶的 `sshd`）：
+
+```bash
+# 本機開一條 SOCKS5 通道到 VM（127.0.0.1:1080 從 VM 的 IP 出去）
+ssh -D 1080 -N -f -o ExitOnForwardFailure=yes <user>@<VM_外部IP>
+#   或用 gcloud： gcloud compute ssh <VM> --zone <zone> -- -D 1080 -N -f
+
+# worker 的 curl 走它（socks5h 的 h＝DNS 也在 VM 端解，整條請求都從 VM 出）
+WORKER_PROXY=socks5h://127.0.0.1:1080 python3 worker.py --server http://<SERVER>:8000
+#   等同： python3 worker.py --proxy socks5h://127.0.0.1:1080 --server ...
+```
+
+- **只影響爬 Yahoo 的 `curl`**；worker↔server 的租任務/回報（`urllib`）不受影響、仍走原路
+  （所以 server 只在 tailnet 也 OK）。不設時行為完全不變。
+- 一台 VM ＝ 一顆 IP；退避邏輯照舊留著（換 IP 是分攤，不是拿來加速轟炸）。
+- 詳解見 `docs/worker-proxy.html`。
+
 ## 部署（讓多台 worker 連到 server）
 
 worker **沒有自動探索**，一定要用 `--server http://<位址>:<port>` 明確告訴它 server 在哪。

@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>worker --proxy：借別人的 IP 繞 rate limit｜revswarm 教材</title>
+<style>
+  :root{
+    --bg:#0b0f16; --bg2:#0f1420; --card:#131a28; --card2:#171f30;
+    --ink:#e6edf3; --muted:#9aa7b8; --faint:#66748a; --line:#26304480;
+    --code:#0a0e15; --codeln:#1c2536;
+    /* 色彩＝執行者（全書固定語意）*/
+    --worker:#5b9dff;   /* 本機 worker（Python）*/
+    --socks:#2dd4bf;    /* 本機 SOCKS proxy :1080 */
+    --tunnel:#a78bfa;   /* SSH 加密通道 */
+    --vm:#f4a63b;       /* GCP VM 出口 IP */
+    --yahoo:#f472b6;    /* Yahoo（目標網站）*/
+    --server:#34d399;   /* revswarm server */
+    --good:#34d399; --bad:#fb7185; --warn:#f4a63b;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:linear-gradient(180deg,#0b0f16,#0c1119 40%,#0b0f16);
+    color:var(--ink); font:16px/1.72 -apple-system,"Segoe UI",Roboto,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:920px; margin:0 auto; padding:0 20px 90px}
+  a{color:var(--worker); text-decoration:none}
+  a:hover{text-decoration:underline}
+  h2{font-size:1.5rem; margin:2.6em 0 .7em; letter-spacing:.01em; scroll-margin-top:20px}
+  h2 .n{color:var(--faint); font-weight:600; margin-right:.5rem}
+  h3{font-size:1.12rem; margin:1.8em 0 .5em; color:#cdd7e5}
+  p{color:#d2dbe7}
+  code.k{background:#1b2434; color:#a9c7ff; padding:.08em .4em; border-radius:6px; font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:.88em}
+  .muted{color:var(--muted)}
+
+  /* pagenav */
+  .nav{display:flex; justify-content:space-between; align-items:center; gap:12px;
+    font-size:.9rem; padding:14px 0; border-bottom:1px solid var(--line)}
+  .nav.bottom{border-bottom:none; border-top:1px solid var(--line); margin-top:50px}
+  .nav a,.nav span{color:var(--muted)}
+  .nav .toc{padding:.3em .9em; border:1px solid var(--line); border-radius:999px; background:#111826}
+
+  /* hero */
+  .hero{padding:40px 0 8px}
+  .badge{display:inline-block; font-size:.75rem; letter-spacing:.14em; text-transform:uppercase;
+    color:#0b0f16; background:linear-gradient(90deg,var(--socks),var(--worker)); font-weight:800;
+    padding:.35em .8em; border-radius:999px}
+  .hero h1{font-size:2.15rem; line-height:1.2; margin:.5em 0 .2em; letter-spacing:.01em}
+  .lead{font-size:1.12rem; color:#c4cfdd; margin:.4em 0 1.1em}
+  .chips{display:flex; flex-wrap:wrap; gap:8px; margin:.6em 0 .2em}
+  .chip{font-size:.82rem; font-family:ui-monospace,Menlo,monospace; padding:.32em .7em; border-radius:8px;
+    border:1px solid var(--line); background:#101725; color:#b7c3d3}
+  .chip.new{border-color:#2dd4bf55; background:#0e211f; color:#7ff0df}
+  .chip.new::before{content:"＋ "; color:var(--socks)}
+  .chip.mod::before{content:"~ "; color:var(--warn)}
+
+  /* card / callout */
+  .card{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:20px 22px; margin:18px 0}
+  .why{border-left:3px solid var(--vm)}
+  .note{background:var(--card2); border:1px solid var(--line); border-left:3px solid var(--worker);
+    border-radius:10px; padding:12px 16px; margin:16px 0; font-size:.95rem; color:#c8d2e0}
+  .note b{color:#fff}
+
+  /* legend */
+  .legend{display:flex; flex-wrap:wrap; gap:10px 18px; margin:14px 0 6px; font-size:.86rem}
+  .legend .lg{display:flex; align-items:center; gap:7px; color:#c0ccdb}
+  .dot{width:11px; height:11px; border-radius:3px; flex:0 0 auto}
+
+  /* journey diagram */
+  .flow{display:flex; align-items:stretch; flex-wrap:wrap; gap:0; margin:8px 0}
+  .node{position:relative; flex:1 1 0; min-width:120px; background:#101828; border:1px solid var(--line);
+    border-top:3px solid var(--c,#5b9dff); border-radius:10px; padding:12px 12px; margin:6px 16px 6px 0}
+  .node:last-child{margin-right:0}
+  .node .t{font-weight:700; font-size:.92rem; color:#eaf1fb}
+  .node .s{font-size:.78rem; color:var(--muted); margin-top:3px; font-family:ui-monospace,Menlo,monospace}
+  .node .arrow{position:absolute; right:-15px; top:50%; transform:translateY(-50%); color:var(--faint); font-size:1.1rem}
+  .flow.alt .node{border-top-color:var(--server)}
+  .flowlabel{font-size:.8rem; color:var(--faint); margin:2px 0 -2px; letter-spacing:.05em}
+
+  /* code */
+  .code{background:var(--code); border:1px solid #1a2333; border-radius:12px; margin:16px 0; overflow:hidden}
+  .code-hd{display:flex; justify-content:space-between; align-items:center; background:#0e1420;
+    border-bottom:1px solid #1a2333; padding:8px 14px; font-size:.8rem; color:var(--muted); font-family:ui-monospace,Menlo,monospace}
+  .code-hd .tag{color:var(--socks)}
+  .code pre{margin:0; padding:14px 16px; overflow-x:auto; font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+    font-size:.855rem; line-height:1.62; color:#c9d4e3}
+  .code pre .c{color:#5f7089}       /* comment */
+  .code pre .s{color:#8fd3a8}       /* string */
+  .code pre .kw{color:#c48fff}      /* keyword */
+  .code pre .fn{color:#7fb7ff}      /* func/name */
+  .hl{display:block; background:#132033; border-left:3px solid var(--socks); margin:0 -16px; padding:0 16px 0 13px}
+
+  /* verify output */
+  .term{background:#080b11; border:1px solid #1a2333; border-radius:12px; overflow:hidden; margin:16px 0}
+  .term-hd{background:#0e1420; padding:7px 14px; font-size:.78rem; color:var(--faint); border-bottom:1px solid #1a2333; font-family:ui-monospace,monospace}
+  .term pre{margin:0; padding:14px 16px; font-family:"SF Mono",ui-monospace,Menlo,monospace; font-size:.85rem; line-height:1.7; color:#cfe3d6; overflow-x:auto}
+  .term .prompt{color:#5f7089}
+  .term .ip-vm{color:var(--vm); font-weight:700}
+  .term .ip-me{color:var(--worker); font-weight:700}
+  .term .ok{color:var(--good); font-weight:700}
+  .annot{list-style:none; padding:0; margin:10px 0 0}
+  .annot li{display:flex; gap:10px; padding:7px 0; border-top:1px dashed var(--line); font-size:.92rem; color:#c4cfdd}
+  .annot li::before{content:attr(data-m); color:var(--vm); font-weight:800; flex:0 0 auto; font-family:ui-monospace,monospace}
+
+  /* mistakes grid */
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:16px 0}
+  .mist{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px}
+  .mist .sym{font-weight:700; color:#fff}
+  .mist .row{font-size:.9rem; margin-top:6px; color:#c4cfdd}
+  .mist .row b{font-family:ui-monospace,monospace; font-weight:700; margin-right:4px}
+  .mist .bad{color:var(--bad)} .mist .good{color:var(--good)}
+
+  /* compare socks5 vs socks5h */
+  .cmp{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0}
+  .cmp>div{border:1px solid var(--line); border-radius:12px; padding:14px 16px; background:var(--card)}
+  .cmp .h{font-family:ui-monospace,monospace; font-weight:800; margin-bottom:6px}
+  .cmp .no .h{color:var(--bad)} .cmp .yes .h{color:var(--good)}
+
+  details{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:2px 16px; margin:12px 0}
+  details[open]{padding-bottom:14px}
+  summary{cursor:pointer; padding:12px 0; font-weight:600; color:#dbe4f0}
+  summary::marker{color:var(--socks)}
+  details p{margin:.4em 0 0; color:#bcc8d7; font-size:.95rem}
+
+  .kbd{font-family:ui-monospace,monospace; background:#1b2434; border:1px solid #2a3550; border-bottom-width:2px;
+    border-radius:6px; padding:.05em .45em; font-size:.85em; color:#cdd9ea}
+  @media(max-width:660px){
+    .grid,.cmp{grid-template-columns:1fr}
+    .hero h1{font-size:1.7rem}
+    .node{margin-right:0}
+    .node .arrow{display:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ===== pagenav top ===== -->
+  <nav class="nav top">
+    <span>← 這是第一章</span>
+    <a class="toc" href="index.html">📖 目錄</a>
+    <span>下一章：待續 →</span>
+  </nav>
+
+  <!-- ===== hero ===== -->
+  <header class="hero">
+    <span class="badge">PR · worker &nbsp;--proxy</span>
+    <h1>借別人的 IP 繞 rate limit</h1>
+    <p class="lead">Yahoo 按 IP 限流，多開機器很貴。這一章讓 worker 的爬取流量
+      改從一台雲端 VM 的 IP 出去——只加三行程式碼、VM 端零安裝、而且不動到 worker 連 server 的那條線。</p>
+    <div class="chips">
+      <span class="chip mod">worker.py</span>
+      <span class="chip mod">README.md</span>
+      <span class="chip new">docs/worker-proxy.html</span>
+    </div>
+  </header>
+
+  <!-- ===== 1. 為什麼 ===== -->
+  <h2 id="why"><span class="n">1</span>為什麼需要這一步</h2>
+  <p>revswarm 把 13.5 萬筆「股票 × 月份」的營收公布日爬回來，唯一來源是 Yahoo 搜尋。
+    痛點很直接——<b>Yahoo 按來源 IP 限流</b>：單一 IP 高頻查詢很快回小頁面、非 200，
+    worker 就得退避長睡。既有解法是「多開機器 = 多 IP 分攤」，但為了換一顆 IP 而養一台完整
+    worker（要能連 server、要部署程式）成本偏高。</p>
+
+  <div class="card why">
+    <p style="margin-top:0"><b>關鍵洞察：worker 其實有兩條互不相干的對外通道。</b>
+      只有其中一條被 Yahoo 限流，另一條完全不該動。看懂這點，這個功能就只是「把其中一條改道」。</p>
+    <div class="legend">
+      <span class="lg"><span class="dot" style="background:var(--worker)"></span>本機 worker（Python）</span>
+      <span class="lg"><span class="dot" style="background:var(--yahoo)"></span>Yahoo（被限流的目標）</span>
+      <span class="lg"><span class="dot" style="background:var(--server)"></span>revswarm server</span>
+    </div>
+    <div class="flow" style="margin-top:10px">
+      <div class="node" style="--c:var(--worker)"><div class="t">curl（<code class="k">fetch()</code>）</div><div class="s">爬 Yahoo 搜尋頁</div><span class="arrow">→</span></div>
+      <div class="node" style="--c:var(--yahoo)"><div class="t">tw.search.yahoo.com</div><div class="s">← 這條會被限流</div></div>
+    </div>
+    <div class="flow">
+      <div class="node" style="--c:var(--worker)"><div class="t">urllib（<code class="k">_req()</code>）</div><div class="s">租任務 / 回報</div><span class="arrow">→</span></div>
+      <div class="node" style="--c:var(--server)"><div class="t">你的 server</div><div class="s">走 Tailscale，不該碰 proxy</div></div>
+    </div>
+  </div>
+
+  <p>所以目標很窄：<b>只把 <code class="k">fetch()</code> 那條 curl 改走一個外部出口，其餘一律不動。</b>
+    出口用一台雲端 VM——但不想在 VM 上裝任何東西（連 Tailscale 都不裝）。</p>
+
+  <!-- ===== 2. 機制：SSH SOCKS ===== -->
+  <h2 id="mech"><span class="n">2</span>出口怎麼來：SSH 動態轉發（SOCKS5）</h2>
+  <p>不在 VM 裝東西，還要讓流量從它的 IP 出去，最乾淨的辦法是 <b>SSH 動態埠轉發</b>：
+    VM 開機就自帶 <code class="k">sshd</code>，本機用 <code class="k">ssh -D</code> 在
+    <code class="k">127.0.0.1:1080</code> 開一個 SOCKS5 代理，所有走它的請求都被 SSH 加密隧道
+    送到 VM，再從 VM 的 IP 出去。VM 端零安裝。</p>
+
+  <div class="legend">
+    <span class="lg"><span class="dot" style="background:var(--worker)"></span>本機 worker</span>
+    <span class="lg"><span class="dot" style="background:var(--socks)"></span>本機 SOCKS :1080</span>
+    <span class="lg"><span class="dot" style="background:var(--tunnel)"></span>SSH 加密通道</span>
+    <span class="lg"><span class="dot" style="background:var(--vm)"></span>GCP VM 出口 IP</span>
+    <span class="lg"><span class="dot" style="background:var(--yahoo)"></span>Yahoo</span>
+  </div>
+  <div class="flowlabel">一次 fetch 的完整旅程</div>
+  <div class="flow">
+    <div class="node" style="--c:var(--worker)"><div class="t">worker curl</div><div class="s">--proxy socks5h://…</div><span class="arrow">→</span></div>
+    <div class="node" style="--c:var(--socks)"><div class="t">SOCKS :1080</div><div class="s">127.0.0.1</div><span class="arrow">→</span></div>
+    <div class="node" style="--c:var(--tunnel)"><div class="t">SSH 通道</div><div class="s">加密轉發</div><span class="arrow">→</span></div>
+    <div class="node" style="--c:var(--vm)"><div class="t">GCP VM</div><div class="s">35.229.164.167</div><span class="arrow">→</span></div>
+    <div class="node" style="--c:var(--yahoo)"><div class="t">Yahoo</div><div class="s">看到的是 VM 的 IP</div></div>
+  </div>
+
+  <div class="code">
+    <div class="code-hd"><span>本機（跑 worker 那台）</span><span class="tag">shell</span></div>
+<pre><span class="c"># 開一條 SOCKS5 通道到 VM（背景常駐；-N 不執行遠端指令、-f 丟背景）</span>
+ssh -D 1080 -N -f -o ExitOnForwardFailure=yes &lt;user&gt;@&lt;VM_外部IP&gt;
+
+<span class="c"># 或用 gcloud（免手動貼公鑰、還能走 IAP，VM 可不開公網 IP）</span>
+gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForwardFailure=yes</pre>
+  </div>
+
+  <div class="note"><b>為什麼是 <code class="k">socks5h</code> 而不是 <code class="k">socks5</code>？</b>
+    尾巴那個 <code class="k">h</code> 代表「hostname 也交給 proxy 解析」——連 DNS 查詢都在 VM 端做，
+    整條請求（含網域解析）都從 VM 出去。用 <code class="k">socks5</code> 的話 DNS 仍在本機解，
+    雖然多半能通，但不是「完全從 VM 出」的乾淨語意。</div>
+
+  <div class="cmp">
+    <div class="no"><div class="h">socks5://</div><div class="muted" style="font-size:.9rem">TCP 走 proxy，<b style="color:var(--bad)">DNS 在本機解</b>。出口 IP 對，但網域解析洩在本地。</div></div>
+    <div class="yes"><div class="h">socks5h://</div><div class="muted" style="font-size:.9rem">TCP 與 <b style="color:var(--good)">DNS 都走 proxy</b>。整條請求都從 VM 出——本章採用。</div></div>
+  </div>
+
+  <!-- ===== 3. 三行改動 ===== -->
+  <h2 id="code"><span class="n">3</span>程式碼：其實只有三處</h2>
+  <p>難的是想通「只改一條通道」；真正的 code 極小。三處都在 <code class="k">worker.py</code>，
+    節錄如下（highlight 行為本次新增）。</p>
+
+  <h3>① 模組層讀一個環境變數</h3>
+  <div class="code">
+    <div class="code-hd"><span>worker.py</span><span class="tag">模組頂部</span></div>
+<pre><span class="fn">MIN_PAGE_BYTES</span> = <span class="s">2000</span>        <span class="c"># 小於此視為被限流/擋（todo 2.6）</span>
+<span class="hl"><span class="c"># 讓 curl 走 proxy（例 socks5h://127.0.0.1:1080，經 SSH SOCKS 從別的 IP 出去繞 per-IP</span></span><span class="hl"><span class="c"># rate limit）。只影響爬 Yahoo 的 curl；worker↔server 的 urllib 不受影響、仍走原路。</span></span><span class="hl"><span class="fn">PROXY</span> = os.environ.<span class="fn">get</span>(<span class="s">"WORKER_PROXY"</span>) <span class="kw">or</span> <span class="kw">None</span></span></pre>
+  </div>
+
+  <h3>② <code class="k">fetch()</code> 把 curl 指令抽成 list，有 proxy 就附上</h3>
+  <div class="code">
+    <div class="code-hd"><span>worker.py — def fetch()</span><span class="tag">爬 Yahoo 的唯一出口</span></div>
+<pre>    cmd = [<span class="s">"curl"</span>, <span class="s">"-sS"</span>, <span class="s">"--http1.1"</span>, <span class="s">"-m"</span>, <span class="fn">str</span>(timeout), <span class="s">"-G"</span>,
+           <span class="s">"-w"</span>, <span class="s">"\n%{http_code}"</span>,            <span class="c"># 末行附上 HTTP 狀態碼</span>
+           <span class="s">"https://tw.search.yahoo.com/search"</span>,
+           <span class="s">"--data-urlencode"</span>, <span class="s">f"p={query}"</span>,
+           <span class="s">"-A"</span>, UA,
+           <span class="s">"-H"</span>, <span class="s">"Accept-Language: zh-TW,zh;q=0.9"</span>]
+<span class="hl">    <span class="kw">if</span> PROXY:</span><span class="hl">        cmd += [<span class="s">"--proxy"</span>, PROXY]              <span class="c"># socks5h:// → DNS 也在 proxy 端解</span></span>
+    <span class="kw">try</span>:
+        r = subprocess.<span class="fn">run</span>(
+            cmd,
+            ...
+        )</pre>
+  </div>
+  <p class="muted" style="font-size:.92rem">既有的 <code class="k">--http1.1</code> 留著有原因：某些環境走 HTTP/2 會 SSL EOF、回
+    <code class="k">000</code>。這跟 proxy 無關，但一起走 curl，所以照舊。</p>
+
+  <h3>③ 一個 <code class="k">--proxy</code> CLI 參數（也吃環境變數）</h3>
+  <div class="code">
+    <div class="code-hd"><span>worker.py — def main()</span><span class="tag">argparse</span></div>
+<pre>    ap.<span class="fn">add_argument</span>(<span class="s">"--max-batches"</span>, type=<span class="fn">int</span>, default=<span class="s">0</span>, help=<span class="s">"跑幾批後結束(0=不限)"</span>)
+<span class="hl">    ap.<span class="fn">add_argument</span>(<span class="s">"--proxy"</span>, default=os.environ.<span class="fn">get</span>(<span class="s">"WORKER_PROXY"</span>),</span><span class="hl">                    help=<span class="s">"爬 Yahoo 的 curl 走此 proxy，如 socks5h://127.0.0.1:1080…"</span>)</span>
+    args = ap.<span class="fn">parse_args</span>()
+
+<span class="hl">    <span class="kw">global</span> PROXY</span><span class="hl">    PROXY = args.proxy <span class="kw">or</span> <span class="kw">None</span></span></pre>
+  </div>
+
+  <div class="note"><b>向後相容是設計目標。</b>
+    沒設 <code class="k">WORKER_PROXY</code>、沒帶 <code class="k">--proxy</code> 時，<code class="k">PROXY</code> 是
+    <code class="k">None</code>，curl 一個字都不會多——舊行為原封不動。</div>
+
+  <!-- ===== 4. 模組分工 ===== -->
+  <h2 id="scope"><span class="n">4</span>改動的邊界：只碰了「爬取」這一格</h2>
+  <p>對照第 1 節那張「兩條通道」圖——這次的改動<b>完全落在 worker 端、且只在 <code class="k">fetch()</code> 這一格</b>：</p>
+  <div class="flow">
+    <div class="node" style="--c:var(--worker)"><div class="t">fetch() / curl</div><div class="s">改：加 --proxy</div><span class="arrow">→</span></div>
+    <div class="node" style="--c:var(--vm)"><div class="t">走 VM 出口</div><div class="s">✔ 本次目標</div></div>
+  </div>
+  <div class="flow alt">
+    <div class="node" style="--c:var(--server)"><div class="t">_req() / urllib</div><div class="s">不動：租任務 / 回報</div><span class="arrow">→</span></div>
+    <div class="node" style="--c:var(--server)"><div class="t">走原路（Tailscale）</div><div class="s">✔ 完全不受影響</div></div>
+  </div>
+  <p>正因為 <code class="k">_req()</code> 那條沒動，<b>server 只在 tailnet（無公網）也照樣運作</b>：
+    worker 仍用 Tailscale 連 server，只有爬 Yahoo 那條繞到 VM。兩件事解耦。</p>
+
+  <!-- ===== 5. 驗證 ===== -->
+  <h2 id="verify"><span class="n">5</span>驗證：實測輸出逐行標注</h2>
+  <p>以下都是這次開發<b>真跑出來</b>的輸出，不是想像的。</p>
+
+  <h3>先證明通道確實換了 IP</h3>
+  <div class="term">
+    <div class="term-hd">本機：走 proxy vs 不走 proxy，各問一次「我的對外 IP 是多少」</div>
+<pre><span class="prompt">$</span> curl -s --proxy socks5h://127.0.0.1:1080 https://api.ipify.org
+<span class="ip-vm">35.229.164.167</span>          <span class="prompt">◐</span>
+<span class="prompt">$</span> curl -s https://api.ipify.org
+<span class="ip-me">61.219.173.229</span>          <span class="prompt">◑</span></pre>
+  </div>
+  <ul class="annot">
+    <li data-m="◐">走 proxy 時對外 IP ＝ <span class="ip-vm">GCP VM 的 IP</span>：流量確實從 VM 出去了。</li>
+    <li data-m="◑">不走 proxy 就是<span class="ip-me">本機真實 IP</span>：兩者不同，證明改道成功、且沒設 proxy 時完全走原路。</li>
+  </ul>
+
+  <h3>再證明 worker 的 fetch() 真的能經 VM 抓到 Yahoo</h3>
+  <div class="term">
+    <div class="term-hd">設 WORKER_PROXY 後直接呼叫 worker.fetch()（不啟整個 worker）</div>
+<pre><span class="prompt">$</span> WORKER_PROXY=socks5h://127.0.0.1:1080 python3 -c '…worker.fetch("台積電 2020年1月")…'
+模組讀到的 PROXY = socks5h://127.0.0.1:1080     <span class="prompt">①</span>
+ok = <span class="ok">True</span> | html 長度 = <span class="ok">136872</span>              <span class="prompt">②</span>
+
+<span class="prompt">$</span> python3 -c 'import worker; print(worker.PROXY)'   <span class="c"># 沒設環境變數</span>
+PROXY(no env) = None                            <span class="prompt">③</span></pre>
+  </div>
+  <ul class="annot">
+    <li data-m="①">模組層確實讀到了環境變數 → 第 3 節 ① 那行生效。</li>
+    <li data-m="②"><code class="k">ok=True</code> 且頁面 <b>136,872 bytes</b>（遠大於 <code class="k">MIN_PAGE_BYTES=2000</code>）
+      → 經 VM 出口拿到正常的 Yahoo 搜尋頁，不是被限流的小頁。</li>
+    <li data-m="③">不給環境變數時 <code class="k">PROXY=None</code> → 向後相容成立，舊部署不受影響。</li>
+  </ul>
+
+  <div class="note"><b>讓通道自己活著。</b>SSH 會斷。實務上把
+    <code class="k">ssh -D …</code> 放進一個 <span class="kbd">while true; do … ; sleep 3; done</span>
+    重連迴圈、跑在 tmux 裡（本專案慣例：長跑用 tmux 不用 nohup）。通道斷線期間 curl 會連不上
+    <code class="k">:1080</code> → worker 視為 rate_limited 退避，不會噴錯崩掉，通道回來就自動續爬。</div>
+
+  <!-- ===== 6. 常見錯誤 ===== -->
+  <h2 id="pitfalls"><span class="n">6</span>常見錯誤</h2>
+  <div class="grid">
+    <div class="mist">
+      <div class="sym">用了 <code class="k">socks5://</code>（少了 h）</div>
+      <div class="row"><span class="bad">後果</span> DNS 仍在本機解，語意不乾淨；少數環境會解析失敗或洩漏查詢。</div>
+      <div class="row"><span class="good">正解</span> 一律 <code class="k">socks5h://</code>，把 DNS 也丟給 VM。</div>
+    </div>
+    <div class="mist">
+      <div class="sym">想把「連 server」也一起 proxy</div>
+      <div class="row"><span class="bad">後果</span> server 只在 tailnet 時，VM 根本連不到它 → worker 租不到任務。</div>
+      <div class="row"><span class="good">正解</span> 只 proxy 爬 Yahoo 的 curl；<code class="k">_req()</code> 的 urllib 保持原路。</div>
+    </div>
+    <div class="mist">
+      <div class="sym">以為一台 VM 能無限換 IP</div>
+      <div class="row"><span class="bad">後果</span> 一台 VM ＝ 一顆 IP；那顆被 Yahoo 標記後一樣會限流。</div>
+      <div class="row"><span class="good">正解</span> 要更多就多開 VM，各起一條通道輪流；或搭配多機 worker。</div>
+    </div>
+    <div class="mist">
+      <div class="sym">換了 IP 就把退避拿掉猛打</div>
+      <div class="row"><span class="bad">後果</span> 新 IP 也很快被燒掉，還可能連累 VM 其他用途。</div>
+      <div class="row"><span class="good">正解</span> 退避照舊；換 IP 是「分攤」不是「加速轟炸」。</div>
+    </div>
+    <div class="mist">
+      <div class="sym">通道沒了自我修復就長跑</div>
+      <div class="row"><span class="bad">後果</span> SSH 一斷，整輪爬取全變 rate_limited 空轉。</div>
+      <div class="row"><span class="good">正解</span> tmux + 重連迴圈 + <code class="k">ServerAliveInterval</code>。</div>
+    </div>
+    <div class="mist">
+      <div class="sym">拿掉 <code class="k">--http1.1</code></div>
+      <div class="row"><span class="bad">後果</span> 某些環境 HTTP/2 會 SSL EOF、回 <code class="k">000</code>（與 proxy 無關的老坑）。</div>
+      <div class="row"><span class="good">正解</span> curl 一律留 <code class="k">--http1.1</code>。</div>
+    </div>
+  </div>
+
+  <!-- ===== 7. 小結 ===== -->
+  <h2 id="wrap"><span class="n">7</span>小結與下一步</h2>
+  <p>這一步的精華不在 code（只有三行），而在<b>看懂 worker 有兩條通道、只該改一條</b>。
+    產物：<code class="k">WORKER_PROXY</code> / <code class="k">--proxy</code>，讓爬取從任意 SOCKS 出口出去，
+    向後相容、與 server 連線解耦。搭配一台雲端 VM 的 SSH SOCKS 通道，就能不多養 worker 而換一顆 IP。</p>
+
+  <h3>目前限制（就是下一章的預告）</h3>
+  <p>現在一次只吃一個 proxy——要真正規模化地分攤 Yahoo 限流，得<b>多顆出口 IP 輪替</b>
+    （多台 VM，或讓多機 worker 各自帶不同 <code class="k">--proxy</code>）。輪替策略與健康檢查留待後續。</p>
+
+  <details>
+    <summary>自我測驗 ①：為什麼 <code class="k">_req()</code>（連 server）不能也走這個 proxy？</summary>
+    <p>因為 server 常只在 tailnet（無公網 IP）。proxy 把流量從 VM 出去，而 VM 不在 tailnet，
+      根本連不到 server，worker 會租不到任務。限流的是「爬 Yahoo」那條，要改的也只有那條。</p>
+  </details>
+  <details>
+    <summary>自我測驗 ②：沒設 <code class="k">WORKER_PROXY</code> 也沒帶 <code class="k">--proxy</code> 時會怎樣？</summary>
+    <p><code class="k">PROXY = None</code>，<code class="k">fetch()</code> 裡 <code class="k">if PROXY:</code> 不成立，
+      curl 一個參數都不會多加——行為與這次改動前完全一致（實測 ③ 印出 <code class="k">None</code>）。</p>
+  </details>
+  <details>
+    <summary>自我測驗 ③：實測看到 <code class="k">html 長度 = 136872</code>，這數字證明了什麼？</summary>
+    <p>證明經 VM 出口拿到的是「正常的 Yahoo 搜尋頁」，而非被限流的空/小頁面
+      （worker 以 <code class="k">MIN_PAGE_BYTES=2000</code> 判斷；136872 ≫ 2000，所以 <code class="k">ok=True</code>）。</p>
+  </details>
+
+  <!-- ===== pagenav bottom ===== -->
+  <nav class="nav bottom">
+    <span>← 這是第一章</span>
+    <a class="toc" href="index.html">📖 目錄</a>
+    <span>下一章：待續 →</span>
+  </nav>
+
+</div>
+</body>
+</html>
