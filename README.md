@@ -43,8 +43,9 @@
 | `server.py` | 工作佇列 server（標準庫 http.server + sqlite3，零依賴）|
 | `worker.py` | 爬蟲 worker（curl --http1.1、民國+西元雙查、窗過濾、退避）|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
-| `export.py` | 把 DB 的 success 匯出成研究用 CSV |
+| `export.py` | 把 DB 的 success 匯出成研究用 CSV（含 `revenue`/`yoy`）|
 | `mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
+| `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
 **零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `worker.py` + `revlib.py`。
 
@@ -208,6 +209,22 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 - 想擴 worker：多開機器/IP 即可，任務佇列會自動分配、不重派（原子租約已驗證 8 併發 0 重複）。
 - 卡在 `dispatched` 的（worker 掛了）10 分鐘後自動回收，不用手動處理。
 - 全部跑完後 `failed` 那批可 `POST /admin/requeue-failed` 再掃一輪，改抓西元年常能救回。
+
+## 營收欄位（順手記錄，非權威）
+
+爬公布日時，Yahoo 搜尋 snippet（多為 MoneyDJ）本來就常帶著金額，例如
+`台化 109年8月營收189.84億、年減26.94%`。這段文字早已存進 `raw_title`，故 `revlib.parse_revenue`
+順手把它解析成兩個欄位，**回報 success 時自動寫入**：
+
+| 欄位 | 意義 |
+| --- | --- |
+| `revenue` | 單月(合併)營收，正規化為「元」（億/萬 換算）|
+| `yoy` | 年增率（%，正=增、負=減）|
+
+- 覆蓋率約 **9 成** success（其餘為格式異常/自結損益，後者刻意排除）。
+- ⚠️ **非權威**：來源非官方、金額四捨五入到億/萬兩位，僅供**交叉校驗/研究參考**；要精確到元請用 MOPS 月營收。
+- 既有 DB 一次性回填（**不重爬**）：`python3 backfill_revenue.py`（先停 server、先備份；`--dry-run` 可預覽）。
+  server 啟動時會自動 `ALTER TABLE` 補上這兩欄。
 
 ## 交叉驗證（MOPS，選配）
 

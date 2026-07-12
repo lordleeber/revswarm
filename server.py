@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   announce_date TEXT,
   source        TEXT,
   raw_title     TEXT,
+  revenue       INTEGER,          -- 月營收(元)，由 raw_title 解析；非官方、四捨五入，僅供校驗
+  yoy           REAL,             -- 年增率(%)，同上
   attempts      INTEGER DEFAULT 0,
   fail_count    INTEGER DEFAULT 0,
   dispatched_at INTEGER,
@@ -72,8 +74,17 @@ def connect(db_path):
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn):
+    """既有 DB 補欄位：CREATE TABLE IF NOT EXISTS 不會替舊表加欄位，故手動 ALTER。"""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+    for col, decl in (("revenue", "INTEGER"), ("yoy", "REAL")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
 
 
 def _tok_eq(a, b):
@@ -337,11 +348,14 @@ class Store:
                             )
                             counts["rejected"] += 1
                         else:
+                            title = item.get("title")
+                            rev = revlib.parse_revenue(title)   # 順手抽營收(非權威，僅校驗)
+                            revenue, yoy = rev if rev else (None, None)
                             conn.execute(
                                 "UPDATE tasks SET state='success', announce_date=?,"
-                                " source=?, raw_title=?, worker_id=?, dispatched_at=NULL,"
-                                " updated_at=? WHERE id=?",
-                                (valid, item.get("source"), item.get("title"),
+                                " source=?, raw_title=?, revenue=?, yoy=?, worker_id=?,"
+                                " dispatched_at=NULL, updated_at=? WHERE id=?",
+                                (valid, item.get("source"), title, revenue, yoy,
                                  worker_id, now, tid),
                             )
                             counts["success"] += 1
