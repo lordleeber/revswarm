@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>worker --proxy：借別人的 IP 繞 rate limit｜revswarm 教材</title>
+<title>worker --proxy：借別人的 IP 出口（SSH SOCKS）｜revswarm 教材</title>
 <style>
   :root{
     --bg:#0b0f16; --bg2:#0f1420; --card:#131a28; --card2:#171f30;
@@ -156,9 +156,10 @@
   <!-- ===== hero ===== -->
   <header class="hero">
     <span class="badge">PR · worker &nbsp;--proxy</span>
-    <h1>借別人的 IP 繞 rate limit</h1>
-    <p class="lead">Yahoo 按 IP 限流，多開機器很貴。這一章讓 worker 的爬取流量
-      改從一台雲端 VM 的 IP 出去——只加三行程式碼、VM 端零安裝、而且不動到 worker 連 server 的那條線。</p>
+    <h1>借別人的 IP 出口：SSH SOCKS</h1>
+    <p class="lead">把 worker 的爬取流量改從一台雲端 VM 的 IP 出去——只加三行程式碼、VM 端零安裝、
+      而且不動到 worker 連 server 的那條線。這是個乾淨、通用的技術……
+      <b>但我們當初是為了「繞 Yahoo rate limit」才做它,後來實測發現這個目的沒達成。</b></p>
     <div class="chips">
       <span class="chip mod">worker.py</span>
       <span class="chip mod">README.md</span>
@@ -166,12 +167,23 @@
     </div>
   </header>
 
+  <div class="card" style="border-left:3px solid var(--bad); background:#1e1418">
+    <p style="margin:0"><b>⚠️ 實測後記(請先讀)。</b>
+      這章的 SSH SOCKS 機制本身正確且可重用,但它<b>沒有</b>解決我們原本要解的「一直被 rate limit」。
+      實測發現:VM 的 IP 並不比本機 IP 乾淨,兩者被擋的比率在雜訊內;真凶是 Yahoo 邊緣間歇回的
+      <code class="k">500 INKApi Error</code>,解方是<b>就地重試</b>(PR #6),與換 IP 無關。
+      完整數據見文末 <a href="#postmortem">第 9 節・實測後記</a>。以下照原始開發順序保留,當作
+      「先量測、別憑直覺」的教材。</p>
+  </div>
+
   <!-- ===== 1. 為什麼 ===== -->
   <h2 id="why"><span class="n">1</span>為什麼需要這一步</h2>
   <p>revswarm 把 13.5 萬筆「股票 × 月份」的營收公布日爬回來，唯一來源是 Yahoo 搜尋。
-    痛點很直接——<b>Yahoo 按來源 IP 限流</b>：單一 IP 高頻查詢很快回小頁面、非 200，
-    worker 就得退避長睡。既有解法是「多開機器 = 多 IP 分攤」，但為了換一顆 IP 而養一台完整
-    worker（要能連 server、要部署程式）成本偏高。</p>
+    痛點很直接——worker 一直被判 <code class="k">rate_limited</code>：查詢很快回小頁面、非 200，
+    worker 就得退避長睡。<b>我們當時的假設是「Yahoo 按來源 IP 限流」</b>，既有解法是「多開機器 =
+    多 IP 分攤」，但為了換一顆 IP 而養一台完整 worker（要能連 server、要部署程式）成本偏高。</p>
+  <div class="note" style="border-left-color:var(--bad)"><b>先劇透:這個「按 IP 限流」的假設是錯的。</b>
+    但先照當時的思路走完(這正是本章的價值)——第 9 節會用數據推翻它。</div>
 
   <div class="card why">
     <p style="margin-top:0"><b>關鍵洞察：worker 其實有兩條互不相干的對外通道。</b>
@@ -266,14 +278,20 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
            <span class="s">"-A"</span>, UA,
            <span class="s">"-H"</span>, <span class="s">"Accept-Language: zh-TW,zh;q=0.9"</span>]
 <span class="hl">    <span class="kw">if</span> PROXY:</span><span class="hl">        cmd += [<span class="s">"--proxy"</span>, PROXY]              <span class="c"># socks5h:// → DNS 也在 proxy 端解</span></span>
-    <span class="kw">try</span>:
-        r = subprocess.<span class="fn">run</span>(
-            cmd,
-            ...
-        )</pre>
+    <span class="kw">for</span> attempt <span class="kw">in</span> <span class="fn">range</span>(<span class="s">1</span>, tries + <span class="s">1</span>):        <span class="c"># ← PR#6 後：就地重試</span>
+        html, retryable = <span class="fn">_curl_page</span>(cmd, timeout)   <span class="c"># 單次請求</span>
+        <span class="kw">if</span> html <span class="kw">is not</span> <span class="kw">None</span>:
+            <span class="kw">return</span> html, <span class="kw">True</span>
+        <span class="kw">if</span> <span class="kw">not</span> retryable:                        <span class="c"># 逾時：重試不划算，直接放棄</span>
+            <span class="kw">break</span>
+        <span class="kw">if</span> attempt &lt; tries:
+            time.<span class="fn">sleep</span>(retry_sleep)             <span class="c"># 500 等秒回抽風才重試</span>
+    <span class="kw">return</span> <span class="kw">None</span>, <span class="kw">False</span></pre>
   </div>
   <p class="muted" style="font-size:.92rem">既有的 <code class="k">--http1.1</code> 留著有原因：某些環境走 HTTP/2 會 SSL EOF、回
-    <code class="k">000</code>。這跟 proxy 無關，但一起走 curl，所以照舊。</p>
+    <code class="k">000</code>。這跟 proxy 無關，但一起走 curl，所以照舊。
+    （那個 <code class="k">for attempt</code> 重試迴圈是後來 PR#6 才加的——它才是真正解決 rate_limited 的東西，
+    原因見 <a href="#postmortem">第 9 節</a>；<code class="k">--proxy</code> 這段留著無害但非解方。）</p>
 
   <h3>③ 一個 <code class="k">--proxy</code> CLI 參數（也吃環境變數）</h3>
   <div class="code">
@@ -415,30 +433,79 @@ LISTEN 0 128   <span class="ip-me">127.0.0.1:1080</span>   0.0.0.0:*            
   </div>
 
   <!-- ===== 8. 小結 ===== -->
-  <h2 id="wrap"><span class="n">8</span>小結與下一步</h2>
-  <p>這一步的精華不在 code（只有三行），而在<b>看懂 worker 有兩條通道、只該改一條</b>。
+  <h2 id="wrap"><span class="n">8</span>小結（技術面）</h2>
+  <p>純就技術而言，這一步的精華在<b>看懂 worker 有兩條通道、只該改一條</b>。
     產物：<code class="k">WORKER_PROXY</code> / <code class="k">--proxy</code>，讓爬取從任意 SOCKS 出口出去，
-    向後相容、與 server 連線解耦。搭配一台雲端 VM 的 SSH SOCKS 通道，就能不多養 worker 而換一顆 IP。</p>
-
-  <h3>目前限制（就是下一章的預告）</h3>
-  <p>現在一次只吃一個 proxy——要真正規模化地分攤 Yahoo 限流，得<b>多顆出口 IP 輪替</b>
-    （多台 VM，或讓多機 worker 各自帶不同 <code class="k">--proxy</code>）。輪替策略與健康檢查留待後續。</p>
+    向後相容、與 server 連線解耦。搭配一台雲端 VM 的 SSH SOCKS 通道，就能不多養 worker 而換一顆 IP。
+    <b>這技術是對的、可重用的</b>——只是它要解的那個問題，其實不是這樣解的（見下一節）。</p>
 
   <details>
     <summary>自我測驗 ①：為什麼 <code class="k">_req()</code>（連 server）不能也走這個 proxy？</summary>
     <p>因為 server 常只在 tailnet（無公網 IP）。proxy 把流量從 VM 出去，而 VM 不在 tailnet，
-      根本連不到 server，worker 會租不到任務。限流的是「爬 Yahoo」那條，要改的也只有那條。</p>
+      根本連不到 server，worker 會租不到任務。要改的只有「爬 Yahoo」那條。</p>
   </details>
   <details>
     <summary>自我測驗 ②：沒設 <code class="k">WORKER_PROXY</code> 也沒帶 <code class="k">--proxy</code> 時會怎樣？</summary>
     <p><code class="k">PROXY = None</code>，<code class="k">fetch()</code> 裡 <code class="k">if PROXY:</code> 不成立，
-      curl 一個參數都不會多加——行為與這次改動前完全一致（實測 ③ 印出 <code class="k">None</code>）。</p>
+      curl 一個參數都不會多加——行為與這次改動前完全一致。</p>
   </details>
   <details>
-    <summary>自我測驗 ③：實測看到 <code class="k">html 長度 = 136872</code>，這數字證明了什麼？</summary>
-    <p>證明經 VM 出口拿到的是「正常的 Yahoo 搜尋頁」，而非被限流的空/小頁面
-      （worker 以 <code class="k">MIN_PAGE_BYTES=2000</code> 判斷；136872 ≫ 2000，所以 <code class="k">ok=True</code>）。</p>
+    <summary>自我測驗 ③：既然換 IP 沒用，這章還留著幹嘛？</summary>
+    <p>兩個理由：(1) SSH SOCKS 從固定出口出去是通用技術，日後真的需要換出口時直接可用；
+      (2) 它是「憑直覺假設病因 → 花力氣做方案 → 一量測發現搞錯」的活教材。留著比刪掉有價值。</p>
   </details>
+
+  <!-- ===== 9. 實測後記 ===== -->
+  <h2 id="postmortem"><span class="n">9</span>實測後記：換 IP 沒用，真凶是邊緣抽風</h2>
+  <p>做完 <code class="k">--proxy</code> 後，實際一量測，假設就垮了。以下都是<b>真跑出來</b>的數據。</p>
+
+  <h3>① 抓下失敗回應的 header——它根本不是「限流」</h3>
+  <div class="term">
+    <div class="term-hd">把回 500 的那次 response header 印出來</div>
+<pre><span class="prompt">$</span> curl ... -D - -o /dev/null   <span class="c"># 走 proxy，dump headers</span>
+HTTP/1.1 <span class="ip-me">500 INKApi Error</span>
+Server: ATS
+Content-Length: 0
+Connection: close
+<span class="c"># 沒有 Retry-After、沒有 X-RateLimit-* → 不是標準限流(429/503)</span></pre>
+  </div>
+  <ul class="annot">
+    <li data-m="◆"><code class="k">Server: ATS</code> = Yahoo 的邊緣 Apache <b>Traffic Server</b>；<code class="k">INKApi</code>
+      是它內部 API(INK＝Inktomi 老代號)。所以這 500 是<b>邊緣層自己出錯</b>，不是後端限流你。</li>
+  </ul>
+
+  <h3>② 有節奏交錯測 20 輪：VM IP 沒有比較好</h3>
+  <div class="term">
+    <div class="term-hd">每輪 proxy 打一發、直連打一發，間隔 6 秒</div>
+<pre>PROXY (VM 35.229.164.167) : 200=14  500=6   成功率 <span class="ip-me">70%</span>
+DIRECT(本機 61.219.173.229): 200=16  500=4   成功率 <span class="ok">80%</span></pre>
+  </div>
+  <ul class="annot">
+    <li data-m="◆">70% vs 80% 的差距在雜訊內；更關鍵的是逐筆看到<b>同一查詢、同一秒，兩顆 IP 一起 500</b>
+      → 這 500 綁的是<b>邊緣/該次請求</b>，不是來源 IP。換 IP 當然沒用。</li>
+  </ul>
+
+  <h3>③ 換個方向：就地重試——這才是解方</h3>
+  <div class="term">
+    <div class="term-hd">中 500 就地隔 2.5s 重試，看恢復率（直連 16 筆）</div>
+<pre>第一發就 200        : 13
+第一發 500          : 3
+  └ 重試 1 次就 200 : <span class="ok">3 / 3</span>
+不重試成功率 : <span class="ip-me">81%</span>   →   加一次重試 : <span class="ok">100%</span>  (16/16)</pre>
+  </div>
+  <ul class="annot">
+    <li data-m="◆">500 是<b>短暫抽風</b>，重打一次幾乎必復原。真正的修正是在 <code class="k">fetch()</code>
+      對非 200 就地重試（PR #6，即第 3 節那段 <code class="k">for attempt</code> 迴圈），跟換 IP 無關。</li>
+  </ul>
+
+  <div class="note" style="border-left-color:var(--good)"><b>這章真正的教訓。</b>
+    「一直被 rate limit」聽起來像 IP 問題，直覺就想換 IP。但<b>先量測</b>才發現:它根本不是限流,
+    是 Yahoo 邊緣間歇性 500，換 IP 治不了、重試才治得了。方案做得再乾淨，解錯問題就是白做——
+    先驗證病因，再動手。</div>
+
+  <div class="note"><b>那 <code class="k">--proxy</code> 白做了嗎？</b>不算。它本身正確、無害(未設時完全不生效)，
+    是可重用的「換固定出口」技術;只是別再拿它當繞 rate limit 的解方。proxy 通道(tmux <code class="k">socks</code>)
+    平時可直接收掉。</div>
 
   <!-- ===== pagenav bottom ===== -->
   <nav class="nav bottom">

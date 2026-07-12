@@ -161,5 +161,45 @@ class TestBackoffAndBlock(unittest.TestCase):
         self.assertTrue(all(r["status"] == "rate_limited" for r in reported))
 
 
+class TestFetchRetry(unittest.TestCase):
+    """fetch() 就地重試：秒回失敗重試、逾時不重試、用完 tries 才放棄。"""
+
+    def setUp(self):
+        self._curl = worker._curl_page
+
+    def tearDown(self):
+        worker._curl_page = self._curl
+
+    def _patch(self, seq):
+        """讓 _curl_page 依序回傳 seq；記錄被呼叫次數。"""
+        self.calls = 0
+
+        def fake(cmd, timeout):
+            self.calls += 1
+            return seq[self.calls - 1]
+        worker._curl_page = fake
+
+    def test_retries_transient_then_succeeds(self):
+        # 前兩次「可重試」失敗 → 第三次成功
+        self._patch([(None, True), (None, True), ("x" * 3000, True)])
+        html, ok = worker.fetch("q", tries=3, retry_sleep=0)
+        self.assertTrue(ok)
+        self.assertEqual(self.calls, 3)
+
+    def test_no_retry_on_timeout(self):
+        # 逾時類（retryable=False）→ 只打一次，不重試
+        self._patch([(None, False), ("x" * 3000, True)])
+        html, ok = worker.fetch("q", tries=3, retry_sleep=0)
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, 1)
+
+    def test_gives_up_after_tries(self):
+        # 一直可重試失敗 → 試滿 tries 次才放棄
+        self._patch([(None, True)] * 5)
+        html, ok = worker.fetch("q", tries=3, retry_sleep=0)
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

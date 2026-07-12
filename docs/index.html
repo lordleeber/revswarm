@@ -58,27 +58,18 @@
   <a class="chap" href="worker-proxy.html">
     <div class="num">1</div>
     <div class="body">
-      <div class="t">借別人的 IP 繞 rate limit</div>
-      <div class="d">讓 worker 爬 Yahoo 的 curl 走 SSH SOCKS5，從一台雲端 VM 的 IP 出去；
-        只加三行、VM 端零安裝，且不動連 server 的那條線。</div>
+      <div class="t">借別人的 IP 出口（SSH SOCKS）＋一個踩雷的教訓</div>
+      <div class="d">讓 worker 爬 Yahoo 的 curl 走 SSH SOCKS5，從一台雲端 VM 的 IP 出去（技術正確、可重用）。
+        但我們原本是想用它「繞 rate limit」——實測後發現搞錯病因：真凶是 Yahoo 邊緣間歇 500，解方是重試而非換 IP。</div>
       <div class="tags">
         <span class="tag">worker.py</span>
         <span class="tag">--proxy / WORKER_PROXY</span>
-        <span class="tag new">docs/worker-proxy.html</span>
+        <span class="tag">500 INKApi 後記</span>
       </div>
     </div>
   </a>
 
-  <div class="chap soon">
-    <div class="num">2</div>
-    <div class="body">
-      <div class="t">多出口 IP 輪替（待續）</div>
-      <div class="d">一台 VM 只有一顆 IP。下一步：多顆出口輪替 + 健康檢查，真正規模化分攤限流。</div>
-      <div class="tags"><span class="tag">下一個 PR</span></div>
-    </div>
-  </div>
-
-  <div class="foot">每章末的「目前限制」就是下一章的預告。</div>
+  <div class="foot">先量測、別憑直覺——第 1 章第 9 節的實測後記就是這句話的活教材。</div>
 </div>
 </body>
 </html>
