@@ -196,15 +196,22 @@ def load_baseline(path):
 
 
 # --- 讀 revswarm ------------------------------------------------------------
-def load_revswarm(db, codes):
-    """回傳 {(stock,ry,rm): (state, announce_date)}，限定 codes。"""
+def load_revswarm(db, codes, chunk=500):
+    """回傳 {(stock,ry,rm): (state, announce_date)}，限定 codes。
+
+    分批查詢：全量(1848 檔)時 IN(?…) 的參數數會超過舊版 SQLite(<3.32)的
+    變數上限 999 而丟 too many SQL variables；切成每批 <=chunk 個避免。
+    """
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     out = {}
-    qmarks = ",".join("?" * len(codes))
-    for r in conn.execute(
-        f"SELECT stock_id, roc_year, roc_month, state, announce_date"
-        f" FROM tasks WHERE stock_id IN ({qmarks})", list(codes)):
-        out[(r[0], r[1], r[2])] = (r[3], r[4])
+    codes = list(codes)
+    for i in range(0, len(codes), chunk):
+        batch = codes[i:i + chunk]
+        qmarks = ",".join("?" * len(batch))
+        for r in conn.execute(
+            f"SELECT stock_id, roc_year, roc_month, state, announce_date"
+            f" FROM tasks WHERE stock_id IN ({qmarks})", batch):
+            out[(r[0], r[1], r[2])] = (r[3], r[4])
     conn.close()
     return out
 
