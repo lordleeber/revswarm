@@ -35,6 +35,9 @@ import revlib
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 MIN_PAGE_BYTES = 2000        # 小於此視為被限流/擋（todo 2.6）
+# 讓 curl 走 proxy（例 socks5h://127.0.0.1:1080，經 SSH SOCKS 從別的 IP 出去繞 per-IP
+# rate limit）。只影響爬 Yahoo 的 curl；worker↔server 的 urllib 不受影響、仍走原路。
+PROXY = os.environ.get("WORKER_PROXY") or None
 
 
 # --- 抓取 -------------------------------------------------------------------
@@ -43,14 +46,17 @@ def fetch(query, timeout=25):
     curl --http1.1 抓 Yahoo 搜尋頁。回傳 (html, ok)。
     ok=False = RATE_LIMITED 訊號（curl 失敗 / 非200 / 頁面過小）。
     """
+    cmd = ["curl", "-sS", "--http1.1", "-m", str(timeout), "-G",
+           "-w", "\n%{http_code}",            # 末行附上 HTTP 狀態碼
+           "https://tw.search.yahoo.com/search",
+           "--data-urlencode", f"p={query}",
+           "-A", UA,
+           "-H", "Accept-Language: zh-TW,zh;q=0.9"]
+    if PROXY:
+        cmd += ["--proxy", PROXY]              # socks5h:// → DNS 也在 proxy 端解
     try:
         r = subprocess.run(
-            ["curl", "-sS", "--http1.1", "-m", str(timeout), "-G",
-             "-w", "\n%{http_code}",           # 末行附上 HTTP 狀態碼
-             "https://tw.search.yahoo.com/search",
-             "--data-urlencode", f"p={query}",
-             "-A", UA,
-             "-H", "Accept-Language: zh-TW,zh;q=0.9"],
+            cmd,
             # Yahoo 頁是 UTF-8：務必明確指定，否則 Windows 會用系統 locale
             # (如 cp950) 解碼 → UnicodeDecodeError、stdout 變 None。errors=replace
             # 讓少數壞位元組不致中斷解析。
@@ -223,7 +229,13 @@ def main():
                     help="佇列空時的等待秒數")
     ap.add_argument("--once", action="store_true", help="只跑一批就結束（測試用）")
     ap.add_argument("--max-batches", type=int, default=0, help="跑幾批後結束(0=不限)")
+    ap.add_argument("--proxy", default=os.environ.get("WORKER_PROXY"),
+                    help="爬 Yahoo 的 curl 走此 proxy，如 socks5h://127.0.0.1:1080"
+                         "（繞 per-IP rate limit）；預設讀環境變數 WORKER_PROXY")
     args = ap.parse_args()
+
+    global PROXY
+    PROXY = args.proxy or None
 
     try:
         run(args)

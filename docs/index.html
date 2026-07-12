@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>revswarm 教材｜隨 PR 共生的實作筆記</title>
+<style>
+  :root{
+    --bg:#0b0f16; --ink:#e6edf3; --muted:#9aa7b8; --faint:#66748a; --line:#26304480;
+    --card:#131a28; --socks:#2dd4bf; --worker:#5b9dff; --vm:#f4a63b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:linear-gradient(180deg,#0b0f16,#0c1119 45%,#0b0f16);
+    color:var(--ink); font:16px/1.7 -apple-system,"Segoe UI",Roboto,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:820px; margin:0 auto; padding:64px 20px 90px}
+  a{text-decoration:none; color:inherit}
+
+  .kicker{font-size:.78rem; letter-spacing:.18em; text-transform:uppercase; color:var(--socks); font-weight:800}
+  h1{font-size:2.4rem; line-height:1.15; margin:.35em 0 .25em; letter-spacing:.01em}
+  .sub{color:#c4cfdd; font-size:1.1rem; max-width:60ch}
+  .meta{color:var(--faint); font-size:.9rem; margin-top:1.1em}
+  .rule{height:1px; background:var(--line); margin:34px 0 8px}
+
+  .toc-h{font-size:.8rem; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); margin:26px 0 12px}
+
+  .chap{display:flex; gap:16px; align-items:flex-start; background:var(--card); border:1px solid var(--line);
+    border-radius:16px; padding:20px 22px; margin:14px 0; transition:border-color .15s, transform .15s}
+  .chap:hover{border-color:#2dd4bf66; transform:translateY(-2px)}
+  .num{flex:0 0 auto; width:44px; height:44px; border-radius:12px; display:grid; place-items:center;
+    font-weight:800; font-size:1.1rem; color:#0b0f16; background:linear-gradient(135deg,var(--socks),var(--worker))}
+  .chap .body{flex:1}
+  .chap .t{font-size:1.18rem; font-weight:700; color:#fff}
+  .chap .d{color:#bcc8d7; font-size:.95rem; margin:.25em 0 .5em}
+  .tags{display:flex; flex-wrap:wrap; gap:6px}
+  .tag{font-size:.75rem; font-family:ui-monospace,Menlo,monospace; padding:.2em .55em; border-radius:7px;
+    border:1px solid var(--line); background:#101725; color:#9fb0c4}
+  .tag.new{border-color:#2dd4bf55; background:#0e211f; color:#7ff0df}
+
+  .soon{opacity:.5; border-style:dashed}
+  .soon .num{background:#1c2536; color:#66748a}
+  .soon:hover{transform:none; border-color:var(--line)}
+
+  .foot{color:var(--faint); font-size:.85rem; margin-top:40px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="kicker">revswarm · 實作筆記</div>
+  <h1>隨 PR 共生的教材</h1>
+  <p class="sub">一個 PR ＝ 一章。寫章的就是寫 code 的同一雙手——踩過的坑、調過的參數、真跑出來的輸出，
+    都是第一手素材。分散式爬蟲把台股月營收公布日爬回來的過程，一步一章記下來。</p>
+  <div class="meta">深色主題 · 每頁單檔自足 · 色彩＝執行者</div>
+
+  <div class="rule"></div>
+  <div class="toc-h">目錄</div>
+
+  <a class="chap" href="worker-proxy.html">
+    <div class="num">1</div>
+    <div class="body">
+      <div class="t">借別人的 IP 繞 rate limit</div>
+      <div class="d">讓 worker 爬 Yahoo 的 curl 走 SSH SOCKS5，從一台雲端 VM 的 IP 出去；
+        只加三行、VM 端零安裝，且不動連 server 的那條線。</div>
+      <div class="tags">
+        <span class="tag">worker.py</span>
+        <span class="tag">--proxy / WORKER_PROXY</span>
+        <span class="tag new">docs/worker-proxy.html</span>
+      </div>
+    </div>
+  </a>
+
+  <div class="chap soon">
+    <div class="num">2</div>
+    <div class="body">
+      <div class="t">多出口 IP 輪替（待續）</div>
+      <div class="d">一台 VM 只有一顆 IP。下一步：多顆出口輪替 + 健康檢查，真正規模化分攤限流。</div>
+      <div class="tags"><span class="tag">下一個 PR</span></div>
+    </div>
+  </div>
+
+  <div class="foot">每章末的「目前限制」就是下一章的預告。</div>
+</div>
+</body>
+</html>
