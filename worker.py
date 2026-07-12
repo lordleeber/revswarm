@@ -41,10 +41,15 @@ PROXY = os.environ.get("WORKER_PROXY") or None
 
 
 # --- 抓取 -------------------------------------------------------------------
-def fetch(query, timeout=25):
+def fetch(query, timeout=25, tries=3, retry_sleep=2.5):
     """
     curl --http1.1 抓 Yahoo 搜尋頁。回傳 (html, ok)。
     ok=False = RATE_LIMITED 訊號（curl 失敗 / 非200 / 頁面過小）。
+
+    Yahoo 邊緣(Server: ATS)會間歇回 500 INKApi Error（空 body、無 Retry-After，
+    非標準限流碼），多半隔幾秒就自癒。實測：隔 2.5s 重試 1 次即恢復（單發 ~81%
+    → 加重試 ~100%）。故非 200/失敗時就地短退避重試 tries 次，仍不行才回報
+    rate_limited——這也順帶少觸發上層「連續 rate_limited → 判本機 IP 被擋」的長睡。
     """
     cmd = ["curl", "-sS", "--http1.1", "-m", str(timeout), "-G",
            "-w", "\n%{http_code}",            # 末行附上 HTTP 狀態碼
@@ -54,6 +59,17 @@ def fetch(query, timeout=25):
            "-H", "Accept-Language: zh-TW,zh;q=0.9"]
     if PROXY:
         cmd += ["--proxy", PROXY]              # socks5h:// → DNS 也在 proxy 端解
+    for attempt in range(1, tries + 1):
+        html = _curl_page(cmd, timeout)
+        if html is not None:
+            return html, True
+        if attempt < tries:
+            time.sleep(retry_sleep)            # 500 INKApi 等短暫抽風，就地重試
+    return None, False
+
+
+def _curl_page(cmd, timeout):
+    """跑一次 curl，回傳合格的 html；curl 失敗 / 非200 / 頁面過小則回 None。"""
     try:
         r = subprocess.run(
             cmd,
@@ -64,19 +80,19 @@ def fetch(query, timeout=25):
             timeout=timeout + 8,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return None, False
+        return None
     if r.returncode != 0 or r.stdout is None:
-        return None, False
+        return None
     out = r.stdout
     # 拆出最後一行的 http_code
     nl = out.rfind("\n")
     code = out[nl + 1:].strip() if nl >= 0 else ""
     html = out[:nl] if nl >= 0 else out
     if code != "200":
-        return None, False
+        return None
     if not html or len(html) < MIN_PAGE_BYTES:
-        return None, False
-    return html, True
+        return None
+    return html
 
 
 def crawl_task(task, per_query_sleep):
