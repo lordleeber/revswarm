@@ -279,11 +279,13 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
            <span class="s">"-H"</span>, <span class="s">"Accept-Language: zh-TW,zh;q=0.9"</span>]
 <span class="hl">    <span class="kw">if</span> PROXY:</span><span class="hl">        cmd += [<span class="s">"--proxy"</span>, PROXY]              <span class="c"># socks5h:// → DNS 也在 proxy 端解</span></span>
     <span class="kw">for</span> attempt <span class="kw">in</span> <span class="fn">range</span>(<span class="s">1</span>, tries + <span class="s">1</span>):        <span class="c"># ← PR#6 後：就地重試</span>
-        html = <span class="fn">_curl_page</span>(cmd, timeout)       <span class="c"># 單次請求（subprocess.run 在此）</span>
+        html, retryable = <span class="fn">_curl_page</span>(cmd, timeout)   <span class="c"># 單次請求</span>
         <span class="kw">if</span> html <span class="kw">is not</span> <span class="kw">None</span>:
             <span class="kw">return</span> html, <span class="kw">True</span>
+        <span class="kw">if</span> <span class="kw">not</span> retryable:                        <span class="c"># 逾時：重試不划算，直接放棄</span>
+            <span class="kw">break</span>
         <span class="kw">if</span> attempt &lt; tries:
-            time.<span class="fn">sleep</span>(retry_sleep)             <span class="c"># 500 INKApi 抽風，就地重試</span>
+            time.<span class="fn">sleep</span>(retry_sleep)             <span class="c"># 500 等秒回抽風才重試</span>
     <span class="kw">return</span> <span class="kw">None</span>, <span class="kw">False</span></pre>
   </div>
   <p class="muted" style="font-size:.92rem">既有的 <code class="k">--http1.1</code> 留著有原因：某些環境走 HTTP/2 會 SSL EOF、回

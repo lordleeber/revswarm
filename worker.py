@@ -48,8 +48,9 @@ def fetch(query, timeout=25, tries=3, retry_sleep=2.5):
 
     Yahoo 邊緣(Server: ATS)會間歇回 500 INKApi Error（空 body、無 Retry-After，
     非標準限流碼），多半隔幾秒就自癒。實測：隔 2.5s 重試 1 次即恢復（單發 ~81%
-    → 加重試 ~100%）。故非 200/失敗時就地短退避重試 tries 次，仍不行才回報
-    rate_limited——這也順帶少觸發上層「連續 rate_limited → 判本機 IP 被擋」的長睡。
+    → 加重試 ~100%）。故對「秒回」的非 200/失敗就地短退避重試 tries 次，仍不行才
+    回報 rate_limited——這也順帶少觸發上層「連續 rate_limited → 判本機 IP 被擋」的長睡。
+    但「逾時」不重試：它已耗掉整段 timeout，重試只是把單筆時間乘上 tries 倍。
     """
     cmd = ["curl", "-sS", "--http1.1", "-m", str(timeout), "-G",
            "-w", "\n%{http_code}",            # 末行附上 HTTP 狀態碼
@@ -60,16 +61,21 @@ def fetch(query, timeout=25, tries=3, retry_sleep=2.5):
     if PROXY:
         cmd += ["--proxy", PROXY]              # socks5h:// → DNS 也在 proxy 端解
     for attempt in range(1, tries + 1):
-        html = _curl_page(cmd, timeout)
+        html, retryable = _curl_page(cmd, timeout)
         if html is not None:
             return html, True
+        if not retryable:                      # 逾時等：已耗掉整段時間，重試不划算
+            break
         if attempt < tries:
-            time.sleep(retry_sleep)            # 500 INKApi 等短暫抽風，就地重試
+            time.sleep(retry_sleep)            # 500 INKApi 等秒回抽風，就地重試
     return None, False
 
 
 def _curl_page(cmd, timeout):
-    """跑一次 curl，回傳合格的 html；curl 失敗 / 非200 / 頁面過小則回 None。"""
+    """跑一次 curl。回傳 (html, retryable)：
+       html      = 合格頁面，或 None（curl 失敗 / 非200 / 頁面過小）
+       retryable = 這次失敗是否「值得就地重試」。逾時(已耗掉整段 timeout)→ False；
+                   秒回的非200/500/頁面過小、或其他 curl 錯誤 → True。"""
     try:
         r = subprocess.run(
             cmd,
@@ -79,20 +85,24 @@ def _curl_page(cmd, timeout):
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout + 8,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
+    except subprocess.TimeoutExpired:
+        return None, False                     # 逾時：重試不划算
+    except OSError:
+        return None, False                     # curl 起不來：重試也沒用
+    if r.returncode == 28:                      # curl exit 28 = operation timeout（-m 命中）
+        return None, False
     if r.returncode != 0 or r.stdout is None:
-        return None
+        return None, True                       # 其他 curl 錯誤（如連線重置）可能短暫
     out = r.stdout
     # 拆出最後一行的 http_code
     nl = out.rfind("\n")
     code = out[nl + 1:].strip() if nl >= 0 else ""
     html = out[:nl] if nl >= 0 else out
     if code != "200":
-        return None
+        return None, True                       # 例如 500 INKApi：秒回，重試幾乎必復原
     if not html or len(html) < MIN_PAGE_BYTES:
-        return None
-    return html
+        return None, True
+    return html, True
 
 
 def crawl_task(task, per_query_sleep):
