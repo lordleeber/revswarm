@@ -59,7 +59,10 @@ def main():
     for (sid, ry, rm), md in base.items():
         if (ry, rm) < revlib.ROC_START or (ry, rm) > revlib.ROC_END:
             continue
-        y, mo, d = (int(x) for x in md.split("-"))
+        try:
+            y, mo, d = (int(x) for x in md.split("-"))
+        except ValueError:            # 畸形 MOPS 日期：skip，不中斷整個 run（對齊 mops_fill）
+            continue
         if not revlib.in_window(y, mo, d, ry, rm):
             continue
         row = conn.execute(
