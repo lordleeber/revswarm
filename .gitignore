@@ -18,3 +18,6 @@ all.csv
 mops_baseline.csv
 mops_baseline.csv.done
 mops_validation.csv
+
+# DB 備份快照（mops_fill.py / mops_overwrite.py 執行前自動備份，勿進版控）
+*.bak-*
