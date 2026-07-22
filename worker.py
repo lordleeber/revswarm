@@ -6,9 +6,10 @@ revswarm worker：可在任意機器啟動，向 server 租任務、爬 Yahoo �
 爬取配方（todo.txt 第3節）：
   對單一 (股票,月份)：
     1. 依序試查詢字串（中一個就停）：
-         q_roc = "{name} {roc_year}年{roc_month}月"        # 民國年 → 常釣到 MoneyDJ
-         q_ad  = "{name} {roc_year+1911}年{roc_month}月"    # 西元年 → 常釣到 Yahoo【公告】
+         q_roc = "{stock_id} {name} {roc_year}年{roc_month}月"     # 民國年 → 常釣到 MoneyDJ
+         q_ad  = "{stock_id} {name} {roc_year+1911}年{roc_month}月" # 西元年 → 常釣到 Yahoo【公告】
        ⚠️ 絕不在查詢後加「營收」二字（會害 recall 掉一半，todo 2.3a）。
+       名稱前綴 4 碼代號，冷門股/舊月份的命中率通常較純名稱高。
     2. curl 一定加 --http1.1（否則 HTTP/2 在某些環境 SSL EOF、回 000）。
     3. 分類：curl 非0 / http!=200 / 頁面 <2000B → RATE_LIMITED（退避重試，不算 failed）。
     4. 解析：窗過濾（次月1~15）+ 精確名稱錨點（見 revlib.parse）。
@@ -111,10 +112,13 @@ def crawl_task(task, per_query_sleep):
       status ∈ success | failed | rate_limited
     """
     name = task["name"]
+    sid = task["stock_id"]
     ry, rm = task["roc_year"], task["roc_month"]
+    # 名稱前綴 4 碼股票代號：釣冷門股/舊月份時，代號比純名稱更能命中 MoneyDJ/Yahoo
+    # 標題（多半含代號），同時消歧同名公司。解析錨點仍只用 name（見 revlib.parse）。
     queries = [
-        ("q_roc", f"{name} {ry}年{rm}月"),
-        ("q_ad", f"{name} {ry + 1911}年{rm}月"),
+        ("q_roc", f"{sid} {name} {ry}年{rm}月"),
+        ("q_ad", f"{sid} {name} {ry + 1911}年{rm}月"),
     ]
     saw_rate_limited = False
     tried_ok = False
