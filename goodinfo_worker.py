@@ -13,7 +13,8 @@ goodinfo 對畢業公司仍保有完整歷史（含「公開發行日期」＝�
 是判「上市前任務」最準的否決來源。
 
 反爬與繞法（已實測）：goodinfo 有 JS cookie 關卡(CLIENT_KEY)+REINIT 重載 + Cloudflare 被動偵測。
-  兩步式：① 先打一次取 stub、從中抓當次 REINIT；② 帶手工 CLIENT_KEY cookie + REINIT 再打 → 真頁。
+  帶手工 CLIENT_KEY cookie + REINIT 參數即可取真頁。單次優先：先用硬編 REINIT 打一次，
+  回擋爬頁才退回兩步式（先取 stub 抓當次 REINIT 再打）——多數情況省一半請求。
 
 負責任地用：
   - 預設每檔間隔 --sleep 秒 + 隨機抖動；偵測到擋爬 stub 會退避重試，仍失敗記 blocked 續跑。
@@ -46,6 +47,7 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 # 依 goodinfo stub JS 格式手工組（實測可過關卡）：4.5|const|const|tzoffset|date|0|0|0
 CLIENT_KEY = "4.5|41174.1506786617|46729.7062342172|-480|46224.65|0|0|0"
+DEFAULT_REINIT = "46224.6557291667"    # 硬編 REINIT；帶 cookie 時單次請求多半即可過關卡
 
 DATE_FIELDS = {          # goodinfo 中文欄位 -> DB 欄位
     "上市日期": "listed_date", "上櫃日期": "otc_date", "興櫃日期": "emerging_date",
@@ -112,15 +114,20 @@ def dates_from(fields):
 
 
 def fetch_one(sid, proxy):
-    """兩步式取真頁；回 (raw_html, fields, status)。"""
-    stub, _ = curl(f"{BASE}?STOCK_ID={sid}", proxy)
-    m = re.search(r"REINIT=([0-9.]+)", stub)
-    reinit = m.group(1) if m else "46224.6557291667"
-    t, rc = curl(f"{BASE}?STOCK_ID={sid}&REINIT={reinit}", proxy)
+    """先試單次(硬編 REINIT)；回擋爬頁才退回兩步式(先抓 stub 取當次 REINIT 再打)。
+    多數情況省一半請求（對反爬兇的 goodinfo 較禮貌）。回 (raw_html, fields, status)。"""
+    t, rc = curl(f"{BASE}?STOCK_ID={sid}&REINIT={DEFAULT_REINIT}", proxy)
     if rc != 0:
         return None, None, f"curl_err({rc})"
-    if is_bad_page(t):
-        return None, None, "blocked"
+    if is_bad_page(t):                      # 單次沒過 → 兩步式：抓 stub 取當次 REINIT 再打
+        stub, _ = curl(f"{BASE}?STOCK_ID={sid}", proxy)
+        m = re.search(r"REINIT=([0-9.]+)", stub)
+        reinit = m.group(1) if m else DEFAULT_REINIT
+        t, rc = curl(f"{BASE}?STOCK_ID={sid}&REINIT={reinit}", proxy)
+        if rc != 0:
+            return None, None, f"curl_err({rc})"
+        if is_bad_page(t):
+            return None, None, "blocked"
     return t, parse_all(t), "ok"
 
 
