@@ -75,9 +75,10 @@ def curl(url, proxy, timeout=25):
     return r.stdout.decode("utf-8", "replace"), r.returncode
 
 
-def is_stub(t):
-    return len(t) < 5000 or ("window.location.replace" in t
-                             and "公開發行日期" not in t)
+def is_bad_page(t):
+    """非真頁：太小 / JS 重載 stub / Cloudflare 錯誤頁(520/522…)。
+    真的基本資料頁一定含「公司名稱」標籤；據此擋掉所有假頁（含 >5KB 的 CF 錯誤頁）。"""
+    return len(t) < 5000 or "公司名稱" not in t
 
 
 def parse_all(t):
@@ -118,7 +119,7 @@ def fetch_one(sid, proxy):
     t, rc = curl(f"{BASE}?STOCK_ID={sid}&REINIT={reinit}", proxy)
     if rc != 0:
         return None, None, f"curl_err({rc})"
-    if is_stub(t):
+    if is_bad_page(t):
         return None, None, "blocked"
     return t, parse_all(t), "ok"
 
