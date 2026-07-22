@@ -21,3 +21,9 @@ mops_validation.csv
 
 # DB 備份快照（mops_fill.py / mops_overwrite.py 執行前自動備份，勿進版控）
 *.bak-*
+
+# 來源/衍生資料暫存區（官方 TWSE/TPEx 下載檔、build 產物，可重抓/重建，不進版控）
+tmp/
+
+# Goodinfo 爬取的第三方資料（受其 ToS 保護，勿進版控/散布）
+goodinfo/

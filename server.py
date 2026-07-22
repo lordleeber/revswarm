@@ -118,17 +118,25 @@ def clamp_refresh(raw, default=10):
 
 
 def derive_stats(by_state, recent_success):
-    """由各 state 計數 + 近 5 分鐘成功數，導出進度/成功率/吞吐/ETA。stats 與 dashboard 共用。"""
+    """由各 state 計數 + 近 5 分鐘成功數，導出進度/成功率/吞吐/ETA。stats 與 dashboard 共用。
+
+    prelisting（公司首次公開前、不可能有月營收，見 mark_prelisting.py）不會被 lease，
+    故排除在「應做總數(workable)」之外——進度與 ETA 以 workable 為分母，數字才誠實。
+    """
     total = sum(by_state.values())
+    excluded = by_state.get("prelisting", 0)      # 上市前：排除在進度分母外
+    workable = total - excluded
     done = by_state.get("success", 0) + by_state.get("failed", 0)
     rate_per_min = recent_success / 5.0
-    remaining = total - done
+    remaining = workable - done
     eta_min = (remaining / rate_per_min) if rate_per_min > 0 else None
     return {
         "total": total,
+        "prelisting": excluded,
+        "workable": workable,
         "by_state": by_state,
         "done": done,
-        "progress_pct": round(100.0 * done / total, 2) if total else 0.0,
+        "progress_pct": round(100.0 * done / workable, 2) if workable else 0.0,
         "success": by_state.get("success", 0),
         "failed": by_state.get("failed", 0),
         "success_rate_pct": round(
@@ -184,11 +192,12 @@ def render_status_html(d, refresh_sec=10):
     by = d["by_state"]
     cards = [
         ("進度", f'{d["progress_pct"]}%', "dim"),
-        ("完成 / 總數", f'{d["done"]} / {d["total"]}', "dim"),
+        ("完成 / 應做", f'{d["done"]} / {d["workable"]}', "dim"),
         ("success", by.get("success", 0), "ok"),
         ("failed", by.get("failed", 0), "bad"),
         ("undone", by.get("undone", 0), "dim"),
         ("dispatched", by.get("dispatched", 0), "warn"),
+        ("上市前(排除)", by.get("prelisting", 0), "dim"),
         ("成功率", "—" if d["success_rate_pct"] is None else f'{d["success_rate_pct"]}%', "dim"),
         ("吞吐 / 分", d["throughput_per_min"], "dim"),
         ("近 5 分成功", d["recent_success_5min"], "dim"),

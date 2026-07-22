@@ -32,12 +32,24 @@ class TestDeriveStats(unittest.TestCase):
         self.assertIsNone(d["success_rate_pct"])         # done=0 → 不算成功率
         self.assertIsNone(d["eta_min"])                  # 吞吐 0 → 無 ETA
 
+    def test_prelisting_excluded(self):
+        # prelisting 不計入進度分母：workable = total - prelisting
+        by = {"undone": 50, "success": 40, "failed": 10, "prelisting": 100}
+        d = server.derive_stats(by, recent_success=25)   # 25/5=5 筆/分
+        self.assertEqual(d["total"], 200)
+        self.assertEqual(d["prelisting"], 100)
+        self.assertEqual(d["workable"], 100)             # 200 - 100
+        self.assertEqual(d["done"], 50)                  # success+failed
+        self.assertEqual(d["progress_pct"], 50.0)        # 50/100，不是 50/200
+        self.assertEqual(d["eta_min"], round(50 / 5.0, 1))  # remaining=workable-done=50
+
 
 class TestRenderStatus(unittest.TestCase):
     def _d(self, **over):
         d = {
-            "total": 100, "by_state": {"success": 40, "failed": 5,
-                                       "undone": 50, "dispatched": 5},
+            "total": 100, "prelisting": 0, "workable": 100,
+            "by_state": {"success": 40, "failed": 5,
+                         "undone": 50, "dispatched": 5},
             "done": 45, "progress_pct": 45.0, "success": 40, "failed": 5,
             "success_rate_pct": 88.89, "recent_success_5min": 12,
             "throughput_per_min": 2.4, "eta_min": 22.9,
