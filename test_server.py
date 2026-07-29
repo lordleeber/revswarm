@@ -182,6 +182,69 @@ class TestLeaseOrder(unittest.TestCase):
         self.assertEqual(st, "dispatched")
 
 
+class TestEngineRouting(unittest.TestCase):
+    """engine 分流：lease 依 engine 過濾、requeue_failed(engine=) 轉交佇列。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _ins(self, stock, ry, rm, state="undone", engine="yahoo"):
+        self.store.conn.execute(
+            "INSERT INTO tasks(stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(?,?,?,?,?,?,0)", (stock, "測", ry, rm, state, engine))
+
+    def test_lease_defaults_to_yahoo_and_ignores_google(self):
+        self._ins("A", 109, 1, engine="yahoo")
+        self._ins("B", 109, 1, engine="google")
+        self.store.conn.commit()
+        batch = self.store.lease(5, "w")               # 不傳 engine → 預設 yahoo
+        self.assertEqual([t["stock_id"] for t in batch], ["A"])
+
+    def test_lease_google_only_sees_google_queue(self):
+        self._ins("A", 109, 1, engine="yahoo")
+        self._ins("B", 109, 1, engine="google")
+        self.store.conn.commit()
+        batch = self.store.lease(5, "w", engine="google")
+        self.assertEqual([t["stock_id"] for t in batch], ["B"])
+
+    def test_requeue_failed_without_engine_keeps_engine_unchanged(self):
+        # 既有行為：不指定 engine → 只改 state，不動 engine（沿用同一種 worker 再掃）。
+        self._ins("A", 109, 1, state="failed", engine="yahoo")
+        self.store.conn.commit()
+        n = self.store.requeue_failed()
+        self.assertEqual(n, 1)
+        row = self.store.conn.execute(
+            "SELECT state, engine FROM tasks WHERE stock_id='A'").fetchone()
+        self.assertEqual((row["state"], row["engine"]), ("undone", "yahoo"))
+
+    def test_requeue_failed_with_engine_reroutes_queue(self):
+        self._ins("A", 109, 1, state="failed", engine="yahoo")
+        self._ins("B", 109, 1, state="success", engine="yahoo")  # 不該被動到
+        self.store.conn.commit()
+        n = self.store.requeue_failed(engine="google")
+        self.assertEqual(n, 1)
+        row_a = self.store.conn.execute(
+            "SELECT state, engine FROM tasks WHERE stock_id='A'").fetchone()
+        self.assertEqual((row_a["state"], row_a["engine"]), ("undone", "google"))
+        row_b = self.store.conn.execute(
+            "SELECT state, engine FROM tasks WHERE stock_id='B'").fetchone()
+        self.assertEqual((row_b["state"], row_b["engine"]), ("success", "yahoo"))
+        # 剛被轉去 google 的任務，yahoo worker 租不到；google worker 租得到。
+        self.assertEqual(self.store.lease(5, "w", engine="yahoo"), [])
+        self.assertEqual(
+            [t["stock_id"] for t in self.store.lease(5, "w", engine="google")], ["A"])
+
+
 class TestAuth(unittest.TestCase):
     TOK = "s3cret"
 
