@@ -42,12 +42,15 @@
 | `init_tasks.py` | 展開 1848×73 成 tasks 寫入 SQLite（冪等）|
 | `server.py` | 工作佇列 server（標準庫 http.server + sqlite3，零依賴）|
 | `worker.py` | 爬蟲 worker（curl --http1.1、民國+西元雙查、窗過濾、退避）|
+| `google_worker.py` | 補搜 worker：Playwright 驅動系統 Chrome 查 Google，撿 Yahoo 救不回的 `failed`（見下）|
+| `requirements.txt` | **只服務 `google_worker.py`** 的相依（playwright）；核心零依賴，不必安裝|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
 | `export.py` | 把 DB 的 success 匯出成研究用 CSV（含 `revenue`/`yoy`）|
 | `mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
-**零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `worker.py` + `revlib.py`。
+**核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `worker.py` + `revlib.py`。
+唯一的例外是 `google_worker.py` 需要 playwright（`requirements.txt`），只在要跑 Google 補搜的機器上裝。
 
 ## Quick start
 
@@ -139,12 +142,13 @@ Chrome」**（headful + 持久設定檔）查 Google 搜尋。
 
 前置（一次性）：
 ```bash
-pip3 install --user playwright     # 不必 playwright install chromium
-google-chrome --version            # 用系統的 /usr/bin/google-chrome
+pip3 install --user -r requirements.txt   # 唯一一項 playwright；不必再跑 playwright install
+google-chrome --version                   # 用系統的 /usr/bin/google-chrome（實測 146）
 ```
-> ⚠️ **playwright 是本 repo 唯一的第三方依賴，且只有 `google_worker.py` 需要它。**
-> `server.py` / `worker.py` / `revlib.py` 仍維持「純標準庫、零依賴」，
-> 只跑 Yahoo 主線的機器什麼都不用裝。
+> ⚠️ **`requirements.txt` 只服務 `google_worker.py`。**
+> playwright 是本 repo 唯一的第三方依賴，`server.py` / `worker.py` / `revlib.py`
+> 仍維持「純標準庫、零依賴」——**只跑 server 或 Yahoo 主線的機器不必安裝它**，
+> 複製 `worker.py` + `revlib.py` 過去就能跑。測試也不需要（playwright 是延後 import 的）。
 
 另外需要**圖形環境**（headful 才不會被擋）：`DISPLAY=:0`。無頭機器請改派有桌面的機器跑。
 Chrome 設定檔存在 `~/.cache/revswarm-chrome`（`--profile` 可改），保留 cookie 以降低驗證碼。

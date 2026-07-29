@@ -1,0 +1,20 @@
+# revswarm 的第三方相依 —— 只有 google_worker.py 需要。
+#
+# ⚠️ 核心是零依賴：server.py / worker.py / revlib.py / init_tasks.py / export.py 等
+#    全部只用 Python 標準庫（3.8+）與 curl。只跑 server 或 Yahoo 主線 worker 的機器
+#    【不需要】安裝這個檔案 —— 複製 worker.py + revlib.py 過去就能跑。
+#
+# 只有要用 google_worker.py（Playwright 驅動 Chrome 補搜 Yahoo 救不回的 failed）才裝：
+#     pip3 install --user -r requirements.txt
+#
+# ⚠️ 裝完【不要】再跑 `playwright install`。google_worker 刻意用「系統安裝的 Chrome」
+#    (channel="chrome")，不是 playwright 下載的 Chromium —— 實測只有真實 Chrome 通得過
+#    Google 的 Client Hints / TLS 指紋檢查。所以真正的前置是系統層面的兩件事：
+#      1. Google Chrome    （實測 146.0.7680.80；/usr/bin/google-chrome）
+#      2. 圖形環境 DISPLAY （headful；headless 實測會被導到 /sorry/ 驗證頁）
+#
+# 測試不需要任何第三方套件：  python3 -m unittest discover
+# （google_worker 把 playwright 延後 import 到 Searcher.start()，所以沒裝也能跑它的測試。）
+
+# 下限取「實際驗證過的版本」，不對未驗證的舊版宣稱相容；上限擋主版本跳號的 API 變動。
+playwright>=1.61,<2
