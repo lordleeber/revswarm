@@ -1,0 +1,2 @@
+stock_id,roc_year,roc_month,announce_date,source,raw_title,note
+3494,109,1,2020-02-17,g_roc_manual,誠研109年1月營收6727萬、年減13.65%,MoneyDJ 該篇文章日期 2020-02-17，落在窗(次月1~15日)外故爬取端不採。誠研 58 筆歷史公布日都在 7~14 號(28 筆為 10 號)，此月為遲交。MOPS t05st01 未涵蓋 3494，無官方申報日可交叉驗證。
