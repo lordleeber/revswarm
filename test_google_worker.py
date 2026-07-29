@@ -55,6 +55,12 @@ class _FakeSearcher:
         self.block_checks += 1
         return self.blocked_seq.pop(0) if self.blocked_seq else False
 
+    def _page_dead(self):
+        return False        # 視窗還在（關窗的情境由 TestIsBlockedNowAndWait 蓋）
+
+    def block_note(self):
+        return "fake"       # 只給 log 用
+
 
 def _page_text(name, roc_year, roc_month):
     """組一段含精確標題錨點 + 窗內日期的假 SERP 文字（供 revlib.parse 命中）。"""
@@ -68,12 +74,16 @@ class TestCrawlTask(unittest.TestCase):
     def setUp(self):
         self._time, self._random, self._fetch = (
             google_worker.time, google_worker.random, google_worker.fetch_google)
+        self._searcher = google_worker.SEARCHER
         google_worker.time = _FakeTime()
         google_worker.random = _FakeRandom()
+        # 明示前提：沒有瀏覽器 → blocked_now() 一律 False，不倚賴別的測試留下的狀態。
+        google_worker.SEARCHER = None
 
     def tearDown(self):
         google_worker.time, google_worker.random, google_worker.fetch_google = (
             self._time, self._random, self._fetch)
+        google_worker.SEARCHER = self._searcher
 
     def _task(self):
         return {"id": 1, "stock_id": "2330", "name": "台積電",
@@ -156,6 +166,34 @@ class TestCrawlTask(unittest.TestCase):
         self.assertEqual(r["status"], "rate_limited")
         self.assertFalse(blocked)
 
+    def test_stops_batch_when_page_still_bad_after_both_queries(self):
+        """⚠️ 實戰第二層：驗證頁不一定認得出是 CAPTCHA（網址不在 /sorry/、文字也沒
+        BLOCK_MARKERS → 只會被分類成 NOT_SERP）。那時要靠「兩種年份都打完後畫面還壞著」
+        來停批，否則又回到「每筆 goto 都蓋掉使用者正在解的頁」。"""
+        seen = []
+
+        def fetch(q, timeout=None):
+            seen.append(q)
+            return (None, False, google_worker.BLOCK_NOT_SERP)
+        google_worker.fetch_google = fetch
+        google_worker.SEARCHER = _FakeSearcher(blocked_seq=[True])
+
+        r, blocked = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertEqual(r["status"], "rate_limited")       # 絕不是 failed
+        self.assertTrue(blocked)                            # 要通報主迴圈停批
+        self.assertEqual(len(seen), 2)                      # 但仍留了第二種年份那次重試
+
+    def test_does_not_stop_batch_when_page_recovered(self):
+        """反向：偶發的空白頁若自己復原了（畫面已是正常 SERP）就不該收掉整批——
+        否則一次抖動就損失整批的吞吐。"""
+        google_worker.fetch_google = lambda q, timeout=None: (
+            None, False, google_worker.BLOCK_NOT_SERP)
+        google_worker.SEARCHER = _FakeSearcher()            # is_blocked_now() → False
+
+        r, blocked = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertEqual(r["status"], "rate_limited")
+        self.assertFalse(blocked)
+
     def test_no_searcher_is_rate_limited_not_failed(self):
         """瀏覽器還沒起（SEARCHER=None）→ rate_limited，絕不能悄悄記成 failed。"""
         google_worker.SEARCHER = None    # 明示前提，不倚賴別的測試類別清乾淨
@@ -174,6 +212,11 @@ class _FakePage:
 
     @property
     def url(self):
+        return self._url
+
+    def evaluate(self, expr):
+        # _live_url() 用它問「瀏覽器當下的網址」。真 playwright 會做一次 IPC，
+        # 所以這裡回的是「真實」網址；page.url 才是可能過期的快取（見下面的測試）。
         return self._url
 
     def set_default_timeout(self, ms):
@@ -328,6 +371,44 @@ class TestIsBlockedNowAndWait(unittest.TestCase):
         self.assertFalse(google_worker.wait_until_unblocked(Stuck(), limit=20.0, poll=5.0))
         self.assertEqual(sum(self.ft.slept), 20.0)
 
+    def test_zero_poll_does_not_spin_forever(self):
+        """--captcha-poll 0 不可讓 waited 永遠不前進（會變成不會結束的空轉）。"""
+        class Stuck:
+            def is_blocked_now(self):
+                return True
+
+        self.assertFalse(google_worker.wait_until_unblocked(Stuck(), limit=5.0, poll=0.0))
+        self.assertLessEqual(len(self.ft.slept), 20)     # 有下限 → 次數有界
+        self.assertEqual(sum(self.ft.slept), 5.0)        # 且總睡眠不超過 limit
+
+    def test_stale_cached_url_is_not_trusted(self):
+        """⚠️ 線上第四次踩到的：人解掉驗證、瀏覽器已回到正常 SERP（網址列都是 /search?q=…），
+        但 page.url 仍回報舊的 /sorry/…（Playwright 的快取值）。若信它就會提早 return True、
+        永遠不做那次會刷新快取的 IPC → 自己鎖在舊值裡，永遠判定還在驗證頁。
+        網址必須真的問瀏覽器（_live_url → evaluate）。"""
+        class StaleUrlPage(_FakePage):
+            @property
+            def url(self):                     # Playwright 快取住的舊值
+                return "https://www.google.com/sorry/index?continue=..."
+
+        page = StaleUrlPage(text="正常搜尋結果" * 20,
+                            url="https://www.google.com/search?q=3494")  # evaluate 回的真實值
+        self.assertFalse(self._searcher(page).is_blocked_now())
+
+    def test_read_error_counts_as_still_blocked(self):
+        """⚠️ 讀不到當前頁時要當「還被擋」：誤判已解除會讓主迴圈導覽下一筆、
+        蓋掉使用者正在輸入的驗證頁。誤判還被擋只是多等一個 poll，代價不對稱。"""
+        class Flaky:
+            url = "https://www.google.com/search?q=x"
+
+            def is_closed(self):
+                return False
+
+            def query_selector(self, sel):
+                raise RuntimeError("Execution context was destroyed")
+
+        self.assertTrue(self._searcher(Flaky()).is_blocked_now())
+
 
 class TestBackoffAndBlock(unittest.TestCase):
     """主迴圈：指數退避 + 連續 rate_limited 判定被擋 + 剩餘任務放回 + 關閉瀏覽器。"""
@@ -395,9 +476,12 @@ class TestBackoffAndBlock(unittest.TestCase):
         # rl_threshold=3 → 指數退避序列 2,4,8（第 3 筆連續 rate_limited 觸發判定被擋）
         backoff = [s for s in self.ft.slept if s in (2, 4, 8, 16, 32, 60)]
         self.assertEqual(backoff, [2, 4, 8])
-        # 非驗證碼的被擋照舊長睡整段 block_sleep（畫面沒東西可解，這是保護自己的 IP）
+        # 畫面正常（is_blocked_now 一路 False）→ 照舊長睡整段 block_sleep，保護自己的 IP
         self.assertIn(1800.0, self.ft.slept)
-        self.assertEqual(self.fake_searcher.block_checks, 0)   # 不該去問「解了嗎」
+        # 而且完全沒進 5s 輪詢——這條路徑不可秒回，否則等於拿掉退避
+        self.assertNotIn(5.0, self.ft.slept)
+        # 問了 4 次「畫面現在壞著嗎」：3 筆各一次（決定要不要停批）+ 收批後一次（決定等法）
+        self.assertEqual(self.fake_searcher.block_checks, 4)
         # 8 筆全部回報 rate_limited（前 3 筆爬到被擋 + 後 5 筆未爬放回）
         reported = captured["reported"]
         self.assertEqual(len(reported), 8)
@@ -438,7 +522,8 @@ class TestBackoffAndBlock(unittest.TestCase):
 
         google_worker.Client = StubClient
         google_worker.fetch_google = fetch
-        # 前兩次檢查仍在驗證頁，第三次人已解掉 → 應提早結束等待
+        # 停批原因已知（CAPTCHA）→ 不再重讀當前頁，直接輪詢：
+        # 前兩次仍在驗證頁，第三次人已解掉 → 應提早結束等待
         self.fake_searcher.blocked_seq = [True, True, False]
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -458,6 +543,105 @@ class TestBackoffAndBlock(unittest.TestCase):
         reported = captured["reported"]
         self.assertEqual(len(reported), 8)
         self.assertTrue(all(r["status"] == "rate_limited" for r in reported))
+
+    def test_unrecognised_verify_page_still_polls_not_long_sleep(self):
+        """⚠️ 線上第二次踩到的：驗證頁網址不在 /sorry/、文字也沒 BLOCK_MARKERS 時只會被
+        分類成 NOT_SERP。原本照 reason 分流 → 走無條件 sleep(1800)、一次都不輪詢，人解
+        掉了也不會接續（實測解完等滿 1800s）。改成看當前頁狀態後，這條也要進 5s 輪詢。"""
+        captured = {}
+
+        class _Stop(Exception):
+            pass
+
+        class StubClient:
+            def __init__(self, *a, **k):
+                self.calls = 0
+
+            def lease(self, n):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"tasks": [
+                        {"id": i, "stock_id": "0000", "name": "測試",
+                         "roc_year": 109, "roc_month": 1} for i in range(1, 9)],
+                        "lease_ttl": 600}
+                raise _Stop
+
+            def report(self, results):
+                captured["reported"] = results
+                return {"applied": {}}
+
+        crawled = []
+
+        def fetch(q, timeout=None):
+            crawled.append(q)
+            return (None, False, google_worker.BLOCK_NOT_SERP)
+
+        google_worker.Client = StubClient
+        google_worker.fetch_google = fetch
+        # 第 1 次是 crawl_task 判斷要不要停批；之後輪詢兩次仍壞著，第三次人處理完
+        self.fake_searcher.blocked_seq = [True, True, True, False]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                google_worker.run(self._args())
+            except _Stop:
+                pass
+
+        # 第一筆打完兩種年份就停批：2 次導覽，不是 3 筆 × 2 查詢
+        self.assertEqual(len(crawled), 2)
+        # 關鍵：不可再是無條件長睡，要走 5s 輪詢並在人處理完後提早接續
+        self.assertNotIn(1800.0, self.ft.slept)
+        self.assertEqual([s for s in self.ft.slept if s == 5.0], [5.0, 5.0, 5.0])
+        # 8 筆全部放回（1 筆爬到被擋 + 7 筆未爬）
+        reported = captured["reported"]
+        self.assertEqual(len(reported), 8)
+        self.assertTrue(all(r["status"] == "rate_limited" for r in reported))
+
+    def test_human_solving_during_report_still_polls(self):
+        """⚠️ 線上第三次踩到的競態：停批到開始等待之間夾著一次 client.report() 的網路
+        往返（1~2s），人正好在那一兩秒解掉驗證。若那時「再讀一次當前頁」來決定等法，
+        會讀到「頁面正常」→ 誤判成單純連續失敗 → 無條件長睡 1800s（實測：解完卻沒輪詢）。
+        停批的原因是已知事實，不可用會競態的重讀去推導。"""
+        captured = {}
+
+        class _Stop(Exception):
+            pass
+
+        class StubClient:
+            def __init__(self, *a, **k):
+                self.calls = 0
+
+            def lease(self, n):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"tasks": [
+                        {"id": i, "stock_id": "0000", "name": "測試",
+                         "roc_year": 109, "roc_month": 1} for i in range(1, 9)],
+                        "lease_ttl": 600}
+                raise _Stop
+
+            def report(self, results):
+                captured["reported"] = results
+                return {"applied": {}}
+
+        google_worker.Client = StubClient
+        google_worker.fetch_google = lambda q, timeout=None: (
+            None, False, google_worker.BLOCK_CAPTCHA)
+        # 停批當下畫面壞著（crawl_task 已知），但回報期間人就解掉了 →
+        # 之後每次讀當前頁都是「沒被擋」
+        self.fake_searcher.blocked_seq = []
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                google_worker.run(self._args())
+            except _Stop:
+                pass
+
+        # 關鍵：不可因為「重讀時畫面已正常」就掉進無條件長睡
+        self.assertNotIn(1800.0, self.ft.slept)
+        # 走輪詢，且第一次就發現已解除 → 只睡一個 poll 就接續
+        self.assertEqual([s for s in self.ft.slept if s == 5.0], [5.0])
+        self.assertEqual(len(captured["reported"]), 8)
 
 
 if __name__ == "__main__":

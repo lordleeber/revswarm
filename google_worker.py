@@ -25,11 +25,14 @@ Chrome」查 Google 搜尋、回報結果。用來二次補搜 worker.py（爬 Y
   4. 驗證頁（/sorry/）、導覽失敗、頁面不是 SERP（沒有 #search 容器，例如全新設定檔
      第一次跑遇到的 Google 同意頁）→ rate_limited（放回佇列），絕不當 failed：
      failed 只能是「頁面是正常 SERP、兩種年份都試過、仍無窗內日期」。
-  5. ⚠️ 撞到人工驗證就「立刻停止導覽」：不再打第二種年份、也不再取下一筆任務，
-     畫面就停在驗證頁等人解。之後每 --captcha-poll 秒只『讀』一次當前頁判斷是否解除
-     （不導覽，才不會把使用者正在輸入的頁面換掉），解掉就馬上接續。
-     這是實戰踩到的：原本要連續 3 筆 rate_limited 才停批，期間每筆的 goto 都會蓋掉
-     驗證頁，使用者根本沒機會解完。
+  5. ⚠️ 撞到需要人工處理的頁面就「立刻停止導覽」：不再取下一筆任務，畫面就停在那頁
+     等人解。之後每 --captcha-poll 秒只『讀』一次當前頁判斷是否解除（不導覽，才不會把
+     使用者正在輸入的頁面換掉），解掉就馬上接續。
+     這是實戰踩到的兩層：原本要連續 3 筆 rate_limited 才停批，期間每筆的 goto 都會蓋掉
+     驗證頁；改成「撞到就停」之後又發現驗證頁不一定認得出是 CAPTCHA（網址不在 /sorry/、
+     文字也沒 BLOCK_MARKERS 時只會被分類成 NOT_SERP），於是走了無條件長睡那條、完全
+     不輪詢，人解掉了照樣等滿 1800s。所以「要不要等人」改成問當前頁的實際狀態，
+     不看 reason（見 should_wait_for_human）。
 
 前置（⚠️ 這是本 repo 第一個第三方依賴；server.py/worker.py/revlib.py 仍維持零依賴）：
   pip3 install --user playwright      # 不需要 playwright install chromium
@@ -130,6 +133,18 @@ class Searcher:
         except Exception:
             return True
 
+    def _live_url(self):
+        """
+        當前頁的**真實**網址（一次真的 IPC）。
+
+        ⚠️ 絕不可用 page.url：那是 Playwright 快取的值，人在畫面上自己操作（解掉驗證後
+        被導向 continue 網址）時不保證更新。實測踩到：人已回到正常 SERP、網址列也是
+        /search?q=…，但 page.url 仍回報舊的 /sorry/…。而 is_blocked_now 只要信了它就
+        提早 return True，永遠不會做那次會刷新快取的 IPC——自己把自己鎖在舊值裡，
+        於是永遠判定「還停在驗證頁」，人解掉了也不會接續。
+        """
+        return self._page.evaluate("() => location.href")
+
     def is_blocked_now(self):
         """
         當前畫面是不是「不能用的頁」（驗證頁 / 同意頁 / 攔阻 / 空白）。
@@ -140,13 +155,35 @@ class Searcher:
         if self._page_dead():
             return False              # 視窗都沒了，等下去也沒意義
         try:
-            if "/sorry/" in self._page.url:
+            if "/sorry/" in self._live_url():
                 return True
             if self._page.query_selector(SERP_SELECTOR) is None:
                 return True           # 同意頁 / enablejs / 空白頁
             return bool(BLOCK_MARKERS.search(self._page.inner_text("body")))
         except Exception:
-            return False
+            # ⚠️ 讀不到就當「還被擋」：誤判成已解除會讓主迴圈導覽下一筆、蓋掉使用者
+            # 正在輸入的驗證頁；誤判成還被擋只是多等一個 poll。兩邊代價不對稱。
+            return True
+
+    def block_note(self):
+        """
+        給 log 用的一行說明：現在為什麼判定被擋（只讀，不導覽）。
+
+        存在的理由：is_blocked_now() 只回 True/False，卡住時無從得知是哪一條判準在擋
+        （網址?容器?字樣?），而這個機制只在真人面前出錯，事後沒有現場可查。
+        """
+        try:
+            url = self._live_url()          # 不用 page.url：那是快取值（見 _live_url）
+        except Exception as e:
+            return f"讀不到當前頁：{e!r}"
+        if "/sorry/" in url:
+            return f"停在驗證頁 {url[:90]}"
+        try:
+            if self._page.query_selector(SERP_SELECTOR) is None:
+                return f"沒有 {SERP_SELECTOR} 容器（同意頁／enablejs／空白頁）：{url[:90]}"
+        except Exception as e:
+            return f"讀不到 DOM：{e!r}"
+        return f"頁面出現攔阻字樣：{url[:90]}"
 
     def search(self, query, timeout=NAV_TIMEOUT_MS):
         """
@@ -221,6 +258,33 @@ def fetch_google(query, timeout=NAV_TIMEOUT_MS):
     return SEARCHER.search(query, timeout=timeout)
 
 
+def blocked_now():
+    """
+    對模組全域的 SEARCHER 問「當前頁現在還停在壞頁嗎」（不導覽）。
+
+    沒有瀏覽器 → False：那時沒有任何頁面可讓人解，不該因此停批。
+    """
+    return SEARCHER is not None and SEARCHER.is_blocked_now()
+
+
+def should_wait_for_human():
+    """
+    收批後該「等人處理」還是「無條件長睡退避」？
+
+    ⚠️ 判準是當前頁的實際狀態，**不是** search() 回的 reason。reason 只描述導覽當下
+    的分類，而「有沒有東西可讓人解」是此刻的頁面狀態——實測 Google 的驗證頁不一定在
+    /sorry/、也不一定有 BLOCK_MARKERS 字樣，那時它只會被分類成 NOT_SERP，若照 reason
+    分流就會走到無條件 sleep(block_sleep)、完全不輪詢，人解掉了也不會接續（實測：解完
+    等滿 1800s 才動）。
+      還停在壞頁（驗證／同意／空白）→ True，輪詢，解掉的瞬間就接續
+      視窗已經沒了                   → True，長睡毫無意義，讓下一批去重建瀏覽器
+      頁面正常（純粹連續導覽失敗）   → False，沒東西可解，照舊長睡，別燒自己 IP
+    """
+    if SEARCHER is None:
+        return True
+    return SEARCHER.is_blocked_now() or SEARCHER._page_dead()
+
+
 def wait_until_unblocked(searcher, limit, poll=5.0):
     """
     把畫面留在驗證頁／同意頁上等人工處理，解掉就立刻回來（回 True），
@@ -230,6 +294,7 @@ def wait_until_unblocked(searcher, limit, poll=5.0):
     這取代原本無條件 sleep(block_sleep)：驗證碼解完還要再乾等 30 分鐘毫無意義，
     而真的無人看顧時行為與原本相同（等滿）。
     """
+    poll = max(poll, 0.5)      # 0 會讓 waited 永遠不前進 → 空轉不會結束
     waited = 0.0
     while waited < limit:
         time.sleep(min(poll, limit - waited))
@@ -242,16 +307,23 @@ def wait_until_unblocked(searcher, limit, poll=5.0):
 # --- 單筆任務 ---------------------------------------------------------------
 def crawl_task(task, per_query_sleep):
     """
-    回傳 (result, hit_captcha)：
-      result      = {id, status, date?, source?, title?}，status ∈ success|failed|rate_limited
-      hit_captcha = 是否撞到 Google 的人工驗證（/sorry/ 或「異常流量」字樣）
+    回傳 (result, stop_batch)：
+      result     = {id, status, date?, source?, title?}，status ∈ success|failed|rate_limited
+      stop_batch = 是否該立刻停止導覽、把畫面留給人處理
 
     與 worker.py 的 crawl_task 有三處差異：
       - 查詢順序：西元年（g_ad）優先，民國年（g_roc）補第二（見模組開頭 1.）
       - source 標 g_* 而非 q_*：讓 /status 與匯出資料看得出這筆是 Google 補搜來的
-      - ⚠️ 多回一個 hit_captcha（worker.py 只回 dict）：Google 的驗證要人工解，
-        撞到就必須「立刻停止導覽」——連第二種年份都不能再打，否則那個 goto
-        會把使用者正在解的驗證頁蓋掉。Yahoo 那邊被擋不需要人介入，所以沒這問題。
+      - ⚠️ 多回一個 stop_batch（worker.py 只回 dict）：Google 的驗證要人工解，
+        撞到就必須「立刻停止導覽」，否則那個 goto 會把使用者正在解的驗證頁蓋掉。
+        Yahoo 那邊被擋不需要人介入，所以沒這問題。
+
+    stop_batch 有兩個觸發點，寬嚴不同（實測調過）：
+      - CAPTCHA：第一次就停，連第二種年份都不打（那次 goto 一定蓋掉驗證頁）
+      - 其他被擋：**打完第二種年份**才問「畫面現在還壞著嗎」。多留這一次 fresh goto
+        是為了讓偶發的空白頁自己復原，不要一次抖動就收掉整批；但也只留這一次——
+        驗證頁不一定認得出是 CAPTCHA（見 should_wait_for_human），繼續往下打就又回到
+        「每筆 goto 都蓋掉使用者正在解的頁」的老問題。
     """
     name = task["name"]
     sid = task["stock_id"]
@@ -283,7 +355,8 @@ def crawl_task(task, per_query_sleep):
     # 走到這：兩種查詢都沒中窗內日期。
     if saw_rate_limited or not tried_ok:
         # 有任一查詢被擋（可能正好漏掉命中）→ 保守放回重試，不判 failed。
-        return {"id": task["id"], "status": "rate_limited"}, False
+        # 兩種年份都打完了還停在壞頁 → 通報停批（見 docstring 的兩個觸發點）。
+        return {"id": task["id"], "status": "rate_limited"}, blocked_now()
     # 兩種年份都試過、頁面都正常、仍無窗內日期 → 真的找不到。
     return {"id": task["id"], "status": "failed"}, False
 
@@ -353,23 +426,23 @@ def _loop(args, client):
         results = []
         consec_rl = 0
         blocked = False
-        captcha = False        # 被擋的種類決定收批後怎麼等（人工可解 vs 只能退避）
+        stop_for_human = False      # 停批是因為「畫面停在要人處理的頁」（見收批後的等法）
         for task in batch:
-            r, hit_captcha = crawl_task(task, args.per_query_sleep)
+            r, stop_batch = crawl_task(task, args.per_query_sleep)
             results.append(r)
             tag = {"success": "✓", "failed": "—", "rate_limited": "×"}[r["status"]]
             extra = f" {r.get('date','')} [{r.get('source','')}]" if r["status"] == "success" else ""
             print(f"  {tag} {task['stock_id']} {task['name']} "
                   f"{task['roc_year']}/{task['roc_month']}{extra}")
 
-            if hit_captcha:
-                # ⚠️ 驗證碼不套 --rl-threshold：那要連續 3 筆才停，期間每筆的 goto 都會
-                # 蓋掉使用者正在解的驗證頁（等於根本解不完）。一次就夠了——Google 要求
-                # 驗證代表整個 IP 被攔，繼續打也只是拿到同一頁。停批後不再有任何導覽。
-                print(f"  ⚠️ Google 要求人工驗證。已立刻停批，畫面就停在驗證頁不再導覽。\n"
-                      f"     請在 Chrome 視窗把驗證碼解掉——解完會自動接續"
+            if stop_batch:
+                # ⚠️ 不套 --rl-threshold：那要連續 3 筆才停，期間每筆的 goto 都會蓋掉
+                # 使用者正在解的驗證頁（等於根本解不完）。Google 要求驗證代表整個 IP
+                # 被攔，繼續打也只是拿到同一頁。停批後不再有任何導覽。
+                print(f"  ⚠️ 畫面停在需要人工處理的頁面（驗證／同意頁）。已立刻停批，不再導覽。\n"
+                      f"     請在 Chrome 視窗處理掉——完成會自動接續"
                       f"（最多等 {args.block_sleep:.0f}s，每 {args.captcha_poll:.0f}s 檢查一次）。")
-                blocked = captcha = True
+                blocked = stop_for_human = True
                 break
 
             if r["status"] == "rate_limited":
@@ -404,17 +477,26 @@ def _loop(args, client):
         if args.once or (args.max_batches and batches_done >= args.max_batches):
             print(f"完成 {batches_done} 批，結束。")
             return
-        if blocked and captcha:
-            # 驗證頁停在畫面上等人解；解掉就馬上接續，不必再乾等剩下的 block_sleep。
-            if wait_until_unblocked(SEARCHER, args.block_sleep, args.captcha_poll):
-                print("  ✔ 驗證已解除，接續下一批。")
+        if blocked:
+            # 要不要等人：先看「為什麼停批」這個已知事實，才看當前頁狀態。
+            # ⚠️ stop_for_human 不可以用「再讀一次當前頁」取代：停批到這裡之間有一次
+            #    client.report() 的網路往返（約 1~2s），人很可能正好在那一兩秒把驗證解掉，
+            #    那時重讀會得到「頁面正常」→ 誤判成單純連續失敗 → 無條件長睡 30 分鐘。
+            #    實測踩過：使用者解完驗證，worker 卻一次都沒輪詢就長睡。
+            if stop_for_human or should_wait_for_human():
+                # 壞頁停在畫面上等人處理；解掉就馬上接續，不必乾等剩下的 block_sleep。
+                if SEARCHER is not None:
+                    print(f"  ⏸ 等人處理（{SEARCHER.block_note()}）")
+                if wait_until_unblocked(SEARCHER, args.block_sleep, args.captcha_poll):
+                    print("  ✔ 已解除，接續下一批。")
+                else:
+                    print(f"  仍停在被擋的頁面（等滿 {args.block_sleep:.0f}s），還是接續試下一批。")
             else:
-                print(f"  仍停在驗證頁（等滿 {args.block_sleep:.0f}s），還是接續試下一批。")
-        elif blocked:
-            # 連續失敗（導覽逾時等）：畫面通常是正常的，沒有東西可解，照舊長睡。
-            # ⚠️ 這裡不可改用 wait_until_unblocked——它會立刻判定「沒被擋」而秒回，
-            #    等於拿掉「別燒自己 IP」的保護。
-            time.sleep(args.block_sleep)
+                # 畫面是正常的 → 純粹連續導覽失敗，沒有東西可解，照舊長睡。
+                # ⚠️ 這條不可改成輪詢——is_blocked_now 會立刻判定「沒被擋」而秒回，
+                #    等於拿掉「別燒自己 IP」的保護。
+                print(f"  頁面正常但連續失敗，長睡 {args.block_sleep:.0f}s 退避。")
+                time.sleep(args.block_sleep)
 
 
 def main():
@@ -426,14 +508,15 @@ def main():
     ap.add_argument("--worker-id", default=None, help="預設 hostname-pid-g")
     # batch 預設遠比 worker.py 小，因為一批必須在租約 TTL(600s) 內回報完，否則會被惰性
     # 回收、可能被別台重派做白工。算最壞情況（用 20s 導覽逾時）：
-    #   某筆 g_ad 逾時 20s + per-query-sleep 6s + g_roc 命中 ~2s + delay 最多 10s ≈ 38s，
+    #   某筆 g_ad 逾時 20s + per-query-sleep 最多 7s + g_roc 命中 ~2s + delay 最多 20s ≈ 49s，
     #   而這種筆數每次都有命中 → consec_rl 被歸零 → --rl-threshold 的保險絲不會跳。
-    #   10 筆 × 38s ≈ 380s < 600s，仍有餘裕；15 筆就會逼近 570s。
-    # （兩個查詢都逾時的筆數約 48s，但那會連續 rate_limited、3 筆就提早收批，不累積。）
+    #   10 筆 × 49s ≈ 490s < 600s，仍有餘裕但已比 delay=6~10s 時窄（原本 380s）；
+    #   12 筆就會逼近 590s，所以調高 --delay/--jitter 時別忘了同步調低 --batch。
+    # （兩個查詢都逾時的筆數約 47s，但那會連續 rate_limited、3 筆就提早收批，不累積。）
     ap.add_argument("--batch", type=int, default=10, help="每次租多少筆")
-    ap.add_argument("--delay", type=float, default=6.0, help="每筆任務間基礎延遲秒")
-    ap.add_argument("--jitter", type=float, default=4.0,
-                    help="每筆延遲的隨機抖動上限秒（預設 6+0~4 = 6~10s）")
+    ap.add_argument("--delay", type=float, default=10.0, help="每筆任務間基礎延遲秒")
+    ap.add_argument("--jitter", type=float, default=10.0,
+                    help="每筆延遲的隨機抖動上限秒（預設 10+0~10 = 10~20s）")
     ap.add_argument("--per-query-sleep", type=float, default=6.0,
                     help="同一任務內兩次查詢間的延遲秒")
     ap.add_argument("--rl-threshold", type=int, default=3,
