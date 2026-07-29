@@ -9,10 +9,12 @@ state machine:  undone → dispatched → (success | failed)
   - rate_limited ≠ failed：立刻放回 undone，不計失敗
 
 endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可設）：
-  POST /lease?n=30&worker=<id>       原子租一批任務
+  POST /lease?n=30&worker=<id>&engine=yahoo   原子租一批任務
+                                     （engine 分流佇列，預設 yahoo；只收 yahoo|google，其餘 400）
   POST /result   {results:[{id,status,date?,source?,title?}, ...]}  批次回報
   GET  /stats                        進度、各 state 計數、近況
   GET  /healthz                      存活探針（免 token）
+  POST /admin/requeue-failed?engine=google   把 failed 轉去指定 engine 的佇列重掃
 
 用法：
   python3 server.py --db revswarm.db --host 0.0.0.0 --port 8000 --token SECRET
@@ -35,6 +37,8 @@ import revlib
 
 LEASE_TTL = 600          # 秒；dispatched 超過此值未回覆即可被重派
 MAX_LEASE = 200          # 單次 lease 上限，避免一隻 worker 掃光佇列
+ENGINES = ("yahoo", "google")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
+DEFAULT_ENGINE = "yahoo"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks(
@@ -49,6 +53,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   raw_title     TEXT,
   revenue       INTEGER,          -- 月營收(元)，由 raw_title 解析；非官方、四捨五入，僅供校驗
   yoy           REAL,             -- 年增率(%)，同上
+  engine        TEXT NOT NULL DEFAULT 'yahoo',  -- 佇列分流：yahoo|google（見 lease/requeue_failed）
   attempts      INTEGER DEFAULT 0,
   fail_count    INTEGER DEFAULT 0,
   dispatched_at INTEGER,
@@ -82,9 +87,17 @@ def connect(db_path):
 def _migrate(conn):
     """既有 DB 補欄位：CREATE TABLE IF NOT EXISTS 不會替舊表加欄位，故手動 ALTER。"""
     have = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-    for col, decl in (("revenue", "INTEGER"), ("yoy", "REAL")):
+    for col, decl in (("revenue", "INTEGER"), ("yoy", "REAL"),
+                      ("engine", "TEXT NOT NULL DEFAULT 'yahoo'")):
         if col not in have:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+    # 這個索引依賴 engine 欄位，須放在上面 ALTER TABLE 之後才能建（SCHEMA 的
+    # executescript 在舊 DB 上跑在 _migrate 之前，此時 engine 欄位可能還不存在）。
+    # google_worker 補搜：requeue-failed?engine=google 把 failed 轉去 engine='google'，
+    # lease 依 engine 分流，Yahoo/Google worker 才不會搶同一批 undone（見 lease/requeue_failed）。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_undone_engine_age"
+        " ON tasks(state, engine, roc_year, roc_month)")
 
 
 def _tok_eq(a, b):
@@ -115,6 +128,27 @@ def clamp_refresh(raw, default=10):
         return max(5, min(int(raw), 300))
     except (ValueError, TypeError):
         return default
+
+
+def parse_engine(raw, default=None):
+    """
+    解析 ?engine= 參數，回傳 (engine, ok)。
+
+    不合法的 engine 一定要回 400，不可靜默當成預設或原樣寫進 DB——兩種靜默壞法都很難查：
+      - lease?engine=（空字串）當真 → WHERE engine='' 永遠零筆，worker 每 30s 印
+        「佇列已空」，看起來像沒任務、其實是參數打錯。
+      - requeue-failed?engine=googel（打錯字）原樣寫入 → 3 萬筆被丟進沒有任何 worker
+        會租的佇列，回應卻照樣是 {"requeued": 30877}。
+    大小寫不做正規化：'Google' 直接 400，比默默寫進一個跟 DB 值不同的字串好查。
+
+    缺參數/空字串 → (default, True)；default 由呼叫端決定語意
+    （lease 是 DEFAULT_ENGINE，requeue-failed 是 None＝engine 欄位不動）。
+    """
+    if not raw:
+        return default, True
+    if raw in ENGINES:
+        return raw, True
+    return None, False
 
 
 def derive_stats(by_state, recent_success):
@@ -255,7 +289,7 @@ class Store:
         self._lock = threading.Lock()
 
     # --- 派工：原子鎖定 + 惰性回收 ---------------------------------------
-    def lease(self, n, worker_id):
+    def lease(self, n, worker_id, engine=DEFAULT_ENGINE):
         n = max(1, min(int(n), MAX_LEASE))
         now = int(time.time())
         cutoff = now - LEASE_TTL
@@ -266,17 +300,24 @@ class Store:
             try:
                 # 惰性回收：先把逾時的 dispatched 全部收回 undone（走 idx_dispatched，很快）。
                 # 拆成獨立 UPDATE（而非塞進 SELECT 的 OR）是為了讓下面的挑選能純走
-                # WHERE state='undone'，靠 idx_undone_age 免 TEMP B-TREE 排序。
+                # 等值條件，靠 idx_undone_engine_age 免 TEMP B-TREE 排序（實測
+                # EXPLAIN QUERY PLAN：SEARCH USING COVERING INDEX idx_undone_engine_age。
+                # ORDER BY 的 id 由索引隱含尾隨的 rowid 滿足——id 就是 rowid）。
+                # ⚠️ 加了 engine 條件後，舊索引 idx_undone_age(state,roc_year,roc_month)
+                # 已無任何查詢會用到，可安全 DROP（留著只是白付寫入成本）。
+                # 惰性回收本身不分 engine：租約逾時就該放回，不管哪種 worker 拿走的。
                 conn.execute(
                     "UPDATE tasks SET state='undone', dispatched_at=NULL, worker_id=NULL"
                     " WHERE state='dispatched'"
                     "   AND (dispatched_at IS NULL OR dispatched_at < ?)",
                     (cutoff,))
                 # 挑最舊的 undone（越舊營收月越優先，跨所有股票齊步推進）。
+                # engine 過濾：Yahoo/Google worker 分流各自的佇列，不互搶任務
+                # （failed 批次靠 requeue_failed(engine='google') 轉去 google 佇列）。
                 rows = conn.execute(
-                    "SELECT id FROM tasks WHERE state='undone'"
+                    "SELECT id FROM tasks WHERE state='undone' AND engine=?"
                     " ORDER BY roc_year, roc_month, id LIMIT ?",
-                    (n,),
+                    (engine, n),
                 ).fetchall()
                 ids = [r["id"] for r in rows]
                 if ids:
@@ -406,14 +447,27 @@ class Store:
         return d
 
     # --- 管理：把所有 failed 重開做「最後一輪」（todo.txt 5.1）----------
-    def requeue_failed(self):
+    def requeue_failed(self, engine=None):
+        """把 state='failed' 的任務重開回 undone。
+
+        engine=None（預設，沿用既有行為）：只改 state，engine 欄位不動，
+        原地讓現有 worker 再掃一輪（例如改抓西元年常能救回）。
+        engine='google' 等：連 engine 一併改過去，轉交給該 engine 的 worker
+        專門處理，不會跟原 engine 的 worker 搶同一批 undone（見 lease）。
+        """
         conn = self.conn
         with self._lock:
             conn.execute("BEGIN IMMEDIATE;")
             try:
-                cur = conn.execute(
-                    "UPDATE tasks SET state='undone', dispatched_at=NULL, worker_id=NULL,"
-                    " updated_at=? WHERE state='failed'", (int(time.time()),))
+                if engine:
+                    cur = conn.execute(
+                        "UPDATE tasks SET state='undone', engine=?, dispatched_at=NULL,"
+                        " worker_id=NULL, updated_at=? WHERE state='failed'",
+                        (engine, int(time.time())))
+                else:
+                    cur = conn.execute(
+                        "UPDATE tasks SET state='undone', dispatched_at=NULL, worker_id=NULL,"
+                        " updated_at=? WHERE state='failed'", (int(time.time()),))
                 n = cur.rowcount
                 conn.commit()
             except Exception:
@@ -492,8 +546,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/lease":
             n = int(q.get("n", ["30"])[0])
             worker = q.get("worker", ["anon"])[0]
+            engine, ok = parse_engine(q.get("engine", [""])[0], DEFAULT_ENGINE)
+            if not ok:
+                return self._send(400, {"error": f"unknown engine; 可用: {list(ENGINES)}"})
             try:
-                batch = self.store.lease(n, worker)
+                batch = self.store.lease(n, worker, engine)
             except sqlite3.OperationalError as e:
                 return self._send(503, {"error": f"db busy: {e}"})
             return self._send(200, {"tasks": batch, "lease_ttl": LEASE_TTL})
@@ -513,7 +570,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"applied": counts})
 
         if u.path == "/admin/requeue-failed":
-            n = self.store.requeue_failed()
+            # default=None ＝ 不給 engine 就沿用舊行為（只改 state，engine 欄位不動）。
+            engine, ok = parse_engine(q.get("engine", [""])[0], None)
+            if not ok:
+                return self._send(400, {"error": f"unknown engine; 可用: {list(ENGINES)}"})
+            n = self.store.requeue_failed(engine)
             return self._send(200, {"requeued": n})
 
         return self._send(404, {"error": "not found"})

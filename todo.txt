@@ -265,3 +265,221 @@ MOPS 那條路的「純月營收」判準(若之後要用 t05st01 資料)：
 原子派工、窗驗證)，加可跨機跑的 worker(curl --http1.1 搜 Yahoo、民國+西元雙查、次月1~15號窗過濾、
 精確名稱比對、rate_limited退避不算failed)，把 1848 檔 x 109/1~115/1 的月營收公布日爬回來。
 資料源與所有雷點見上。先做 stocks.csv + server + init + worker，小規模驗證後放量。
+
+（以上 1~8 節為 2026-07-11 的初始交接文件，Yahoo 主線已依此完成。以下第 9 節是
+  2026-07-29 新增的下一輪任務：用 Google 補搜 Yahoo 救不回的 failed。）
+
+
+================================================================================
+9. 下一輪：用 Google 補搜 failed (Playwright) — 2026-07-29 規劃，新 session 執行
+================================================================================
+
+9.1 現況數據 (Yahoo 主線已全部跑完)
+--------------------------------------------------------------------------------
+  總任務        134,904
+  prelisting      6,194   (上市前，不可能有月營收，排除在分母外，見 mark_prelisting.py)
+  應做 workable 128,710
+  success        97,833   = 76.01%   ← 目前勝率
+  failed         30,877   ← 本輪要補搜的目標
+  進度 100% (done = success + failed = workable)
+
+  目標：用 Google 補搜這 30,877 筆。實測命中率 9/10 = 90%。
+  推估：救回 ~27,800 → 總成功率 ~97.6% (樂觀) / 70% → 92.8% (保守)
+
+
+9.2 資料源探索結論 (⚠️ 全部實測過，別重走這些冤枉路)
+--------------------------------------------------------------------------------
+✗ Google Custom Search JSON API
+    已對新客戶關閉，2027-01-01 全面停用。一律回：
+      403 PERMISSION_DENIED "This project does not have the access to Custom Search JSON API."
+    試過 3 把金鑰、跨不同專案、確認 API 已啟用、金鑰無限制/有限制 — 全無效。
+    注意這個錯誤訊息跟標準的「API 未啟用」不同(後者會寫出專案編號)，別誤判成設定問題。
+    → 不要再申請金鑰、不要再開新專案，這條路是死的。
+
+✗ curl 直接爬 www.google.com/search
+    每次都被擋(不是頻率問題)，回「請啟用 JavaScript」轉址頁 /httpservice/retry/enablejs。
+    原因：回應帶一串 Accept-CH: Sec-CH-UA-* ，Google 在核對 Client Hints/TLS 指紋，
+    curl 帶 Chrome UA 也偽裝不了。換 proxy IP 完全無效。
+    (加 CONSENT cookie、gbv=1 都試過，無效。)
+
+✗ Bing 直接爬 www.bing.com/search
+    立即跳驗證碼「請解決以下挑戰以繼續」。
+
+✗ DuckDuckGo html.duckduckgo.com/html/
+    第 1 次請求成功(可拿到 10 筆結果)，第 2 次起就 403 封 IP。
+    實測 60 次請求 59 次被擋；之後單發也是 403(236 bytes 錯誤頁)。單 IP 不可行。
+
+✗ MoneyDJ 直取
+    /z/zc/... 資料頁 302 轉 SSO 登入頁；首頁是 Big5 編碼且 curl 拿不到任何可爬連結
+    或站內搜尋端點；公開新聞頁網址是不可預測的 GUID (NewsViewer.aspx?a=<guid>)。
+    → 仍然需要外部索引才找得到，繞回原點。
+
+✗ MOPS 官方 (詳見 2.1)
+    重大訊息 t05st01 只涵蓋約 32 家自願把月營收發成重大訊息者，mops_baseline.csv 約 53 檔。
+    無法覆蓋 3 萬筆。
+
+✓ 可行解：Playwright 驅動「系統安裝的 Chrome」+ headful + 持久設定檔
+    真實 Chrome 通過了 Client Hints 指紋檢查(curl 過不了的那關)。
+    headless=True 曾被導到 /sorry/ 驗證頁；改 headful + 持久設定檔後 0 驗證碼。
+
+
+9.3 可行配方 (實測驗證過，直接照做)
+--------------------------------------------------------------------------------
+環境：
+  pip3 install --user playwright         # 1.61.0；這是本 repo 第一個第三方依賴
+  不需要 playwright install chromium     # 用系統的 /usr/bin/google-chrome (實測 Chrome 146)
+  需要圖形環境：DISPLAY=:0 (headful)
+
+啟動瀏覽器 (跨任務重用同一個實例，啟動成本高，不要每筆重開)：
+  ctx = p.chromium.launch_persistent_context(
+      os.path.expanduser("~/.cache/revswarm-chrome"),   # 持久設定檔，保留 cookie
+      channel="chrome",            # 用系統 Chrome，非下載的 Chromium
+      headless=False,              # ⚠️ 有視窗；headless 會被導到 /sorry/
+      locale="zh-TW", timezone_id="Asia/Taipei",
+      viewport={"width": 1366, "height": 900},
+      args=["--disable-blink-features=AutomationControlled"])
+
+查詢：
+  https://www.google.com/search?q=<查詢>&hl=zh-TW&gl=tw
+  不帶 num → 取第 1 頁預設約 10 筆結果。
+
+⚠️ 查詢順序與 Yahoo 相反：Google 要「西元年優先」
+  q_ad  = "{代號} {名稱} {西元年}年{月}月"    ← 第一順位 (單獨命中率 70%)
+  q_roc = "{代號} {名稱} {民國年}年{月}月"    ← 第二順位 (補 20%)
+  中一個就停。絕不加「營收」二字(同 2.3a)，也絕不加 "moneydj"(見 9.4)。
+  Google 會直接忽略民國年 token(頁面會顯示「缺少字詞：110」)，這就是要用西元年的原因。
+
+取文字與解析 (與 Yahoo 完全同一套，不需要新 parser)：
+  text = page.inner_text("body")          # 整頁可見文字，含標題/摘要/麵包屑/相關搜尋
+  hit  = revlib.parse(text, name, ry, rm) # 窗過濾(次月1~15) + 精確名稱錨點
+
+禮貌延遲：每次查詢間 6~10 秒 (使用者指定)。
+
+驗證碼判定：
+  page.url 含 "/sorry/" → 判 rate_limited，⚠️ 絕不可判 failed
+  (failed 只能是「頁面正常、兩種年份都試過、仍無窗內日期」)
+  headful 之下可人工解，解完自動接續。
+
+
+9.4 實測數據 (10 筆真實 failed 樣本；累計 40 次查詢，0 驗證碼)
+--------------------------------------------------------------------------------
+  q_ad   命中 7/10 = 70%
+  q_roc  命中 5/10 = 50%
+  任一    命中 9/10 = 90%   ← 外推依據
+
+  兩種寫法互補的真正原因(不是隨機波動)：
+    中央社【公告】標題寫西元年(「友達2022年3月合併營收280.43億元」) → 只有 q_ad 抓得到
+    MoneyDJ 標題寫民國年  (「凌通110年10月營收3.46億、年增14.66%」) → 只有 q_roc 抓得到
+
+  命中來源分佈：中央社【公告】4、MoneyDJ 2、CMoney 1、winvest.tw 1、Yahoo Finance 1
+    → 來源很分散，MoneyDJ 只佔少數。
+
+  ⚠️ 實測「查詢字串尾端加 moneydj」會變差，已驗證不要加：
+     q_ad 70%→40%、q_roc 50%→70%、任一 90%→80%
+     原因：過度限縮，把 CMoney/中央社/Yahoo 來源的命中排擠掉了(友達整筆落空)。
+     四種變體取聯集仍是 9/10，加 moneydj 沒補到任何新案例，純淨損失。
+
+  唯一始終落空：6742 澤米 民國109/5 (最舊的月份之一)
+
+
+9.5 已完成的 server 端改動 (已測試，直接沿用，不用重做)
+--------------------------------------------------------------------------------
+  - tasks 表新增 engine 欄位 TEXT NOT NULL DEFAULT 'yahoo'
+    (CREATE TABLE 與 _migrate() 兩處都加了，既有 DB 會自動 ALTER 補上)
+  - 新增索引 idx_undone_engine_age(state, engine, roc_year, roc_month)
+    ⚠️ 這個索引必須建在 _migrate() 內、且在 ALTER TABLE 之後。放在 SCHEMA 字串裡會讓
+       舊 DB 開啟時炸「no such column: engine」，因為 executescript 跑在 _migrate 之前。
+  - Store.lease(n, worker_id, engine="yahoo")  依 engine 過濾派工
+  - Store.requeue_failed(engine=None)
+      engine=None      → 沿用舊行為，只改 state，不動 engine
+      engine='google'  → 連 engine 一併轉過去，交給 google worker 專門處理
+  - POST /lease?n=&worker=&engine=google
+    POST /admin/requeue-failed?engine=google
+  - 惰性回收逾時租約時「不分 engine」(租約逾時就該放回，不管誰拿走的)
+  - test_server.py 已補 TestEngineRouting 4 個測試；全檔 18 個測試通過
+  - 實測：對 revswarm.db 副本跑 requeue_failed(engine='google') → 30,813 筆轉成
+    state=undone/engine=google，yahoo 佇列不受影響
+
+  ⚠️ 這些改動在寫下本節時「尚未 commit」，只存在於工作目錄(git status 顯示
+     M server.py / M test_server.py)。新 session 開始時請先 `git status` 與
+     `git diff server.py` 確認實際狀態 —— 若已被 commit 就照常繼續；若工作目錄
+     被清掉了(改動消失)，則 9.5 這幾項需要重做。判斷方式：
+       python3 -c "import server; print('engine' in {r[1] for r in
+         server.connect('revswarm.db').execute('PRAGMA table_info(tasks)')})"
+     印 True 代表 engine 欄位已在 DB 內、改動有效。
+
+
+9.6 待做 (新 session 的工作)
+--------------------------------------------------------------------------------
+【2026-07-29 進度】Step 0~3 已完成(未 commit)：google_worker.py 改寫成 Playwright 版、
+  test_google_worker.py 14 個測試、.env.example 拿掉金鑰、README 段落重寫。
+  全 repo 70 個測試通過。實測 8 筆隨機 failed(多為最舊月份 109~110 年) → 命中 4 筆
+  (g_ad 1、g_roc 3)，22 次查詢 0 驗證碼、0 次誤判 rate_limited。
+  ⚠️ 這 50% 明顯低於 9.4 的 9/10，兩次樣本都只有 8~10 筆(CI 很寬)，且本次抽樣偏舊月份
+  ——舊月份本來就最難(見 9.4 澤米)。真實命中率等放量後看 /stats。
+  剩下 Step 4(啟動放量) 未做。source 標成 g_ad/g_roc(非 q_ad/q_roc)以便區分引擎。
+
+Step 0  清理死程式碼 (目前工作目錄裡有 Custom Search API 版的殘留)
+  - google_worker.py        API 版 → 改寫成 Playwright 版
+  - test_google_worker.py   測 API 版 → 對應改寫
+  - .env.example            刪掉 GOOGLE_API_KEY / GOOGLE_CSE_ID (Playwright 版不需金鑰)
+  - README.md               google_worker 段落現在描述已死的 API → 改寫
+  - .env                    裡有 3 把已無用的 Google 金鑰，可自行到 Console 刪除
+
+Step 1  實作 google_worker.py (Playwright 版)
+  - 沿用 worker.py 骨架：Client(lease/report)、主迴圈、指數退避、
+    連續 rate_limited 判定被擋、提早結束本批並把剩餘任務以 rate_limited 放回
+  - lease 要帶 engine=google
+  - 瀏覽器實例跨任務重用；每批結束不必關閉
+  - 分散式(使用者要求可在別台電腦啟動)：目標機只需
+      copy google_worker.py + revlib.py
+      pip3 install --user playwright
+      有圖形環境 (DISPLAY)
+      .env 放同一組 REVSWARM_TOKEN
+      python3 google_worker.py --server http://<SERVER>:8000
+  - 參數比照 worker.py：--batch/--delay/--jitter/--per-query-sleep/--rl-threshold/
+    --block-sleep/--idle-sleep/--once/--max-batches
+    預設 delay 改成 6，jitter 4 (=6~10 秒，使用者指定)
+
+Step 2  test_google_worker.py
+  - 比照 test_worker.py 手法：替換模組全域的 time/random/搜尋函式為假物件，
+    不連網、不真的開瀏覽器、不真的睡
+  - 測 crawl_task 四種分類(q_ad命中/q_roc補中/兩者皆正常但無日期=failed/被擋=rate_limited)
+  - 測主迴圈退避序列與剩餘任務放回
+
+Step 3  文件
+  - README 新增 google_worker 段落：Playwright 安裝、DISPLAY 需求、驗證碼人工解流程、
+    engine 佇列分流用法
+  - ⚠️ 明確說明這是 repo 第一個第三方依賴，且 server.py/worker.py/revlib.py 仍維持零依賴
+
+Step 4  啟動
+  - curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
+      "http://<SERVER>:8000/admin/requeue-failed?engine=google"
+  - 先 --once 或 --max-batches 1 小量驗證，再放量
+  - 背景長跑用 tmux (不要 nohup)；headful 需要 DISPLAY=:0
+  - 時程概估：每筆平均約 1.3 次查詢 × (頁面載入 2~4s + 延遲 6~10s) ≈ 12~20s/筆
+    → 30,877 筆單機約 5~7 天；多機可分攤(每台一顆 IP)
+
+
+9.7 未決事項 / 已知風險
+--------------------------------------------------------------------------------
+  1. 驗證碼：40 次查詢 0 次不代表 6 萬次安全。無人看顧時會卡住 →
+     一定要有 rate_limited 退避 + 長睡，並考慮多機分攤 IP。
+  2. 日期來源不一致：晶心科 111/12 的 q_ad 抓到 2023-01-09(中央社)、
+     q_roc 抓到 2023-01-10(MoneyDJ)，兩者都在窗內但只有一個是真正申報日
+     (可能是「新聞發稿日」vs「實際申報日」的落差)。
+     若要求精確，需訂來源優先序，而不是「先命中的贏」。目前配方是先命中就停。
+  3. 尚未實測：加 num=20 或翻第 2 頁(start=10) 能否救回舊月份(如澤米)。
+     加 num 幾乎零成本但 Google 對它的支援不穩，需先驗證真的有變多；
+     翻頁確定有效但請求數翻倍，直接反映在總時程上。
+  4. 90% 來自 10 筆樣本，95% 信賴區間約 55%~100%，區間很寬。
+     正式跑起來後 /stats 就是真實量測，不必另外抽樣。
+
+
+9.8 一句話總結給新 session
+--------------------------------------------------------------------------------
+把 google_worker.py 改寫成「Playwright + 系統 Chrome + headful + 持久設定檔」爬 Google，
+向 server 租 engine=google 的任務(先 requeue-failed?engine=google 把 30,877 筆轉過去)，
+查詢用「西元年優先、民國年補第二」、不加 moneydj、每次間隔 6~10 秒，
+沿用 revlib.parse 的窗過濾與名稱錨點，/sorry/ 判 rate_limited 絕不判 failed。
+server 端的 engine 分流已完成並測試過。所有死路與實測數據見 9.2~9.4。
