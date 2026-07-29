@@ -124,15 +124,17 @@ class TestCrawlTask(unittest.TestCase):
 
     def test_no_searcher_is_rate_limited_not_failed(self):
         """瀏覽器還沒起（SEARCHER=None）→ rate_limited，絕不能悄悄記成 failed。"""
+        google_worker.SEARCHER = None    # 明示前提，不倚賴別的測試類別清乾淨
         r = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
         self.assertEqual(r["status"], "rate_limited")
 
 
 class _FakePage:
-    """假 playwright page：可指定導覽後的 url、頁面文字，或讓 goto 直接拋錯。"""
+    """假 playwright page：可指定導覽後的 url、頁面文字、有沒有 #search 結果容器，
+    或讓 goto 直接拋錯。has_search=False 模擬「不是 SERP」（同意頁 / enablejs / 未知攔阻）。"""
     def __init__(self, text="", url="https://www.google.com/search?q=x",
-                 raise_on_goto=False, closed=False):
-        self.text, self._url = text, url
+                 has_search=True, raise_on_goto=False, closed=False):
+        self.text, self._url, self.has_search = text, url, has_search
         self.raise_on_goto, self._closed = raise_on_goto, closed
         self.goto_calls = 0
 
@@ -149,7 +151,8 @@ class _FakePage:
             raise RuntimeError("navigation failed")
 
     def wait_for_selector(self, sel, timeout=None):
-        raise RuntimeError("no #search")   # 等不到結果區不該影響判斷，仍往下讀文字
+        if not self.has_search:
+            raise RuntimeError(f"timeout waiting for {sel}")   # 真 playwright 也是拋錯
 
     def inner_text(self, sel):
         return self.text
@@ -181,8 +184,28 @@ class TestSearcherClassify(unittest.TestCase):
         s = self._searcher(_FakePage(text="我們的系統偵測到您的電腦網路送出異常流量。" * 20))
         self.assertEqual(s.search("q"), (None, False))
 
-    def test_short_page_is_rate_limited(self):
-        s = self._searcher(_FakePage(text="短"))
+    def test_non_serp_page_is_rate_limited_not_failed(self):
+        """⚠️ 最重要的一條：頁面沒有 #search（Google 同意頁／enablejs／未知攔阻）→
+        必須 rate_limited。它字數很多、網址不含 /sorry/、也沒有任何攔阻字樣，
+        用字數判準會被當成正常頁 → 找不到窗內日期 → 誤記成真的 failed，
+        把「還沒查成功」寫成「Google 也沒有」，靜靜污染研究資料。
+        全新設定檔的第一次查詢就會遇到同意頁，所以這是新機器部署的必經路徑。"""
+        consent = "在您繼續前 Google 使用 Cookie 和資料 我同意 全部拒絕 更多選項" * 20
+        s = self._searcher(_FakePage(text=consent, has_search=False,
+                                     url="https://consent.google.com/m?continue=..."))
+        self.assertEqual(s.search("q"), (None, False))
+
+    def test_sparse_but_real_serp_is_ok(self):
+        """反向：合法但「幾乎沒結果」的 SERP 不可被誤判 rate_limited。實測這種頁面
+        整頁可見文字只有 326 字（仍有 #search/#rso）——所以判準是容器，不是字數。
+        誤判的代價：lease 是最舊優先，被放回的任務下一批又排最前面 → 永久重試。"""
+        s = self._searcher(_FakePage(text="找不到與查詢字詞相符的資料。" * 4))  # ~84 字
+        text, ok = s.search("q")
+        self.assertTrue(ok)
+        self.assertIn("找不到", text)
+
+    def test_empty_text_is_rate_limited(self):
+        s = self._searcher(_FakePage(text=""))
         self.assertEqual(s.search("q"), (None, False))
 
     def test_nav_error_is_rate_limited_and_keeps_browser(self):

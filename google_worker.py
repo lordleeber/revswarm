@@ -22,8 +22,9 @@ Chrome」查 Google 搜尋、回報結果。用來二次補搜 worker.py（爬 Y
      ——實測加了會把 CMoney/中央社/Yahoo 來源的命中排擠掉（任一 90%→80%），純損失。
   3. page.inner_text("body") 取整頁可見文字（標題+摘要+相關搜尋）直接餵 revlib.parse，
      不需要新 parser：它本來就是純文字的窗過濾 + 名稱錨點。
-  4. 驗證頁（/sorry/）、導覽失敗、頁面文字過短 → rate_limited（放回佇列），絕不當
-     failed：failed 只能是「頁面正常、兩種年份都試過、仍無窗內日期」。
+  4. 驗證頁（/sorry/）、導覽失敗、頁面不是 SERP（沒有 #search 容器，例如全新設定檔
+     第一次跑遇到的 Google 同意頁）→ rate_limited（放回佇列），絕不當 failed：
+     failed 只能是「頁面是正常 SERP、兩種年份都試過、仍無窗內日期」。
      headful 之下驗證碼可人工解，解完下一筆自動接續（瀏覽器實例不關）。
 
 前置（⚠️ 這是本 repo 第一個第三方依賴；server.py/worker.py/revlib.py 仍維持零依賴）：
@@ -56,8 +57,11 @@ import revlib
 
 SEARCH_URL = "https://www.google.com/search"
 PROFILE_DIR = "~/.cache/revswarm-chrome"   # 持久設定檔：保留 cookie/同意狀態，降驗證碼
-NAV_TIMEOUT_MS = 30000
-MIN_TEXT_CHARS = 200      # 低於此視為錯誤頁/被擋；正常 SERP（含 0 結果頁）遠超過
+# 導覽逾時 20s：實測 Google 要嘛 ~1s 回、要嘛給 /sorry/，等更久沒有意義，只會讓
+# 「整批耗時 > 租約 TTL(600s)」的風險變高（見 --batch 的說明）。
+NAV_TIMEOUT_MS = 20000
+SERP_SELECTOR = "#search"     # 結果容器；「這頁到底是不是 SERP」的判準（見 search()）
+SERP_TIMEOUT_MS = 5000
 # 被擋/驗證的訊號。刻意只認明確字樣：誤判成 rate_limited 會讓「Google 真的查不到」
 # 的任務永遠放回佇列繞圈，所以寧可漏認也不要濫認。
 BLOCK_MARKERS = re.compile(
@@ -102,7 +106,7 @@ class Searcher:
                 try:
                     getattr(obj, meth)()
                 except Exception:
-                    pass          # 關閉失敗無所謂，程式正要結束
+                    pass          # 關不掉也只能放手（本函式也用於中途重建，不只收尾）
         self._pw = self._ctx = self._page = None
 
     def _recycle(self):
@@ -111,7 +115,7 @@ class Searcher:
 
     def search(self, query, timeout=NAV_TIMEOUT_MS):
         """
-        回傳 (text, ok)。ok=False = RATE_LIMITED 訊號（驗證頁 / 導覽失敗 / 文字過短）。
+        回傳 (text, ok)。ok=False = RATE_LIMITED 訊號（不是 SERP / 導覽失敗 / 驗證字樣）。
         絕不因為「這頁沒有想要的日期」而回 ok=False——那是 parse 的事。
         """
         if self._page is None:
@@ -131,20 +135,27 @@ class Searcher:
             self._page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             if "/sorry/" in self._page.url:
                 return None, False
-            # 保險：結果區偶爾晚一步進 DOM。等不到不作為判斷依據，仍往下讀文字。
-            try:
-                self._page.wait_for_selector("#search", timeout=5000)
-            except Exception:
-                pass
+            # ⚠️ 「這頁是不是真的 SERP」只認結果容器 #search，不用文字長度判斷。
+            # 實測：連「幾乎沒有結果」的查詢都有 #search/#rso，但整頁可見文字只有 326 字
+            # ——用字數當門檻兩頭都會錯：
+            #   高門檻 → 正常的稀疏結果頁被誤判 rate_limited。而 lease 是最舊優先，
+            #            被放回的任務下一批又排最前面，會永久重試、永遠不會定案。
+            #   低門檻 → 更糟：全新設定檔的第一次查詢會遇到 Google 同意頁
+            #            (consent.google.com)，它字數遠超門檻、網址不含 /sorry/、
+            #            也沒有任何 BLOCK_MARKERS 字樣 → 被當成正常頁 → 找不到窗內日期
+            #            → 誤記成真的 failed。那會把「還沒查成功」寫成「Google 也沒有」，
+            #            靜靜污染研究資料。同意頁/enablejs 轉址頁都沒有 #search。
+            # 等不到就讓例外落到外層 handler，跟導覽失敗一樣統一當 rate_limited。
+            self._page.wait_for_selector(SERP_SELECTOR, timeout=SERP_TIMEOUT_MS)
             text = self._page.inner_text("body")
         except Exception:
             # playwright 的錯誤型別要 import 才拿得到（本模組刻意延後 import），
-            # 且這裡任何失敗都保守當 rate_limited，故一律吞掉。
+            # 且這裡任何失敗（導覽逾時、不是 SERP、context 掛掉）都保守當 rate_limited。
             # 頁面/context 已關（使用者關窗）→ 重建，否則之後每筆都會失敗。
             if self._page is None or self._page.is_closed():
                 self._recycle()
             return None, False
-        if not text or len(text) < MIN_TEXT_CHARS or BLOCK_MARKERS.search(text):
+        if not text or BLOCK_MARKERS.search(text):
             return None, False
         return text, True
 
@@ -322,9 +333,13 @@ def main():
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"),
                     help="Bearer token；預設讀 .env / 環境變數 REVSWARM_TOKEN")
     ap.add_argument("--worker-id", default=None, help="預設 hostname-pid-g")
-    # batch 預設比 worker.py 小：本 worker 每筆約 12~20s，而 server 的租約 TTL 是 600s，
-    # 一批跑超過 TTL 會被惰性回收、可能被別台重派（做白工）。15 筆 ≈ 最多 300s，留足餘裕。
-    ap.add_argument("--batch", type=int, default=15, help="每次租多少筆")
+    # batch 預設遠比 worker.py 小，因為一批必須在租約 TTL(600s) 內回報完，否則會被惰性
+    # 回收、可能被別台重派做白工。算最壞情況（用 20s 導覽逾時）：
+    #   某筆 g_ad 逾時 20s + per-query-sleep 6s + g_roc 命中 ~2s + delay 最多 10s ≈ 38s，
+    #   而這種筆數每次都有命中 → consec_rl 被歸零 → --rl-threshold 的保險絲不會跳。
+    #   10 筆 × 38s ≈ 380s < 600s，仍有餘裕；15 筆就會逼近 570s。
+    # （兩個查詢都逾時的筆數約 48s，但那會連續 rate_limited、3 筆就提早收批，不累積。）
+    ap.add_argument("--batch", type=int, default=10, help="每次租多少筆")
     ap.add_argument("--delay", type=float, default=6.0, help="每筆任務間基礎延遲秒")
     ap.add_argument("--jitter", type=float, default=4.0,
                     help="每筆延遲的隨機抖動上限秒（預設 6+0~4 = 6~10s）")

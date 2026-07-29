@@ -245,6 +245,29 @@ class TestEngineRouting(unittest.TestCase):
             [t["stock_id"] for t in self.store.lease(5, "w", engine="google")], ["A"])
 
 
+class TestParseEngine(unittest.TestCase):
+    """?engine= 的解析：不合法一定要能讓呼叫端回 400，不可靜默當預設或原樣寫進 DB。"""
+
+    def test_missing_or_empty_uses_default(self):
+        # lease 的 default 是 DEFAULT_ENGINE；requeue-failed 的 default 是 None
+        # （＝engine 欄位不動，沿用舊行為）。空字串必須與「沒帶參數」同義：
+        # 若當真，WHERE engine='' 永遠零筆，worker 會一直印「佇列已空」看不出是打錯參數。
+        self.assertEqual(server.parse_engine("", server.DEFAULT_ENGINE), ("yahoo", True))
+        self.assertEqual(server.parse_engine(None, server.DEFAULT_ENGINE), ("yahoo", True))
+        self.assertEqual(server.parse_engine("", None), (None, True))
+
+    def test_whitelisted(self):
+        self.assertEqual(server.parse_engine("yahoo"), ("yahoo", True))
+        self.assertEqual(server.parse_engine("google"), ("google", True))
+
+    def test_unknown_is_rejected(self):
+        # 打錯字若原樣寫入，3 萬筆會被丟進沒有任何 worker 會租的佇列，
+        # 而回應仍是 {"requeued": N} —— 這種靜默壞法最難查，所以一律 ok=False。
+        for bad in ("googel", "Google", "YAHOO", "bing", "yahoo google", "'"):
+            with self.subTest(bad=bad):
+                self.assertEqual(server.parse_engine(bad, "yahoo"), (None, False))
+
+
 class TestAuth(unittest.TestCase):
     TOK = "s3cret"
 

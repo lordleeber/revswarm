@@ -80,12 +80,12 @@ python3 export.py --out revenue_dates.csv
 
 | method | path | 說明 |
 |---|---|---|
-| POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），worker.py 與 google_worker.py 不會搶同一批 |
+| POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），worker.py 與 google_worker.py 不會搶同一批；只收 `yahoo`\|`google`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
 | POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?}]}`；status ∈ success/failed/rate_limited |
 | GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
 | GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
 | GET | `/healthz` | 存活探針（免 token）|
-| POST | `/admin/requeue-failed` | 把所有 `failed` 重開成 `undone`，做「最後一輪」（改西元年常能救回）。加 `?engine=google` 則連 engine 一併轉過去，交給 google_worker 專門處理，不影響其餘 yahoo 佇列 |
+| POST | `/admin/requeue-failed` | 把所有 `failed` 重開成 `undone`，做「最後一輪」（改西元年常能救回）。加 `?engine=google` 則連 engine 一併轉過去，交給 google_worker 專門處理，不影響其餘 yahoo 佇列；未知 engine 回 400（否則 3 萬筆會被丟進沒有 worker 會租的佇列）|
 
 ## worker 調參
 
@@ -162,7 +162,8 @@ DISPLAY=:0 python3 google_worker.py --server http://<SERVER>:8000         # 再�
 可同時開著、不會互搶任務。參數意義與 `worker.py` 相同，預設值不同：
 
 ```bash
---batch 15             # 每筆約 12~20s；一批要在租約 TTL(600s)內回報完，故批次比 worker.py 小
+--batch 10             # 一批必須在租約 TTL(600s)內回報完；最壞情況每筆約 38s（導覽逾時
+                       #   20s + 查詢間隔 6s + 補查 2s + 延遲 10s），10 筆 ≈ 380s 留有餘裕
 --delay 6 --jitter 4   # 每筆任務間 6~10s
 --per-query-sleep 6    # 同任務內兩次查詢間隔
 --rl-threshold 3       # 連續幾筆 rate_limited 判定被要求驗證
@@ -179,9 +180,17 @@ DISPLAY=:0 python3 google_worker.py --server http://<SERVER>:8000         # 再�
 命中的 `source` 記成 `g_ad` / `g_roc`（Yahoo 是 `q_ad` / `q_roc`），
 匯出資料看得出這筆日期是哪個引擎補到的。
 
-驗證碼處理：偵測到 `/sorry/`、頁面出現「異常流量」等字樣、或導覽失敗，
-一律當 `rate_limited` 放回佇列，**絕不當 `failed`**——只有「頁面正常、兩種年份都試過、
-仍無窗內日期」才是真的 `failed`，避免把「這次沒查到」誤記為「Google 也搜不到」。
+驗證碼處理：偵測到 `/sorry/`、頁面出現「異常流量」等字樣、導覽失敗、或**頁面根本不是
+搜尋結果頁**（沒有 `#search` 結果容器），一律當 `rate_limited` 放回佇列，
+**絕不當 `failed`**——只有「頁面是正常 SERP、兩種年份都試過、仍無窗內日期」才是真的
+`failed`，避免把「這次沒查到」誤記為「Google 也搜不到」。
+
+> ⚠️ 為什麼判準是 `#search` 容器而不是頁面字數：**全新設定檔的第一次查詢會遇到
+> Google 同意頁**，它字數很多、網址不含 `/sorry/`、也沒有任何攔阻字樣，用字數判準會被
+>當成正常頁 → 找不到窗內日期 → 誤記成真 `failed`，靜靜污染研究資料。反過來，實測合法
+> 但「幾乎沒結果」的 SERP 整頁可見文字只有 326 字，字數門檻設高又會誤判 `rate_limited`
+> （而 lease 是最舊優先，被放回的任務下一批又排最前面，會永久重試）。同意頁與
+> `enablejs` 轉址頁都沒有 `#search`，稀疏結果頁有——所以容器是對的維度。
 連續超過 `--rl-threshold` 筆就提早結束本批、長睡 `--block-sleep`；
 **視窗會一直開著，可以人工把驗證碼解掉，長睡結束後自動接續**（瀏覽器實例跨任務重用）。
 

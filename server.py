@@ -9,7 +9,8 @@ state machine:  undone → dispatched → (success | failed)
   - rate_limited ≠ failed：立刻放回 undone，不計失敗
 
 endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可設）：
-  POST /lease?n=30&worker=<id>&engine=yahoo   原子租一批任務（engine 分流佇列，預設 yahoo）
+  POST /lease?n=30&worker=<id>&engine=yahoo   原子租一批任務
+                                     （engine 分流佇列，預設 yahoo；只收 yahoo|google，其餘 400）
   POST /result   {results:[{id,status,date?,source?,title?}, ...]}  批次回報
   GET  /stats                        進度、各 state 計數、近況
   GET  /healthz                      存活探針（免 token）
@@ -36,6 +37,8 @@ import revlib
 
 LEASE_TTL = 600          # 秒；dispatched 超過此值未回覆即可被重派
 MAX_LEASE = 200          # 單次 lease 上限，避免一隻 worker 掃光佇列
+ENGINES = ("yahoo", "google")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
+DEFAULT_ENGINE = "yahoo"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks(
@@ -125,6 +128,27 @@ def clamp_refresh(raw, default=10):
         return max(5, min(int(raw), 300))
     except (ValueError, TypeError):
         return default
+
+
+def parse_engine(raw, default=None):
+    """
+    解析 ?engine= 參數，回傳 (engine, ok)。
+
+    不合法的 engine 一定要回 400，不可靜默當成預設或原樣寫進 DB——兩種靜默壞法都很難查：
+      - lease?engine=（空字串）當真 → WHERE engine='' 永遠零筆，worker 每 30s 印
+        「佇列已空」，看起來像沒任務、其實是參數打錯。
+      - requeue-failed?engine=googel（打錯字）原樣寫入 → 3 萬筆被丟進沒有任何 worker
+        會租的佇列，回應卻照樣是 {"requeued": 30877}。
+    大小寫不做正規化：'Google' 直接 400，比默默寫進一個跟 DB 值不同的字串好查。
+
+    缺參數/空字串 → (default, True)；default 由呼叫端決定語意
+    （lease 是 DEFAULT_ENGINE，requeue-failed 是 None＝engine 欄位不動）。
+    """
+    if not raw:
+        return default, True
+    if raw in ENGINES:
+        return raw, True
+    return None, False
 
 
 def derive_stats(by_state, recent_success):
@@ -265,7 +289,7 @@ class Store:
         self._lock = threading.Lock()
 
     # --- 派工：原子鎖定 + 惰性回收 ---------------------------------------
-    def lease(self, n, worker_id, engine="yahoo"):
+    def lease(self, n, worker_id, engine=DEFAULT_ENGINE):
         n = max(1, min(int(n), MAX_LEASE))
         now = int(time.time())
         cutoff = now - LEASE_TTL
@@ -276,8 +300,12 @@ class Store:
             try:
                 # 惰性回收：先把逾時的 dispatched 全部收回 undone（走 idx_dispatched，很快）。
                 # 拆成獨立 UPDATE（而非塞進 SELECT 的 OR）是為了讓下面的挑選能純走
-                # WHERE state='undone'，靠 idx_undone_age 免 TEMP B-TREE 排序。不分
-                # engine：租約逾時就該放回，不管原本是哪個 worker 種類拿走的。
+                # 等值條件，靠 idx_undone_engine_age 免 TEMP B-TREE 排序（實測
+                # EXPLAIN QUERY PLAN：SEARCH USING COVERING INDEX idx_undone_engine_age。
+                # ORDER BY 的 id 由索引隱含尾隨的 rowid 滿足——id 就是 rowid）。
+                # ⚠️ 加了 engine 條件後，舊索引 idx_undone_age(state,roc_year,roc_month)
+                # 已無任何查詢會用到，可安全 DROP（留著只是白付寫入成本）。
+                # 惰性回收本身不分 engine：租約逾時就該放回，不管哪種 worker 拿走的。
                 conn.execute(
                     "UPDATE tasks SET state='undone', dispatched_at=NULL, worker_id=NULL"
                     " WHERE state='dispatched'"
@@ -518,7 +546,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/lease":
             n = int(q.get("n", ["30"])[0])
             worker = q.get("worker", ["anon"])[0]
-            engine = q.get("engine", ["yahoo"])[0]
+            engine, ok = parse_engine(q.get("engine", [""])[0], DEFAULT_ENGINE)
+            if not ok:
+                return self._send(400, {"error": f"unknown engine; 可用: {list(ENGINES)}"})
             try:
                 batch = self.store.lease(n, worker, engine)
             except sqlite3.OperationalError as e:
@@ -540,7 +570,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"applied": counts})
 
         if u.path == "/admin/requeue-failed":
-            engine = q.get("engine", [None])[0]
+            # default=None ＝ 不給 engine 就沿用舊行為（只改 state，engine 欄位不動）。
+            engine, ok = parse_engine(q.get("engine", [""])[0], None)
+            if not ok:
+                return self._send(400, {"error": f"unknown engine; 可用: {list(ENGINES)}"})
             n = self.store.requeue_failed(engine)
             return self._send(200, {"requeued": n})
 
