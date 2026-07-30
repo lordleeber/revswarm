@@ -38,6 +38,8 @@
 | `build_stocks.py` | 從證交所 ISIN 建 `stocks.csv`（code→中文簡稱→market）|
 | `data/active_stocks.txt` | 1848 檔股票代號（一行一個）|
 | `data/name_overrides.csv` | 已下市/ISIN 查無者的人工補名（目前 3426 台興、6806 森崴能源）|
+| `data/date_overrides.csv` | 人工確認的**遲交**公布日（窗外個案，目前 1 筆；見下）|
+| `apply_date_overrides.py` | 把上面那份 CSV 套進 DB（冪等；DB 不進版控，重建後要重跑）|
 | `stocks.csv` | 產生的對照表（進版控）|
 | `init_tasks.py` | 展開 1848×73 成 tasks 寫入 SQLite（冪等）|
 | `server.py` | 工作佇列 server（標準庫 http.server + sqlite3，零依賴）|
@@ -355,6 +357,60 @@ python3 mops_validate.py --codes-file data/active_stocks.txt   # 建全量基準
 逐筆比對寫入 `mops_validation.csv`，並印出：一致率、不一致清單（Yahoo 可能抓錯）、
 以及「MOPS 有、Yahoo 卻判 failed」的**可回收**案例（可搭 `/admin/requeue-failed` 重掃）。
 > 實測抽驗台積電/台塑/聯發科等，重疊月份與 MOPS 官方申報日 **100% 一致**。
+
+## 遲交的個案：`data/date_overrides.csv`
+
+窗是「營收月的次月 **1~15 日**」。這個上界不是猜的——`mops_baseline.csv` 那 2556 筆
+MOPS 官方申報日是**唯一沒被窗過濾過**的權威資料，它的日分佈：
+
+```
+日 10 : 520   ← 截止日高峰      日 13 :   8
+日 11 : 112                     日 14 :  18
+日 12 :  50                     日 15 :   8      >15 日：0 筆（最大日 = 15）
+```
+
+也就是「次月 10 日截止 + 遇假日順延 + 小幅落後」全都塞得進 15 日。
+**所以窗不該全域放寬**（放寬只會讓三月才發的回顧型文章有機會被當成公布日）。
+
+但確實有公司某個月遲交到 16、17 號。實測：`3494 誠研 109/1` 的 MoneyDJ 文章日期是
+`2020-02-17`，而誠研 58 筆歷史公布日都在 7~14 號（28 筆是 10 號）——那個月就是遲交。
+這種**不是窗設太窄，是個案異常**，沒有一個「遲交可以到幾號」的規則涵蓋得了，只能逐筆
+人工確認。這份 CSV 就是那個出口：
+
+```bash
+python3 apply_date_overrides.py --dry-run   # 只檢查與列出
+python3 apply_date_overrides.py             # 寫入（會先備份 DB）
+```
+
+驗證規則刻意只守強的那一半：
+
+| | 規則 | 為什麼 |
+|---|---|---|
+| ✓ 驗 | `announce_date` 必須落在**營收月的次月** | 月份錯一定是打錯或誤判 |
+| ✓ 驗 | 日必須是該月合法的日、`note` 不可空白 | 擋打錯；每筆都要交代證據 |
+| ✓ 驗 | `announce_date` 必須是**補零**的 `YYYY-MM-DD` | 下面那條稽核 SQL 用 `substr` 取「日」，格式歪一格就漏抓 |
+| ✓ 驗 | `source` 必須以 `manual` 結尾 | 標記掉了就分不出人工與爬蟲結果 |
+| ✓ 驗 | 表頭與每列欄位數要完全對、同一個 key 不可重複 | 半形逗號會靜默截斷 `note`；重複的後者會無聲蓋掉前者 |
+| ✗ 不驗 | 幾號以前才算「合理遲交」 | 上限是個案問題，由 `note` 與人負責 |
+
+任一列不合格就整批拒絕、不寫任何東西。冪等的「一致」比到 `announce_date`/`source`/
+`raw_title`/`revenue`/`yoy` 全部——改對 CSV 裡打錯的 `raw_title` 會重新導出 `revenue`，
+不會被誤判成「已一致」。
+
+`source` 用 `*_manual` 後綴（例 `g_roc_manual`）：這些是全庫唯一會落在窗外的 success，
+標記要留得住稽核，否則就靜靜違反「所有 `announce_date` 都過窗」這個保證。稽核用：
+
+```sql
+SELECT * FROM tasks WHERE state='success'
+ AND CAST(substr(announce_date,9,2) AS INTEGER) NOT BETWEEN 1 AND 15;
+```
+
+> 這條 SQL 靠 `substr(...,9,2)` 取「日」，所以 `2020-2-17` 會被讀成 `7`（落在 1~15）→
+> 這筆窗外 success 從稽核裡消失。其他 success 的日期都經 `revlib.validate_date` 正規化，
+> 這支為了收窗外個案必須繞過窗檢查，但寫入前仍會正規化一次（`canonical_date`）。
+
+> ⚠️ `revswarm.db` 是執行期產物、不進版控，所以**重建 DB 後要重跑一次** `apply_date_overrides.py`
+> 才會把人工判斷補回去——這正是這份 CSV 存在的理由（否則那些判斷只活在 DB 裡）。
 
 ## 已驗證（端到端小規模測試）
 
