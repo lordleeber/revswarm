@@ -43,7 +43,7 @@
 | `stocks.csv` | 產生的對照表（進版控）|
 | `init_tasks.py` | 展開 1848×73 成 tasks 寫入 SQLite（冪等）|
 | `server.py` | 工作佇列 server（標準庫 http.server + sqlite3，零依賴）|
-| `worker.py` | 爬蟲 worker（curl --http1.1、民國+西元雙查、窗過濾、退避）|
+| `yahoo_worker.py` | 爬蟲 worker（curl --http1.1、民國+西元雙查、窗過濾、退避）|
 | `google_worker.py` | 補搜 worker：Playwright 驅動系統 Chrome 查 Google，撿 Yahoo 救不回的 `failed`（見下）|
 | `requirements.txt` | **只服務 `google_worker.py`** 的相依（playwright）；核心零依賴，不必安裝|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
@@ -51,7 +51,7 @@
 | `mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
-**核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `worker.py` + `revlib.py`。
+**核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `yahoo_worker.py` + `revlib.py`。
 唯一的例外是 `google_worker.py` 需要 playwright（`requirements.txt`），只在要跑 Google 補搜的機器上裝。
 
 ## Quick start
@@ -67,9 +67,9 @@ python3 init_tasks.py                         # → revswarm.db (134,904 undone)
 echo "REVSWARM_TOKEN=$(head -c16 /dev/urandom | base64 | tr -d '\n')" > .env
 python3 server.py --host 0.0.0.0 --port 8000  # 自動讀 .env 的 REVSWARM_TOKEN
 
-# 4. 在「每一台」worker 機器上跑（複製 worker.py + revlib.py 過去）
+# 4. 在「每一台」worker 機器上跑（複製 yahoo_worker.py + revlib.py 過去）
 echo "REVSWARM_TOKEN=<與 server .env 同一組>" > .env
-python3 worker.py --server http://<SERVER_IP>:8000
+python3 yahoo_worker.py --server http://<SERVER_IP>:8000
 
 # 5. 隨時看進度
 source .env
@@ -85,7 +85,7 @@ python3 export.py --out revenue_dates.csv
 
 | method | path | 說明 |
 |---|---|---|
-| POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），worker.py 與 google_worker.py 不會搶同一批；只收 `yahoo`\|`google`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
+| POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），yahoo_worker.py 與 google_worker.py 不會搶同一批；只收 `yahoo`\|`google`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
 | POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?}]}`；status ∈ success/failed/rate_limited |
 | GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
 | GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
@@ -95,7 +95,7 @@ python3 export.py --out revenue_dates.csv
 ## worker 調參
 
 ```bash
-python3 worker.py --server URL \
+python3 yahoo_worker.py --server URL \
   --batch 30            # 每次租幾筆
   --delay 3 --jitter 2  # 每筆任務間 3~5s（禮貌 + 降低被封）
   --per-query-sleep 1.5 # 同任務內兩次查詢間隔
@@ -118,8 +118,8 @@ ssh -D 1080 -N -f -o ExitOnForwardFailure=yes <user>@<VM_外部IP>
 #   或用 gcloud： gcloud compute ssh <VM> --zone <zone> -- -D 1080 -N -f
 
 # worker 的 curl 走它（socks5h 的 h＝DNS 也在 VM 端解，整條請求都從 VM 出）
-WORKER_PROXY=socks5h://127.0.0.1:1080 python3 worker.py --server http://<SERVER>:8000
-#   等同： python3 worker.py --proxy socks5h://127.0.0.1:1080 --server ...
+WORKER_PROXY=socks5h://127.0.0.1:1080 python3 yahoo_worker.py --server http://<SERVER>:8000
+#   等同： python3 yahoo_worker.py --proxy socks5h://127.0.0.1:1080 --server ...
 ```
 
 - **只影響爬 Yahoo 的 `curl`**；worker↔server 的租任務/回報（`urllib`）不受影響、仍走原路
@@ -129,7 +129,7 @@ WORKER_PROXY=socks5h://127.0.0.1:1080 python3 worker.py --server http://<SERVER>
 
 ## google_worker：補搜 failed（Playwright + 系統 Chrome）
 
-`worker.py` 爬 Yahoo 兩種年份都試過仍找不到窗內日期的 `failed` 任務，實測有一批
+`yahoo_worker.py` 爬 Yahoo 兩種年份都試過仍找不到窗內日期的 `failed` 任務，實測有一批
 在 Google 搜尋能命中正確的月營收公告（抽測 10 筆真實 failed，命中 9 筆）。
 `google_worker.py` 就是專門補搜這批的第二種 worker，用 **Playwright 驅動「系統安裝的
 Chrome」**（headful + 持久設定檔）查 Google 搜尋。
@@ -148,15 +148,15 @@ pip3 install --user -r requirements.txt   # 唯一一項 playwright；不必再�
 google-chrome --version                   # 用系統的 /usr/bin/google-chrome（實測 146）
 ```
 > ⚠️ **`requirements.txt` 只服務 `google_worker.py`。**
-> playwright 是本 repo 唯一的第三方依賴，`server.py` / `worker.py` / `revlib.py`
+> playwright 是本 repo 唯一的第三方依賴，`server.py` / `yahoo_worker.py` / `revlib.py`
 > 仍維持「純標準庫、零依賴」——**只跑 server 或 Yahoo 主線的機器不必安裝它**，
-> 複製 `worker.py` + `revlib.py` 過去就能跑。測試也不需要（playwright 是延後 import 的）。
+> 複製 `yahoo_worker.py` + `revlib.py` 過去就能跑。測試也不需要（playwright 是延後 import 的）。
 
 另外需要**圖形環境**（headful 才不會被擋）：`DISPLAY=:0`。無頭機器請改派有桌面的機器跑。
 Chrome 設定檔存在 `~/.cache/revswarm-chrome`（`--profile` 可改），保留 cookie 以降低驗證碼。
 
 跑法：先把 `failed` 轉去 `google` 佇列（否則 google_worker 租不到任何任務），
-再啟動 google_worker（用法與 `worker.py` 對稱）：
+再啟動 google_worker（用法與 `yahoo_worker.py` 對稱）：
 ```bash
 curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
   "http://<SERVER>:8000/admin/requeue-failed?engine=google"
@@ -164,8 +164,8 @@ curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
 DISPLAY=:0 python3 google_worker.py --server http://<SERVER>:8000 --once   # 先小量驗證
 DISPLAY=:0 python3 google_worker.py --server http://<SERVER>:8000         # 再放量（用 tmux）
 ```
-`engine=google` 佇列跟原本 `yahoo` 佇列完全分開派工，`worker.py` 與 `google_worker.py`
-可同時開著、不會互搶任務。參數意義與 `worker.py` 相同，預設值不同：
+`engine=google` 佇列跟原本 `yahoo` 佇列完全分開派工，`yahoo_worker.py` 與 `google_worker.py`
+可同時開著、不會互搶任務。參數意義與 `yahoo_worker.py` 相同，預設值不同：
 
 ```bash
 --batch 10             # 一批必須在租約 TTL(600s)內回報完；最壞情況每筆約 49s（導覽逾時
@@ -286,14 +286,14 @@ tmux kill-session -t revswarm      # 要停止 server 時
 ```bash
 # 複製 worker 需要的兩個檔（用 scp 從 server 拉，或任何方式）
 mkdir -p ~/revswarm && cd ~/revswarm
-scp <user>@<server位址>:/path/to/revswarm/worker.py .
+scp <user>@<server位址>:/path/to/revswarm/yahoo_worker.py .
 scp <user>@<server位址>:/path/to/revswarm/revlib.py .
 
 # token 寫進 .env（與 server 同一組），worker 自動讀
 echo "REVSWARM_TOKEN=<貼上 server 那串 token>" > .env
 
 curl http://<server位址>:8000/healthz          # 回 {"ok":true,...} 才代表連得到
-python3 worker.py --server http://<server位址>:8000
+python3 yahoo_worker.py --server http://<server位址>:8000
 ```
 多台 worker 就在每台重複本步驟（多機 = 多 IP，分攤 Yahoo 封鎖）。
 

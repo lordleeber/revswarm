@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 revswarm google_worker：向 server 租 engine='google' 的任務、用 Playwright 驅動「系統安裝的
-Chrome」查 Google 搜尋、回報結果。用來二次補搜 worker.py（爬 Yahoo）救不回的 failed 任務
+Chrome」查 Google 搜尋、回報結果。用來二次補搜 yahoo_worker.py（爬 Yahoo）救不回的 failed 任務
 ——手動抽測 10 筆真實 failed，Google 命中 9 筆。
 
 為什麼是 Playwright 而不是 API 或 curl（三條死路，別重走，見 todo.txt 9.2）：
@@ -14,11 +14,11 @@ Chrome」查 Google 搜尋、回報結果。用來二次補搜 worker.py（爬 Y
   ✓ 真實 Chrome（channel="chrome"）+ headful + 持久設定檔：通過指紋檢查，實測 40 次
     查詢 0 驗證碼。headless=True 曾被導到 /sorry/，所以預設 headful。
 
-跟 worker.py 共用同一套佇列協定與窗過濾邏輯（revlib.parse），只換掉抓取來源：
-  1. ⚠️ 查詢順序與 worker.py 相反：Google 要「西元年優先」。Google 會直接忽略民國年
+跟 yahoo_worker.py 共用同一套佇列協定與窗過濾邏輯（revlib.parse），只換掉抓取來源：
+  1. ⚠️ 查詢順序與 yahoo_worker.py 相反：Google 要「西元年優先」。Google 會直接忽略民國年
      token（頁面顯示「缺少字詞：110」），故 q_ad 單獨命中 70%、q_roc 補 20%、任一 90%。
      兩者互補是結構性的：中央社【公告】標題寫西元年、MoneyDJ 標題寫民國年。
-  2. 絕不在查詢後加「營收」二字（同 worker.py，會害 recall）；也絕不加 "moneydj"
+  2. 絕不在查詢後加「營收」二字（同 yahoo_worker.py，會害 recall）；也絕不加 "moneydj"
      ——實測加了會把 CMoney/中央社/Yahoo 來源的命中排擠掉（任一 90%→80%），純損失。
   3. page.inner_text("body") 取整頁可見文字（標題+摘要+相關搜尋）直接餵 revlib.parse，
      不需要新 parser：它本來就是純文字的窗過濾 + 名稱錨點。
@@ -34,7 +34,7 @@ Chrome」查 Google 搜尋、回報結果。用來二次補搜 worker.py（爬 Y
      不輪詢，人解掉了照樣等滿 1800s。所以「要不要等人」改成問當前頁的實際狀態，
      不看 reason（見 should_wait_for_human）。
 
-前置（⚠️ 這是本 repo 第一個第三方依賴；server.py/worker.py/revlib.py 仍維持零依賴）：
+前置（⚠️ 這是本 repo 第一個第三方依賴；server.py/yahoo_worker.py/revlib.py 仍維持零依賴）：
   pip3 install --user playwright      # 不需要 playwright install chromium
   需要圖形環境（如 DISPLAY=:0）與系統 Chrome（/usr/bin/google-chrome）
 
@@ -82,7 +82,7 @@ BLOCK_MARKERS = re.compile(
     re.I)
 
 # 長壽的瀏覽器實例（跨任務重用；啟動成本 ~2~4s，不可每筆重開）。由 run() 設定，
-# fetch_google() 讀它——與 worker.py 的 PROXY 同樣是「模組全域」，測試可整個換掉。
+# fetch_google() 讀它——與 yahoo_worker.py 的 PROXY 同樣是「模組全域」，測試可整個換掉。
 SEARCHER = None
 
 
@@ -311,10 +311,10 @@ def crawl_task(task, per_query_sleep):
       result     = {id, status, date?, source?, title?}，status ∈ success|failed|rate_limited
       stop_batch = 是否該立刻停止導覽、把畫面留給人處理
 
-    與 worker.py 的 crawl_task 有三處差異：
+    與 yahoo_worker.py 的 crawl_task 有三處差異：
       - 查詢順序：西元年（g_ad）優先，民國年（g_roc）補第二（見模組開頭 1.）
       - source 標 g_* 而非 q_*：讓 /status 與匯出資料看得出這筆是 Google 補搜來的
-      - ⚠️ 多回一個 stop_batch（worker.py 只回 dict）：Google 的驗證要人工解，
+      - ⚠️ 多回一個 stop_batch（yahoo_worker.py 只回 dict）：Google 的驗證要人工解，
         撞到就必須「立刻停止導覽」，否則那個 goto 會把使用者正在解的驗證頁蓋掉。
         Yahoo 那邊被擋不需要人介入，所以沒這問題。
 
@@ -381,7 +381,7 @@ class Client:
 
     def lease(self, n):
         # engine=google：只租 requeue-failed?engine=google 轉過來的任務，
-        # 不會跟 worker.py（engine=yahoo）搶同一批 undone（見 server.py Store.lease）。
+        # 不會跟 yahoo_worker.py（engine=yahoo）搶同一批 undone（見 server.py Store.lease）。
         return self._req("POST", f"/lease?n={n}&worker={self.worker_id}&engine=google")
 
     def report(self, results):
@@ -506,7 +506,7 @@ def main():
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"),
                     help="Bearer token；預設讀 .env / 環境變數 REVSWARM_TOKEN")
     ap.add_argument("--worker-id", default=None, help="預設 hostname-pid-g")
-    # batch 預設遠比 worker.py 小，因為一批必須在租約 TTL(600s) 內回報完，否則會被惰性
+    # batch 預設遠比 yahoo_worker.py 小，因為一批必須在租約 TTL(600s) 內回報完，否則會被惰性
     # 回收、可能被別台重派做白工。算最壞情況（用 20s 導覽逾時）：
     #   某筆 g_ad 逾時 20s + per-query-sleep 最多 7s + g_roc 命中 ~2s + delay 最多 20s ≈ 49s，
     #   而這種筆數每次都有命中 → consec_rl 被歸零 → --rl-threshold 的保險絲不會跳。

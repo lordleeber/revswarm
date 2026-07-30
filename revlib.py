@@ -6,7 +6,7 @@ revswarm 共用核心：月營收公布日的「期望窗」與 Yahoo 搜尋頁�
 server 與 worker 都依賴這裡的窗邏輯，確保「worker 抓到的日期」與
 「server 存 success 前的再驗證」用的是同一套規則（見 todo.txt 2.4 / 5.5）。
 
-純函式、只用標準庫，沒有網路副作用；worker 的抓取(curl)放在 worker.py。
+純函式、只用標準庫，沒有網路副作用；worker 的抓取(curl)放在 yahoo_worker.py。
 """
 
 import os

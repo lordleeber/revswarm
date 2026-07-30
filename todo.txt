@@ -483,3 +483,23 @@ Step 4  啟動
 查詢用「西元年優先、民國年補第二」、不加 moneydj、每次間隔 6~10 秒，
 沿用 revlib.parse 的窗過濾與名稱錨點，/sorry/ 判 rate_limited 絕不判 failed。
 server 端的 engine 分流已完成並測試過。所有死路與實測數據見 9.2~9.4。
+
+
+10. 檔案改名：worker.py → yahoo_worker.py（2026-07-30）
+================================================================================
+主力 worker 原本叫 worker.py，但 repo 已經有 google_worker.py（補搜 failed）與
+goodinfo_worker.py（抓首次公開日），「worker」這個泛稱反而是三者裡最不清楚的一個。
+改成 yahoo_worker.py，跟它吃的佇列（engine='yahoo'）同名：
+
+  worker.py       → yahoo_worker.py
+  test_worker.py  → test_yahoo_worker.py
+
+⚠️ 只改檔名/模組名，行為與協定完全沒動：
+  - CLI 參數、退避邏輯、窗過濾、lease/report 協定都一樣（lease 仍不帶 engine 參數，
+    由 server 預設成 yahoo）。
+  - 環境變數維持 WORKER_PROXY（不是 YAHOO_WORKER_PROXY）——已經寫在既有的 tmux/SSH
+    SOCKS 流程裡，改名只會讓現有出口設定無聲失效。
+  - DB 的 worker_id 仍是 hostname-pid，既有資料不受影響。
+
+本節之前（9.x 及更早）的敘述寫的是 worker.py，那是當時的實際檔名，保留不改；
+讀到時對照本節即可。
