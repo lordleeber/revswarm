@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-revswarm worker：可在任意機器啟動，向 server 租任務、爬 Yahoo 搜尋、回報結果。
+revswarm 的 Yahoo worker：可在任意機器啟動，向 server 租任務、爬 Yahoo 搜尋、回報結果。
+
+這是主力 worker，吃 engine='yahoo' 佇列（lease 不帶 engine 參數，server 預設就是 yahoo）。
+Yahoo 兩種年份都試過仍找不到窗內日期的 failed，由 google_worker.py 走 engine='google'
+佇列二次補搜——兩者共用同一套佇列協定與 revlib 窗過濾，只換抓取來源。
 
 爬取配方（todo.txt 第3節）：
   對單一 (股票,月份)：
@@ -16,8 +20,8 @@ revswarm worker：可在任意機器啟動，向 server 租任務、爬 Yahoo �
     5. 只有「兩種年份都試過、頁面正常、仍無窗內日期」才回 failed。
     6. 每次查詢間 delay+jitter；偵測連續 rate_limited → 指數退避（多半是整個 IP 被擋）。
 
-部署：把 worker.py 與 revlib.py 複製到任一台機器即可跑：
-  python3 worker.py --server http://SERVER:8000 --token SECRET
+部署：把 yahoo_worker.py 與 revlib.py 複製到任一台機器即可跑：
+  python3 yahoo_worker.py --server http://SERVER:8000 --token SECRET
 """
 
 import argparse
@@ -241,7 +245,7 @@ def run(args):
 
 def main():
     revlib.load_env()          # 先載 .env，讓 REVSWARM_TOKEN 免手打
-    ap = argparse.ArgumentParser(description="revswarm worker")
+    ap = argparse.ArgumentParser(description="revswarm Yahoo worker")
     ap.add_argument("--server", required=True, help="server base URL, 如 http://1.2.3.4:8000")
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"),
                     help="Bearer token；預設讀 .env / 環境變數 REVSWARM_TOKEN")

@@ -161,7 +161,7 @@
       而且不動到 worker 連 server 的那條線。這是個乾淨、通用的技術……
       <b>但我們當初是為了「繞 Yahoo rate limit」才做它,後來實測發現這個目的沒達成。</b></p>
     <div class="chips">
-      <span class="chip mod">worker.py</span>
+      <span class="chip mod">yahoo_worker.py</span>
       <span class="chip mod">README.md</span>
       <span class="chip new">docs/worker-proxy.html</span>
     </div>
@@ -258,19 +258,19 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
 
   <!-- ===== 3. 三行改動 ===== -->
   <h2 id="code"><span class="n">3</span>程式碼：其實只有三處</h2>
-  <p>難的是想通「只改一條通道」；真正的 code 極小。三處都在 <code class="k">worker.py</code>，
+  <p>難的是想通「只改一條通道」；真正的 code 極小。三處都在 <code class="k">yahoo_worker.py</code>，
     節錄如下（highlight 行為本次新增）。</p>
 
   <h3>① 模組層讀一個環境變數</h3>
   <div class="code">
-    <div class="code-hd"><span>worker.py</span><span class="tag">模組頂部</span></div>
+    <div class="code-hd"><span>yahoo_worker.py</span><span class="tag">模組頂部</span></div>
 <pre><span class="fn">MIN_PAGE_BYTES</span> = <span class="s">2000</span>        <span class="c"># 小於此視為被限流/擋（todo 2.6）</span>
 <span class="hl"><span class="c"># 讓 curl 走 proxy（例 socks5h://127.0.0.1:1080，經 SSH SOCKS 從別的 IP 出去繞 per-IP</span></span><span class="hl"><span class="c"># rate limit）。只影響爬 Yahoo 的 curl；worker↔server 的 urllib 不受影響、仍走原路。</span></span><span class="hl"><span class="fn">PROXY</span> = os.environ.<span class="fn">get</span>(<span class="s">"WORKER_PROXY"</span>) <span class="kw">or</span> <span class="kw">None</span></span></pre>
   </div>
 
   <h3>② <code class="k">fetch()</code> 把 curl 指令抽成 list，有 proxy 就附上</h3>
   <div class="code">
-    <div class="code-hd"><span>worker.py — def fetch()</span><span class="tag">爬 Yahoo 的唯一出口</span></div>
+    <div class="code-hd"><span>yahoo_worker.py — def fetch()</span><span class="tag">爬 Yahoo 的唯一出口</span></div>
 <pre>    cmd = [<span class="s">"curl"</span>, <span class="s">"-sS"</span>, <span class="s">"--http1.1"</span>, <span class="s">"-m"</span>, <span class="fn">str</span>(timeout), <span class="s">"-G"</span>,
            <span class="s">"-w"</span>, <span class="s">"\n%{http_code}"</span>,            <span class="c"># 末行附上 HTTP 狀態碼</span>
            <span class="s">"https://tw.search.yahoo.com/search"</span>,
@@ -295,7 +295,7 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
 
   <h3>③ 一個 <code class="k">--proxy</code> CLI 參數（也吃環境變數）</h3>
   <div class="code">
-    <div class="code-hd"><span>worker.py — def main()</span><span class="tag">argparse</span></div>
+    <div class="code-hd"><span>yahoo_worker.py — def main()</span><span class="tag">argparse</span></div>
 <pre>    ap.<span class="fn">add_argument</span>(<span class="s">"--max-batches"</span>, type=<span class="fn">int</span>, default=<span class="s">0</span>, help=<span class="s">"跑幾批後結束(0=不限)"</span>)
 <span class="hl">    ap.<span class="fn">add_argument</span>(<span class="s">"--proxy"</span>, default=os.environ.<span class="fn">get</span>(<span class="s">"WORKER_PROXY"</span>),</span><span class="hl">                    help=<span class="s">"爬 Yahoo 的 curl 走此 proxy，如 socks5h://127.0.0.1:1080…"</span>)</span>
     args = ap.<span class="fn">parse_args</span>()
@@ -337,7 +337,7 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
     <div class="rstep"><span class="sn">3</span><div class="rb"><b>再跑 worker</b>（另一個 tmux，帶上 <code class="k">WORKER_PROXY</code>）。
       <div class="code" style="margin:8px 0 0"><div class="code-hd"><span>本機</span><span class="tag">tmux: worker</span></div>
 <pre>tmux new-session -d -s worker \
-  'WORKER_PROXY=socks5h://127.0.0.1:1080 python3 worker.py --server http://&lt;SERVER&gt;:8000 --token &lt;TOKEN&gt;'</pre></div></div></div>
+  'WORKER_PROXY=socks5h://127.0.0.1:1080 python3 yahoo_worker.py --server http://&lt;SERVER&gt;:8000 --token &lt;TOKEN&gt;'</pre></div></div></div>
   </div>
 
   <div class="note"><b>順序為什麼要緊？</b>
