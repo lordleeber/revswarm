@@ -388,7 +388,14 @@ python3 apply_date_overrides.py             # 寫入（會先備份 DB）
 |---|---|---|
 | ✓ 驗 | `announce_date` 必須落在**營收月的次月** | 月份錯一定是打錯或誤判 |
 | ✓ 驗 | 日必須是該月合法的日、`note` 不可空白 | 擋打錯；每筆都要交代證據 |
+| ✓ 驗 | `announce_date` 必須是**補零**的 `YYYY-MM-DD` | 下面那條稽核 SQL 用 `substr` 取「日」，格式歪一格就漏抓 |
+| ✓ 驗 | `source` 必須以 `manual` 結尾 | 標記掉了就分不出人工與爬蟲結果 |
+| ✓ 驗 | 表頭與每列欄位數要完全對、同一個 key 不可重複 | 半形逗號會靜默截斷 `note`；重複的後者會無聲蓋掉前者 |
 | ✗ 不驗 | 幾號以前才算「合理遲交」 | 上限是個案問題，由 `note` 與人負責 |
+
+任一列不合格就整批拒絕、不寫任何東西。冪等的「一致」比到 `announce_date`/`source`/
+`raw_title`/`revenue`/`yoy` 全部——改對 CSV 裡打錯的 `raw_title` 會重新導出 `revenue`，
+不會被誤判成「已一致」。
 
 `source` 用 `*_manual` 後綴（例 `g_roc_manual`）：這些是全庫唯一會落在窗外的 success，
 標記要留得住稽核，否則就靜靜違反「所有 `announce_date` 都過窗」這個保證。稽核用：
@@ -397,6 +404,10 @@ python3 apply_date_overrides.py             # 寫入（會先備份 DB）
 SELECT * FROM tasks WHERE state='success'
  AND CAST(substr(announce_date,9,2) AS INTEGER) NOT BETWEEN 1 AND 15;
 ```
+
+> 這條 SQL 靠 `substr(...,9,2)` 取「日」，所以 `2020-2-17` 會被讀成 `7`（落在 1~15）→
+> 這筆窗外 success 從稽核裡消失。其他 success 的日期都經 `revlib.validate_date` 正規化，
+> 這支為了收窗外個案必須繞過窗檢查，但寫入前仍會正規化一次（`canonical_date`）。
 
 > ⚠️ `revswarm.db` 是執行期產物、不進版控，所以**重建 DB 後要重跑一次** `apply_date_overrides.py`
 > 才會把人工判斷補回去——這正是這份 CSV 存在的理由（否則那些判斷只活在 DB 裡）。
