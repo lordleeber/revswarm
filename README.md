@@ -145,14 +145,15 @@ Chrome」**（headful + 持久設定檔）查 Google 搜尋。
 前置（一次性）：
 ```bash
 pip3 install --user -r requirements.txt   # 唯一一項 playwright；不必再跑 playwright install
-google-chrome --version                   # 用系統的 /usr/bin/google-chrome（實測 146）
+google-chrome --version                   # 用系統的 /usr/bin/google-chrome（實測 146、150）
 ```
 > ⚠️ **`requirements.txt` 只服務 `google_worker.py`。**
 > playwright 是本 repo 唯一的第三方依賴，`server.py` / `yahoo_worker.py` / `revlib.py`
 > 仍維持「純標準庫、零依賴」——**只跑 server 或 Yahoo 主線的機器不必安裝它**，
 > 複製 `yahoo_worker.py` + `revlib.py` 過去就能跑。測試也不需要（playwright 是延後 import 的）。
 
-另外需要**圖形環境**（headful 才不會被擋）：`DISPLAY=:0`。無頭機器請改派有桌面的機器跑。
+另外需要**圖形環境**（headful 才不會被擋）：Linux 上是 `DISPLAY=:0`。無頭機器請改派有桌面的
+機器跑（Windows 桌面本來就有圖形環境，見下面的 PowerShell 跑法）。
 Chrome 設定檔存在 `~/.cache/revswarm-chrome`（`--profile` 可改），保留 cookie 以降低驗證碼。
 
 跑法：先把 `failed` 轉去 `google` 佇列（否則 google_worker 租不到任何任務），
@@ -164,6 +165,27 @@ curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
 DISPLAY=:0 python3 google_worker.py --server http://<SERVER>:8000 --once   # 先小量驗證
 DISPLAY=:0 python3 google_worker.py --server http://<SERVER>:8000         # 再放量（用 tmux）
 ```
+
+**Windows 11 / PowerShell 跑法**（實測 Chrome 150、Python 3.13、venv 裝 playwright 1.62）：
+```powershell
+$env:DISPLAY = ":0"
+.\.venv\Scripts\python.exe google_worker.py --server http://<SERVER>:8000 --once
+```
+三個 Windows 專屬的坑，都在上面兩行裡解掉了：
+
+1. **`$env:DISPLAY = ":0"` 一定要設，但它在 Windows 上不做任何事。** `main()` 只檢查這個
+   環境變數存不存在，不設就 `sys.exit(1)`；而 `DISPLAY` 是 X11 概念，Chrome 在 Windows 上
+   完全忽略它、走原生視窗。所以這行純粹是餵飽那道為 Linux 寫的守衛，餵飽之後行為是對的。
+2. **PowerShell 沒有 bash 的行內前綴語法**——`DISPLAY=:0 python3 ...` 是語法錯誤，
+   必須拆成獨立一行的 `$env:DISPLAY = ":0"`。
+3. **用完整路徑呼叫 `.\.venv\Scripts\python.exe`，不要 activate。** Windows 客戶端的
+   execution policy 預設 `Restricted`，`activate.ps1` 會被擋下（`running scripts is
+   disabled on this system`）。指名執行檔跟 activate 效果相同（activate 只是改 PATH），
+   還省掉動系統安全設定。
+
+`channel="chrome"` 在 Windows 上會自己找到 `C:\Program Files\Google\Chrome\Application\chrome.exe`，
+不必額外設定；設定檔則落在 `C:\Users\<你>\.cache\revswarm-chrome`（`~` 由 `expanduser` 展開）。
+
 `engine=google` 佇列跟原本 `yahoo` 佇列完全分開派工，`yahoo_worker.py` 與 `google_worker.py`
 可同時開著、不會互搶任務。參數意義與 `yahoo_worker.py` 相同，預設值不同：
 
