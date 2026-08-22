@@ -48,8 +48,14 @@ HEADERS = {
 # --- 月營收公告辨識（沿用已驗證的規則，見 playground/mops_revenue_dates.py）------
 REV_KW = re.compile(r"營收|營業額|營業收入")
 YM_PAT = re.compile(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月")
+# 「呈現為零」：零營收公司會另發一則「說明本公司113年11月-114年1月營業收入呈現為零」的
+# 重大訊息，它涵蓋一個「月份區間」、申報日比真正的月營收申報晚好幾個月，卻同時滿足
+# 「有營收關鍵字 + 有年月」而被收進基準，變成 false positive（實測 1438 三地開發 4 筆，
+# 害得交叉驗證誤判 DB 那 3 筆抓對的日期是錯的）。用「呈現為零」精準排除——不能只用
+# 「說明」二字，那會誤殺台積電 114/1「營收報告與地震影響說明」這種真的月營收公告。
 NOISE = re.compile(r"受邀|說明會|法說|論壇|概況|法人|會議|Conference|股東|"
-                   r"董事會|媒體|更正|修正|更新|重編|補充|澄清|差異|核閱|查核|調整")
+                   r"董事會|媒體|更正|修正|更新|重編|補充|澄清|差異|核閱|查核|調整|"
+                   r"呈現為零")
 EARNINGS = re.compile(r"盈餘|損益|稅前|稅後|淨利|獲利|EPS|每股")
 DAY_MAX = 15                 # 月營收次月10日前申報，遇假日順延，公布日 <= 15
 MARKET_CLOSE = (13, 30)      # 台股收盤；之後(含)視為盤後
@@ -186,12 +192,24 @@ def build_baseline(codes, years, path, sleep, refresh):
 
 
 def load_baseline(path):
+    """讀快取的基準 CSV。
+
+    讀進來時「再過一次」is_monthly_revenue：baseline 是可續跑的快取，過濾規則後來變嚴時
+    舊快取裡仍留著當初收錯的列（如 1438「營業收入呈現為零」那 4 筆），不重濾就會一直
+    用錯的基準去打真資料。重濾的成本是零，快取不必重抓。
+    """
     out = {}
     if not os.path.exists(path):
         return out
+    dropped = 0
     with open(path, encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
+            if not is_monthly_revenue(r.get("subject") or ""):
+                dropped += 1
+                continue
             out[(r["stock_id"], int(r["roc_year"]), int(r["roc_month"]))] = r
+    if dropped:
+        print(f"  （快取裡有 {dropped} 筆不合現行過濾規則，已略過；重抓基準可清掉）")
     return out
 
 

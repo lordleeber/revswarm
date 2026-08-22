@@ -12,6 +12,7 @@ revswarm.db-shm
 *.db-wal
 *.db-shm
 revenue_dates.csv
+missing.csv
 all.csv
 
 # MOPS 交叉驗證產物（可由 mops_validate.py 重建）

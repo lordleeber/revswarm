@@ -65,6 +65,16 @@ def iter_roc_months(start=ROC_START, end=ROC_END):
             m = 1
 
 
+# --- 上市前緩衝（mark_prelisting / export 共用）-----------------------------
+# 公司在「首次公開當月」補報「前一個月」營收是合法的：實測 18 筆都長這樣且 raw_title
+# 對得上（例：竑騰 113/5 營收於 2024-06-07 公布、公開發行日 2024-06-04）。所以判定
+# 「這筆不可能存在」時要放這麼多個月的水。
+#
+# 放這裡是因為 mark_prelisting（回寫 DB 用它降級）與 export（標 pre_public flag 用它）
+# 必須用同一個數字——兩邊各寫各的會出現「已降級的留著、沒降級的被標 low」這種不一致。
+PRE_PUBLIC_GRACE_MONTHS = 1
+
+
 # --- 期望窗（todo.txt 2.4）-------------------------------------------------
 def expected_window(roc_year, roc_month):
     """
@@ -102,12 +112,22 @@ def _anchor_offsets(html, name, roc_year, roc_month):
     """
     精確名稱標題錨點的字元位置（todo.txt 2.5：避免「統一」吃到「統一超」）。
     鎖定「{名稱} {年}年{月}月」，名稱後須緊接空白或數字。民國/西元年都接受。
+
+    年份必須是「這個任務的年」（民國 roc_year 或西元 roc_year+1911）。早期版本這裡寫
+    \d{2,4}年，只鎖月不鎖年，於是搜尋結果頁上「同月份、別年份」的近期文章會被當成錨點
+    ——例：任務 111/6、112/6、113/6 三筆都錨到同一篇「宏碁智新 115年6月」。窗過濾只擋
+    得掉日期本身離譜的，擋不掉「錨錯地方、卻剛好挑到一個窗內日期」，形成靜默錯配
+    （實測全庫 705 筆、佔 0.57%，見 README「資料品質」）。
+
+    收緊之後找不到錨點的頁面會落到 parse() 的後備路徑（取第一個窗內日期），精度較低但
+    不會指向別年的文章；寧可退回後備，也不要一個確定錯的錨點。
     """
     esc = re.escape(name)
     # (?:【公告】)? 兼容 Yahoo 股市公告標題；名稱與年之間允許 0~1 個空白；
     # 名稱後用 lookahead 確保緊接空白或數字，不被更長公司名吃掉。
+    year = r'(?:%d|%d)' % (roc_year, roc_year + 1911)
     pat = re.compile(
-        r'(?:【公告】)?' + esc + r'(?=[\s　\d])[\s　]?\d{2,4}年\s*' +
+        r'(?:【公告】)?' + esc + r'(?=[\s　\d])[\s　]?' + year + r'年\s*' +
         str(roc_month) + r'月'
     )
     return [m.start() for m in pat.finditer(html)]
@@ -208,3 +228,45 @@ def parse_revenue(text):
             val = -abs(val)
         yoy = val
     return int(round(amt)), yoy
+
+
+def yoy_scope(text):
+    """判斷 raw_title 裡那個年增率講的是「單月」還是「累計」。
+
+    MoneyDJ 兩種寫法混用，年增率黏在哪個營收後面就是誰的：
+      單月：「大城地產 112年9月營收3萬、年減99.98%」                    → 'monthly'
+      累計：「皇普 113年12月營收53.06億，累計營收53.31億、年增188.14%」  → 'cumulative'
+    後者的 188.14% 是「累計 53.31 億 vs 去年同期累計 18.50 億」，不是單月年增率。
+    parse_revenue 兩種都照抽進 yoy 欄，語意混在一起——實測有「累計」字樣的那批，
+    拿單月營收自算年增率只有 67.5% 對得上，沒有的那批是 97.2%（見 README「資料品質」）。
+
+    回傳 'monthly' / 'cumulative'；沒有金額或沒有年增率可定位時回 None。
+    判準：金額與年增率之間（或金額緊鄰的前兩字）出現「累計」→ 累計。
+    """
+    if not text or _REV_SKIP.search(text):
+        return None
+    m_amt = _REV_AMT.search(text)
+    m_yoy = _REV_YOY.search(text)
+    if not m_amt or not m_yoy:
+        return None
+    head = text[max(0, m_amt.start() - 2):m_amt.start()]     # 「累計營收…」只有累計沒單月
+    between = text[m_amt.end():m_yoy.start()]                # 「營收X，累計營收Y、年增Z%」
+    return "cumulative" if ("累計" in head or "累計" in between) else "monthly"
+
+
+_TITLE_YM = re.compile(r'(\d{2,4})\s*年\s*(\d{1,2})\s*月')
+
+
+def title_year_conflict(text, roc_year, roc_month):
+    """raw_title 的佐證文字講的是不是「別年的同月份」。
+
+    專治 _anchor_offsets 收緊前留下的錯配：title 寫「115年6月」卻掛在任務 111/6 上。
+    只在「有 N年{roc_month}月 字樣、但 N 全都不是本任務年份」時回 True；
+    找不到可比對的年月字樣回 False（沒有證據不算衝突——Yahoo 模板碎片就屬這類）。
+    """
+    if not text:
+        return False
+    same_month = [int(y) for y, m in _TITLE_YM.findall(text) if int(m) == roc_month]
+    if not same_month:
+        return False
+    return not any(y in (roc_year, roc_year + 1911) for y in same_month)
