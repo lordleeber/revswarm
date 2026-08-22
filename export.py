@@ -16,10 +16,14 @@
        - confidence  flags 非空 → low，否則 high。做事件研究請先篩 confidence='high'
      並把 yoy 的 999999.99 哨兵值清成空值（見 clean_yoy）。
 
-  2. missing.csv        缺口清單。只有非 success，一列 = 一個「沒有事件日」的 (股票×月)。
-     state 分兩種語意，別混為一談：
+  2. missing.csv        缺口清單。所有非 success 的列，一列 = 一個「沒有事件日」的 (股票×月)。
+     state 有四種，語意完全不同，別混為一談：
        - failed      爬過（民國年+西元年都試）仍找不到 → 真缺口，可再撈
-       - prelisting  該月公司尚未上市 → 事件本來就不存在，不是失敗，不該算進覆蓋率分母
+       - prelisting  該月公司尚未公開發行 → 事件本來就不存在，不該算進覆蓋率分母
+       - undone      還沒爬到（爬蟲未收工時才會有）→ 不是缺口，是還沒做
+       - dispatched  已租給 worker、還沒回報 → 同上
+     刻意不在 SQL 裡濾掉 undone/dispatched：那會讓「還沒爬」在缺口清單裡靜靜消失，
+     下游把 missing.csv 的列數當成缺口總量就會低估。要算真缺口請自己篩 state='failed'。
 
 用法：
   python3 export.py                                     # → revenue_dates.csv + missing.csv
@@ -44,7 +48,10 @@ MAIN_FIELDS = ["stock_id", "name", "market", "rev_ym", "roc_year", "roc_month",
 MISSING_FIELDS = ["stock_id", "name", "market", "rev_ym", "roc_year", "roc_month",
                   "state", "attempts", "fail_count"]
 
-# worker 解析不到 yoy 時寫入的哨兵值（非真實年增率，直接算平均會炸）。
+# 999999.99 不是我們寫進去的哨兵——全 repo 沒有任何程式產生它（grep 一下只會命中本檔）。
+# 它是**來源文字自己就這麼寫**：去年同期基期為零時，中央社【公告】會寫成
+# 「【公告】櫻花建 2022年8月合併營收23.64億元 年增999999.99%」，parse_revenue 照實抽進來。
+# 全庫 50 筆，raw_title 100% 都含這串。當成真年增率去算平均會炸，所以匯出時清成空值。
 YOY_SENTINEL = 999999.99
 
 
@@ -111,12 +118,7 @@ def load_first_public(path):
     return out
 
 
-# pre_public 的緩衝月數：公司在「首次公開當月」補報「前一個月」營收是合法的
-# （實測 18 筆都長這樣，raw_title 也對得上），只有早 2 個月以上才是不可能事件。
-PRE_PUBLIC_GRACE = 1
-
-
-def row_flags(row, first_public=None):
+def row_flags(row, first_public=None, grace_months=None):
     """回傳這列的已知疑點 list（空 list = 沒踩到）。每條都是實測過的錯誤來源：
 
       no_revenue   raw_title 抽不到營收金額 → 多半只是 Yahoo 頁面模板碎片，不是新聞
@@ -125,9 +127,13 @@ def row_flags(row, first_public=None):
       no_anchor    raw_title 既無公司名也無股票代號 → 可能抓到彙總頁（CMoney 盤後速報
                    那種一頁列一堆股票的），無法確認講的是這家。
       year_conflict raw_title 講的是「別年的同月份」（見 revlib.title_year_conflict）。
-      pre_public   營收月早於公司首次公開月 2 個月以上 → 當時沒有申報義務，事件不存在。
-                   （mark_prelisting --demote-success 會把這種打回 prelisting；還留在
-                   主檔的多半是 stock_dates.db 沒涵蓋到的公司。）
+      pre_public   營收月早於公司首次公開月「超過 grace_months 個月」→ 當時沒有申報義務，
+                   事件不存在。（mark_prelisting --demote-success 會把這種打回 prelisting；
+                   還留在主檔的多半是 stock_dates.db 沒涵蓋到的公司。）
+
+    grace_months 預設取 revlib.PRE_PUBLIC_GRACE_MONTHS，與 mark_prelisting 的降級門檻
+    同源。若降級時用了非預設的 --grace-months，這裡要傳同一個值，否則會把「刻意保留的
+    合法補報」標成 pre_public/low。
     """
     flags = []
     title = row["raw_title"] or ""
@@ -139,10 +145,16 @@ def row_flags(row, first_public=None):
         flags.append("year_conflict")
     fp = (first_public or {}).get(row["stock_id"])
     if fp:
+        grace = (revlib.PRE_PUBLIC_GRACE_MONTHS if grace_months is None else grace_months)
         lead = (fp[0] * 12 + fp[1]) - (row["roc_year"] * 12 + row["roc_month"])
-        if lead > PRE_PUBLIC_GRACE:
+        if lead > grace:
             flags.append("pre_public")
     return flags
+
+
+def pct(part, whole):
+    """百分比字串；分母為 0 回 'n/a'（空 DB / 全 prelisting 的子集 DB 會遇到）。"""
+    return f"{100.0 * part / whole:.1f}%" if whole else "n/a"
 
 
 def write_csv(path, fields, rows):
@@ -162,13 +174,24 @@ def main():
     ap.add_argument("--no-missing", action="store_true", help="不產缺口清單")
     ap.add_argument("--dates-db", default="stock_dates.db",
                     help="goodinfo 首次公開日（供 pre_public flag；找不到就停用該條）")
+    ap.add_argument("--grace-months", type=int, default=revlib.PRE_PUBLIC_GRACE_MONTHS,
+                    help="pre_public flag 的緩衝月數，須與 mark_prelisting --grace-months "
+                         f"一致（預設 {revlib.PRE_PUBLIC_GRACE_MONTHS}）")
     args = ap.parse_args()
+
+    if args.grace_months < 0:
+        ap.error("--grace-months 不可為負")
 
     markets = load_markets(args.stocks)
     first_public = load_first_public(args.dates_db)
     # 唯讀開啟：匯出時 worker/server 可能還在寫，不要意外持鎖或改到 DB。
     conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    # 三段查詢（主檔／缺口／統計）必須看同一個快照：DB 是 WAL，一個唯讀交易就能鎖住
+    # 一致的讀取視圖。否則 worker 在中間把一筆 undone 改成 success，那筆會兩份檔案
+    # 都不出現、統計也對不上列數。isolation_level=None 才不會被 python 自動插交易。
+    conn.isolation_level = None
+    conn.execute("BEGIN")
 
     main_rows = []
     flag_tally = {}
@@ -177,7 +200,7 @@ def main():
                       revenue, yoy, engine, source, raw_title
                  FROM tasks WHERE state='success'
                 ORDER BY stock_id, roc_year, roc_month"""):
-        flags = row_flags(r, first_public)
+        flags = row_flags(r, first_public, args.grace_months)
         for f in flags:
             flag_tally[f] = flag_tally.get(f, 0) + 1
         main_rows.append({
@@ -204,7 +227,7 @@ def main():
     low = sum(1 for r in main_rows if r["confidence"] == "low")
     cum = sum(1 for r in main_rows if r["yoy_scope"] == "cumulative")
     print(f"      confidence=high {len(main_rows) - low:>7,} 列"
-          f"（{100.0 * (len(main_rows) - low) / max(len(main_rows), 1):.1f}%）"
+          f"（{pct(len(main_rows) - low, len(main_rows))}）"
           f"／low {low:,} 列  flags：{flag_tally}")
     print(f"      yoy_scope=cumulative {cum:,} 列（這些的 yoy 是累計年增率，別當單月用）")
 
@@ -232,13 +255,16 @@ def main():
     # --- 覆蓋率摘要 ---
     by_state = {s: c for s, c in conn.execute(
         "SELECT state, COUNT(*) FROM tasks GROUP BY state")}
+    conn.execute("ROLLBACK")          # 唯讀交易，收掉快照
     total = sum(by_state.values())
     succ = by_state.get("success", 0)
     pre = by_state.get("prelisting", 0)
-    print(f"\n覆蓋率  {succ:,}/{total:,} = {100.0 * succ / total:.1f}%（含全部任務）")
+    # 空 DB 或整份都是 prelisting（小型子集 DB 會這樣）時分母為 0，
+    # 不能讓最後一行摘要炸掉整份已經寫好的匯出。
+    print(f"\n覆蓋率  {succ:,}/{total:,} = {pct(succ, total)}（含全部任務）")
     if pre:
-        # prelisting 是「公司尚未上市」，事件不存在，不該當分母。
-        print(f"        {succ:,}/{total - pre:,} = {100.0 * succ / (total - pre):.1f}%"
+        # prelisting 是「公司尚未公開發行」，事件不存在，不該當分母。
+        print(f"        {succ:,}/{total - pre:,} = {pct(succ, total - pre)}"
               f"（扣除 {pre:,} 筆 prelisting，這才是真實可得率）")
     print(f"各 state：{by_state}")
 

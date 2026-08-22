@@ -45,6 +45,18 @@ class TestDerivedFields(unittest.TestCase):
         self.assertEqual(E.clean_yoy(0.0), 0.0)                 # 0 不可被當成沒有值
 
 
+class TestPct(unittest.TestCase):
+    """分母為 0 不能炸掉已經寫好的匯出（空 DB／整份都是 prelisting 的子集 DB）。"""
+
+    def test_一般情況(self):
+        self.assertEqual(E.pct(1, 2), "50.0%")
+        self.assertEqual(E.pct(0, 3), "0.0%")
+
+    def test_分母為0(self):
+        self.assertEqual(E.pct(0, 0), "n/a")
+        self.assertEqual(E.pct(5, 0), "n/a")
+
+
 class TestRowFlags(unittest.TestCase):
     def test_乾淨的一列沒有任何_flag(self):
         self.assertEqual(E.row_flags(row()), [])
@@ -88,6 +100,21 @@ class TestRowFlags(unittest.TestCase):
         self.assertIn("pre_public",
                       E.row_flags(row(stock_id="9999", name="X", roc_year=112,
                                       roc_month=11, raw_title="X 112年11月營收1億"), fp))
+
+    def test_grace_可覆寫且預設與_revlib_同源(self):
+        import revlib
+        fp = {"7751": (113, 6)}
+        r = row(stock_id="7751", roc_year=113, roc_month=3, raw_title="竑騰 113年3月營收1億")
+        # 預設緩衝 1 → 早 3 個月要標
+        self.assertIn("pre_public", E.row_flags(r, fp))
+        # 降級時若用了 --grace-months 3，匯出也要傳 3，否則會把刻意保留的標成 low
+        self.assertNotIn("pre_public", E.row_flags(r, fp, grace_months=3))
+        # 緩衝 0 → 早 1 個月的也要標
+        r1 = row(stock_id="7751", roc_year=113, roc_month=5, raw_title="竑騰 113年5月營收1億")
+        self.assertNotIn("pre_public", E.row_flags(r1, fp))
+        self.assertIn("pre_public", E.row_flags(r1, fp, grace_months=0))
+        # 預設值就是 revlib 的共用常數（兩邊寫死各自的數字會不一致）
+        self.assertEqual(revlib.PRE_PUBLIC_GRACE_MONTHS, 1)
 
     def test_沒有_first_public_時該條靜默停用(self):
         r = row(stock_id="7751", roc_year=113, roc_month=4, raw_title="竑騰 113年4月營收1億")

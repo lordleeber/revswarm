@@ -376,6 +376,9 @@ python3 export.py                    # → revenue_dates.csv + missing.csv
 python3 export.py --no-missing       # 只出主檔
 ```
 
+三段查詢（主檔／缺口／統計）跑在同一個唯讀交易裡，取的是同一個快照 —— 爬蟲還在跑時匯出
+也不會出現「某筆兩份檔案都沒有」。
+
 **`revenue_dates.csv`** — 分析主檔，只有 `state='success'`，一列 = 一個公布日事件。
 除了 DB 原欄位，另補下游一定會自己算的東西：
 
@@ -390,9 +393,21 @@ python3 export.py --no-missing       # 只出主檔
 
 `yoy` 的 `999999.99` 哨兵值（worker 解析不到年增率時寫入）已清成空值。
 
-**`missing.csv`** — 缺口清單，只有非 success。`state` 兩種語意別混為一談：
-`failed` 是爬過仍找不到的**真缺口**（可再撈）；`prelisting` 是該月公司尚未公開發行，
-**事件本來就不存在**，不該算進覆蓋率分母。
+**`missing.csv`** — 缺口清單，所有非 success 的列。`state` 四種語意完全不同，別混為一談：
+
+| state | 意思 |
+|---|---|
+| `failed` | 爬過（民國年+西元年都試）仍找不到 → **真缺口**，可再撈 |
+| `prelisting` | 該月公司尚未公開發行 → **事件本來就不存在**，不該算進覆蓋率分母 |
+| `undone` | 還沒爬到（爬蟲未收工時才有）→ 不是缺口，是還沒做 |
+| `dispatched` | 已租給 worker、還沒回報 → 同上 |
+
+刻意不在 SQL 裡濾掉 `undone`/`dispatched`：那會讓「還沒爬」在缺口清單裡靜靜消失，
+下游把列數當成缺口總量就會低估。**要算真缺口請自己篩 `state='failed'`。**
+
+⚠️ `pre_public` flag 的緩衝月數（`export.py --grace-months`）必須與降級時用的
+`mark_prelisting.py --grace-months` 一致，兩者預設都取 `revlib.PRE_PUBLIC_GRACE_MONTHS`。
+只改一邊會把「刻意保留的合法補報」標成 `pre_public` / `confidence=low`。
 
 ## 資料品質
 

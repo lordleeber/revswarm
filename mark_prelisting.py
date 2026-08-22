@@ -109,9 +109,10 @@ def main():
     ap.add_argument("--out", default="tmp/prelisting_candidates.csv")
     ap.add_argument("--demote-success", action="store_true",
                     help="把上市前的假 success 也打回 prelisting（見模組 docstring）")
-    ap.add_argument("--grace-months", type=int, default=1,
+    ap.add_argument("--grace-months", type=int, default=revlib.PRE_PUBLIC_GRACE_MONTHS,
                     help="降級緩衝月數：首次公開前這幾個月內的 success 視為合法補報，"
-                         "不降級（預設 1）")
+                         f"不降級（預設 {revlib.PRE_PUBLIC_GRACE_MONTHS}）。改了這個值，"
+                         "export.py --grace-months 要跟著改，否則 pre_public flag 會不一致")
     ap.add_argument("--demoted-out", default="tmp/prelisting_demoted.csv",
                     help="降級前把原值（含 announce_date/raw_title）寫這裡存證")
     args = ap.parse_args()
@@ -124,28 +125,90 @@ def main():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000")
 
-    # 取每檔名稱供輸出
+    # 取每檔名稱供輸出（純顯示用，不影響決策，放交易外無妨）
     names = {r["stock_id"]: r["name"] for r in conn.execute(
         "SELECT DISTINCT stock_id, name FROM tasks")}
-    plan = build_plan(conn, cutoffs,
-                      grace_months=args.grace_months if args.demote_success else None)
-    plan.sort(key=lambda x: -(x[3] + x[7]))
-    total = sum(p[3] for p in plan)
-    succ_before = sum(p[5] for p in plan)
-    demote_total = sum(p[7] for p in plan)
 
+    now = int(time.time())
+    if not args.dry_run:
+        bak = f"{args.db}.bak-prelisting-{now}"
+        dst = sqlite3.connect(bak)
+        with dst:
+            conn.backup(dst)
+        dst.close()
+        print(f"已備份 DB → {bak}\n")
+        # 計畫、存證查詢、UPDATE 必須在同一個交易裡。線上 worker 隨時可能把切點前某筆
+        # 回報成 success：若存證 SELECT 在交易外先跑，那筆會被後面的 UPDATE 連
+        # announce_date/raw_title/revenue/yoy 一起清掉，卻不在 --demoted-out 裡（只剩
+        # DB 備份可救），印出的降級筆數也會對不上。代價是整段（約 200 個小查詢）持寫鎖
+        # 一兩秒，對維運工具可以接受。
+        conn.execute("BEGIN IMMEDIATE;")
+
+    try:
+        plan = build_plan(conn, cutoffs,
+                          grace_months=args.grace_months if args.demote_success else None)
+        plan.sort(key=lambda x: -(x[3] + x[7]))
+        total = sum(p[3] for p in plan)
+        succ_before = sum(p[5] for p in plan)
+        demote_total = sum(p[7] for p in plan)
+
+        # 緩衝期內保留的 success 要橫跨「所有」有切點的公司來數：只有緩衝內 success、
+        # 沒有任何可砍任務的公司不會進 plan，拿 plan 的 succ_before 相減會少算。
+        kept = 0
+        if args.demote_success:
+            for sid, (ckey, _fp) in cutoffs.items():
+                kept += conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE stock_id=? AND state='success'"
+                    " AND (roc_year*100+roc_month)>=? AND (roc_year*100+roc_month)<?",
+                    (sid, shift_key(ckey, -args.grace_months), ckey)).fetchone()[0]
+
+        # 降級存證：趁 UPDATE 清掉這些欄位之前，在同一個交易裡把原值撈出來。
+        demote_rows = []
+        if args.demote_success:
+            for sid, ck, fp, n, br, sc, dk, dc in plan:
+                if not dc:
+                    continue
+                for r in conn.execute(
+                        "SELECT roc_year, roc_month, announce_date, revenue, yoy,"
+                        "       engine, source, raw_title FROM tasks"
+                        " WHERE stock_id=? AND state='success'"
+                        "   AND (roc_year*100+roc_month)<?"
+                        " ORDER BY roc_year, roc_month", (sid, dk)):
+                    demote_rows.append([sid, names.get(sid, ""), fp, r["roc_year"],
+                                        r["roc_month"], r["announce_date"], r["revenue"],
+                                        r["yoy"], r["engine"], r["source"], r["raw_title"]])
+
+        marked = demoted = 0
+        if not args.dry_run:
+            for sid, ckey, fp, cnt, br, sc, dkey, dcnt in plan:
+                cur = conn.execute(
+                    "UPDATE tasks SET state='prelisting', dispatched_at=NULL,"
+                    " worker_id=NULL, updated_at=?"
+                    " WHERE stock_id=? AND (roc_year*100+roc_month)<?"
+                    " AND state IN ('undone','failed','dispatched')",
+                    (now, sid, ckey))
+                marked += cur.rowcount
+                if args.demote_success and dcnt:
+                    # 連同爬到的內容一起清掉：留著會變成「prelisting 卻有公布日」的髒
+                    # 資料，原值已收進 demote_rows（同交易內讀的），DB 備份也還在。
+                    cur = conn.execute(
+                        "UPDATE tasks SET state='prelisting', announce_date=NULL,"
+                        " source=NULL, raw_title=NULL, revenue=NULL, yoy=NULL,"
+                        " dispatched_at=NULL, worker_id=NULL, updated_at=?"
+                        " WHERE stock_id=? AND (roc_year*100+roc_month)<?"
+                        " AND state='success'", (now, sid, dkey))
+                    demoted += cur.rowcount
+            conn.commit()
+    except Exception:
+        if not args.dry_run:
+            conn.rollback()
+        raise
+
+    # --- 以下都是報表，交易已收掉 ---
     print(f"goodinfo 首次公開晚於窗頭的公司: {len(cutoffs)} 檔")
     print(f"★ 其中有『上市前 undone/failed/dispatched 任務』可標 prelisting: "
           f"{len(plan)} 檔, {total} 筆")
     if args.demote_success:
-        # 緩衝期內保留的 success 要橫跨「所有」有切點的公司來數：只有緩衝內 success、
-        # 沒有任何可砍任務的公司不會進 plan，拿 plan 的 succ_before 相減會少算。
-        kept = 0
-        for sid, (ckey, _fp) in cutoffs.items():
-            kept += conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE stock_id=? AND state='success'"
-                " AND (roc_year*100+roc_month)>=? AND (roc_year*100+roc_month)<?",
-                (sid, shift_key(ckey, -args.grace_months), ckey)).fetchone()[0]
         print(f"★ --demote-success：另有 {demote_total} 筆上市前 success 要降級"
               f"（緩衝 {args.grace_months} 個月，緩衝內的 {kept} 筆視為合法補報，保留）")
     elif succ_before:
@@ -162,21 +225,9 @@ def main():
             w.writerow([sid, names.get(sid, ""), fp, n, br, sc, dc])
     print(f"  完整清單 → {args.out}")
 
-    # 降級名單存證：先把原值撈出來寫檔，之後 UPDATE 會清掉這些欄位。
-    demote_rows = []
-    if args.demote_success and demote_total:
-        for sid, ck, fp, n, br, sc, dk, dc in plan:
-            if not dc:
-                continue
-            for r in conn.execute(
-                    "SELECT roc_year, roc_month, announce_date, revenue, yoy,"
-                    "       engine, source, raw_title FROM tasks"
-                    " WHERE stock_id=? AND state='success'"
-                    "   AND (roc_year*100+roc_month)<?"
-                    " ORDER BY roc_year, roc_month", (sid, dk)):
-                demote_rows.append([sid, names.get(sid, ""), fp, r["roc_year"],
-                                    r["roc_month"], r["announce_date"], r["revenue"],
-                                    r["yoy"], r["engine"], r["source"], r["raw_title"]])
+    if args.demote_success:
+        # 即使這輪 0 筆也要重寫（只有表頭）：不然上一輪的存證檔原地留著，
+        # 下次來看會以為那是本輪降級的名單。
         os.makedirs(os.path.dirname(args.demoted_out) or ".", exist_ok=True)
         with open(args.demoted_out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
@@ -195,42 +246,9 @@ def main():
         conn.close()
         return
 
-    now = int(time.time())
-    bak = f"{args.db}.bak-prelisting-{now}"
-    dst = sqlite3.connect(bak)
-    with dst:
-        conn.backup(dst)
-    dst.close()
-    print(f"\n已備份 DB → {bak}")
-
-    conn.execute("BEGIN IMMEDIATE;")
-    try:
-        n = d = 0
-        for sid, ckey, fp, cnt, br, sc, dkey, dcnt in plan:
-            cur = conn.execute(
-                "UPDATE tasks SET state='prelisting', dispatched_at=NULL,"
-                " worker_id=NULL, updated_at=?"
-                " WHERE stock_id=? AND (roc_year*100+roc_month)<?"
-                " AND state IN ('undone','failed','dispatched')",
-                (now, sid, ckey))
-            n += cur.rowcount
-            if args.demote_success and dcnt:
-                # 連同爬到的內容一起清掉：留著會變成「prelisting 卻有公布日」的髒資料，
-                # 原值已寫進 --demoted-out 存證，DB 備份也還在。
-                cur = conn.execute(
-                    "UPDATE tasks SET state='prelisting', announce_date=NULL,"
-                    " source=NULL, raw_title=NULL, revenue=NULL, yoy=NULL,"
-                    " dispatched_at=NULL, worker_id=NULL, updated_at=?"
-                    " WHERE stock_id=? AND (roc_year*100+roc_month)<? AND state='success'",
-                    (now, sid, dkey))
-                d += cur.rowcount
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    print(f"已標記 {n} 筆上市前任務為 prelisting。")
+    print(f"\n已標記 {marked} 筆上市前任務為 prelisting。")
     if args.demote_success:
-        print(f"已降級 {d} 筆假 success 為 prelisting（原值見 {args.demoted_out}）。")
+        print(f"已降級 {demoted} 筆假 success 為 prelisting（原值見 {args.demoted_out}）。")
     by = {r["state"]: r["c"] for r in conn.execute(
         "SELECT state, COUNT(*) c FROM tasks GROUP BY state")}
     print("目前各狀態：", by)
