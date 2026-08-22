@@ -47,7 +47,10 @@
 | `google_worker.py` | 補搜 worker：Playwright 驅動系統 Chrome 查 Google，撿 Yahoo 救不回的 `failed`（見下）|
 | `requirements.txt` | **只服務 `google_worker.py`** 的相依（playwright）；核心零依賴，不必安裝|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
-| `export.py` | 把 DB 的 success 匯出成研究用 CSV（含 `revenue`/`yoy`）|
+| `export.py` | 匯出研究用 CSV：`revenue_dates.csv`（success + 可靠度分層）與 `missing.csv`（缺口）|
+| `build_stock_dates.py` | 從官方來源建 `stock_dates.db`（上市/上櫃日現況快照）|
+| `goodinfo_worker.py` | 補 goodinfo 的四板日期（上市/上櫃/興櫃/公開發行），拿到**已畢業公司的早年日期**，官方現況快照沒有 |
+| `mark_prelisting.py` | 用首次公開日把「公司當時還沒公開發行」的任務標成 `prelisting`；`--demote-success` 連上市前的假 success 一起降級（見「資料品質」）|
 | `mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
@@ -75,8 +78,8 @@ python3 yahoo_worker.py --server http://<SERVER_IP>:8000
 source .env
 curl -s -H "Authorization: Bearer $REVSWARM_TOKEN" http://<SERVER_IP>:8000/stats | python3 -m json.tool
 
-# 6. 匯出研究資料
-python3 export.py --out revenue_dates.csv
+# 6. 匯出研究資料（一次出主檔 + 缺口清單）
+python3 export.py
 ```
 
 ## API
@@ -363,6 +366,109 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 - ⚠️ **非權威**：來源非官方、金額四捨五入到億/萬兩位，僅供**交叉校驗/研究參考**；要精確到元請用 MOPS 月營收。
 - 既有 DB 一次性回填（**不重爬**）：`python3 backfill_revenue.py`（先停 server、先備份；`--dry-run` 可預覽）。
   server 啟動時會自動 `ALTER TABLE` 補上這兩欄。
+
+## 匯出
+
+`export.py` 一次產出兩份，各司其職（都不進版控，隨時可重跑重建）：
+
+```bash
+python3 export.py                    # → revenue_dates.csv + missing.csv
+python3 export.py --no-missing       # 只出主檔
+```
+
+**`revenue_dates.csv`** — 分析主檔，只有 `state='success'`，一列 = 一個公布日事件。
+除了 DB 原欄位，另補下游一定會自己算的東西：
+
+| 欄位 | 說明 |
+|---|---|
+| `market` | 從 `stocks.csv` join（`sii`=上市 / `otc`=上櫃），上市櫃交易規則不同要分組 |
+| `rev_ym` | 營收**所屬**月份的西元 `YYYY-MM`，接股價資料用這欄（DB 存的是民國）|
+| `lag_days` | 公布日 − 營收月月底，依窗規則必落 1~15 |
+| `yoy_scope` | `yoy` 那個數字是單月（`monthly`）還是累計（`cumulative`）年增率 |
+| `confidence` | `high` / `low`。**做事件研究請先篩 `confidence='high'`** |
+| `flags` | 這列踩到哪幾條疑點，分號分隔；空 = 乾淨 |
+
+`yoy` 的 `999999.99` 哨兵值（worker 解析不到年增率時寫入）已清成空值。
+
+**`missing.csv`** — 缺口清單，只有非 success。`state` 兩種語意別混為一談：
+`failed` 是爬過仍找不到的**真缺口**（可再撈）；`prelisting` 是該月公司尚未公開發行，
+**事件本來就不存在**，不該算進覆蓋率分母。
+
+## 資料品質
+
+爬完之後做過一輪體檢（外部拿 MOPS 官方申報日交叉、內部做分層對照實驗）。結論是
+**日期主體可信，但有幾個缺陷會汙染下游分析**，處理方式與殘留風險記在這裡。
+
+### 外部驗證
+
+MOPS「歷史重大訊息」的官方申報日涵蓋 53 檔、2,556 筆。其中 920 筆是 `mops_fill.py`
+當初灌進 DB 的，拿 MOPS 驗它是循環論證，得剔除。**排除循環後真實重疊 1,459 筆、一致率 99.52%。**
+
+⚠️ 這 1,459 筆全部來自 yahoo 引擎且全是大型股 —— **google 補搜的 2.4 萬筆與 MOPS 零重疊，
+沒有外部驗證**，只能靠下面的內部對照實驗判斷。
+
+### 已修掉的
+
+| 缺陷 | 規模 | 處理 |
+|---|---|---|
+| `revlib.parse` 錨點只鎖月不鎖年 | 全庫 705 筆 provenance 錯配 | 錨點改綁本任務年份（民國/西元皆可）|
+| 上市前的假 `success` | 165 筆 / 47 檔 | `mark_prelisting.py --demote-success` 打回 `prelisting` |
+| `prelisting` 與 `success` 邏輯矛盾 | 1,310 筆 / 46 檔 | 上一條的鏡像，降級後自動歸零 |
+| `yoy` 混了單月與累計兩種語意 | 1,273 筆 | 新增 `yoy_scope` 欄分流 |
+| 低信度列混在主檔裡 | 18,959 筆（15.4%）| 新增 `confidence` / `flags` 欄標記 |
+
+錨點漏洞長這樣：任務 111/6、112/6、113/6 三筆全都錨到同一篇「宏碁智新 **115年**6月」。
+窗過濾只擋得掉日期本身離譜的，擋不掉「錨錯地方、卻剛好挑到一個窗內日期」。
+
+`confidence='low'` 的四條 flag，每條都是實測過的錯誤來源：
+
+| flag | 筆數 | 意思 |
+|---|---:|---|
+| `no_revenue` | 18,252 | `raw_title` 抽不到營收金額 —— 多半是 Yahoo 頁面模板碎片（`"yptydevice":"desktop"` 那種），不是新聞標題，日期沒有文字佐證 |
+| `no_anchor` | 2,713 | `raw_title` 既無公司名也無代號 —— 可能抓到 CMoney 盤後速報那種一頁列一堆股票的彙總頁 |
+| `year_conflict` | 697 | `raw_title` 講的是「別年的同月份」——錨點漏洞的殘留（修錨點前全庫 705 筆，其中 8 筆隨假 success 一起降級了）|
+| `pre_public` | 0 | 營收月早於首次公開 2 個月以上（已全數降級，只有 `stock_dates.db` 沒涵蓋的公司才會再出現）|
+
+分層是有效的，不是憑感覺標的：
+
+```
+                     週末率    偏離該公司慣用申報日 >=3 天
+confidence=high       2.04%              7.77%
+confidence=low        4.28%             17.42%
+
+                     可比對    用單月營收自算年增率對得上
+yoy_scope=monthly    72,267            97.21%
+yoy_scope=cumulative    716             1.54%      ← 這些是累計年增率，別當單月用
+```
+
+### 沒修掉、要知道的殘留風險
+
+**① google 引擎的日期系統性偏早（約 1,900 筆，占 google 的 8%）**
+
+三條獨立證據：控制公司習慣後（同時有兩引擎、各 ≥12 筆的 1,056 檔股票內對照）google 週末率
+**5.84%** vs yahoo **1.64%**；週日群聚可對到隔天週一的 yahoo 高峰（`2022-01-09(日)` google
+109 筆 / yahoo 10 筆 → 隔天 `01-10` yahoo 525 筆）；偏離「該公司慣用申報日」的分布，google
+在**偏早那側多出 7.8pp**、偏晚側持平，是方向性偏移而非雜訊變大。
+
+機制是 `g_ad` 走中央社【公告】，Google SERP snippet 上的日期不等於申報日。逐筆修不掉，
+但 `engine` 欄留在主檔裡，**做事件研究請拿 `engine` 當敏感度分析的分組變數**。
+
+**② 遲交公司會抓到「窗內的錯日期」，而不是抓不到**
+
+`1438 三地開發` 的 MOPS 官方申報日 113/11 是 **2025-03-03**（遲 4 個月），但 DB 抓到窗內
+的 2024-12-09 新聞。這是靜默錯誤，比 `failed` 危險。MOPS 重疊裡占 3/1,459（0.2%），但
+MOPS 只涵蓋大型股，冷門股的遲交率量不到。`data/date_overrides.csv` 是這類個案的人工出口。
+
+**③ 剩下 5,613 筆 `failed`**
+
+87% 集中在民國 109~111（舊月份 × 冷門股），民國 113 之後只剩 325 筆。其中 4,591 筆夾在
+同一檔的 success 中間（真破洞），1,022 筆落在頭尾之外（可能已下市/長期停牌）。
+
+### 檢查過、沒問題的
+
+窗規則（全庫只有 `data/date_overrides.csv` 那筆人工個案在 1~15 之外）、同一公司同一天報兩個月
+（0 筆）、revenue 負數（0 筆；`revenue=0` 的 126 筆都是浩鼎、高端疫苗這類真的零營收）、
+月覆蓋率無整月塌陷（最低民國 110/5-6 的 77~79%，最高 99.9%）、MOPS 有而 DB 判 failed（1 筆）。
 
 ## 交叉驗證（MOPS，選配）
 

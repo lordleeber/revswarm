@@ -7,6 +7,7 @@
 跑法：  python3 -m unittest test_stock_dates    或    python3 test_stock_dates.py
 """
 
+import sqlite3
 import unittest
 
 import build_stock_dates as bsd
@@ -75,6 +76,70 @@ class TestDatesFrom(unittest.TestCase):
     def test_no_dates(self):
         d = gw.dates_from({"股票名稱": "X"})
         self.assertIsNone(d["first_public_gi"])                # 無任何板日期
+
+
+class TestShiftKey(unittest.TestCase):
+    """roc_year*100+month 不是連續數，位移得換算成絕對月序（不能直接加減）。"""
+
+    def test_同年內位移(self):
+        self.assertEqual(mp.shift_key(11311, -1), 11310)
+        self.assertEqual(mp.shift_key(11306, -2), 11304)
+        self.assertEqual(mp.shift_key(11301, +1), 11302)
+
+    def test_跨年位移(self):
+        self.assertEqual(mp.shift_key(11301, -1), 11212)    # 113/1 往前一個月 = 112/12
+        self.assertEqual(mp.shift_key(11302, -3), 11211)
+        self.assertEqual(mp.shift_key(11212, +1), 11301)
+
+    def test_位移0不動(self):
+        self.assertEqual(mp.shift_key(11311, 0), 11311)
+
+
+class TestDemotePlan(unittest.TestCase):
+    """--demote-success 的計畫：緩衝期內的 success 不能被降級。"""
+
+    def setUp(self):
+        import server
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(server.SCHEMA)
+        # 竑騰：首次公開 2024-06-04（民國 113/6）
+        for ry, rm, st in [(113, 3, "success"),    # 早 3 個月 → 降級
+                           (113, 4, "success"),    # 早 2 個月 → 降級
+                           (113, 5, "success"),    # 早 1 個月 → 緩衝內，保留
+                           (113, 2, "failed"),     # 本來就會被標 prelisting
+                           (113, 7, "success")]:   # 首次公開之後，完全不在範圍
+            self.conn.execute(
+                "INSERT INTO tasks (stock_id, name, roc_year, roc_month, state)"
+                " VALUES ('7751','竑騰',?,?,?)", (ry, rm, st))
+        self.conn.commit()
+        self.cutoffs = {"7751": (11306, "2024-06-04")}
+
+    def test_預設不算降級(self):
+        plan = mp.build_plan(self.conn, self.cutoffs)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0][3], 1)            # prune_count：那筆 failed
+        self.assertEqual(plan[0][5], 3)            # succ_before：113/3,4,5
+        self.assertEqual(plan[0][7], 0)            # demote_count：沒開就是 0
+
+    def test_緩衝1個月只降級早2個月以上的(self):
+        plan = mp.build_plan(self.conn, self.cutoffs, grace_months=1)
+        self.assertEqual(plan[0][6], 11305)        # demote_key = 切點往前 1 個月
+        self.assertEqual(plan[0][7], 2)            # 只有 113/3、113/4
+
+    def test_緩衝0則連早1個月的也降(self):
+        plan = mp.build_plan(self.conn, self.cutoffs, grace_months=0)
+        self.assertEqual(plan[0][6], 11306)
+        self.assertEqual(plan[0][7], 3)
+
+    def test_只有可降級success的公司也要進計畫(self):
+        # 沒有任何 undone/failed，只有上市前 success —— 不開降級時不該出現，開了才出現
+        self.conn.execute("UPDATE tasks SET state='prelisting' WHERE state='failed'")
+        self.conn.commit()
+        self.assertEqual(mp.build_plan(self.conn, self.cutoffs), [])
+        plan = mp.build_plan(self.conn, self.cutoffs, grace_months=1)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0][7], 2)
 
 
 if __name__ == "__main__":
