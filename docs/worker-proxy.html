@@ -337,7 +337,7 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
     <div class="rstep"><span class="sn">3</span><div class="rb"><b>再跑 worker</b>（另一個 tmux，帶上 <code class="k">WORKER_PROXY</code>）。
       <div class="code" style="margin:8px 0 0"><div class="code-hd"><span>本機</span><span class="tag">tmux: worker</span></div>
 <pre>tmux new-session -d -s worker \
-  'WORKER_PROXY=socks5h://127.0.0.1:1080 python3 yahoo_worker.py --server http://&lt;SERVER&gt;:8000 --token &lt;TOKEN&gt;'</pre></div></div></div>
+  'WORKER_PROXY=socks5h://127.0.0.1:1080 python3 -m worker.yahoo_worker --server http://&lt;SERVER&gt;:8000 --token &lt;TOKEN&gt;'</pre></div></div></div>
   </div>
 
   <div class="note"><b>順序為什麼要緊？</b>
