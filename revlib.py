@@ -110,7 +110,7 @@ def _iter_dates(html):
 
 
 def _anchor_offsets(html, name, roc_year, roc_month):
-    """
+    r"""
     精確名稱標題錨點的字元位置（todo.txt 2.5：避免「統一」吃到「統一超」）。
     鎖定「{名稱} {年}年{月}月」，名稱後須緊接空白或數字。民國/西元年都接受。
 
