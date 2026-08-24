@@ -14,8 +14,9 @@
 低板的歷史日期就查不到（如已上市的 6446 查不到它早年的上櫃/興櫃日）。故 otc_date / emerging_date
 對「已畢業公司」多為空；first_public 只能取「目前查得到的最早日」，是下界近似，非絕對首次公開。
 
-用法：  python3 build_stock_dates.py            # 重建 stock_dates.db
-        python3 build_stock_dates.py --db X.db
+用法（repo 根目錄）：
+  python3 -m goodinfo.build_stock_dates            # 重建 stock_dates.db
+  python3 -m goodinfo.build_stock_dates --db X.db
 """
 
 import argparse

@@ -24,7 +24,8 @@
 根本抽不到營收金額（是 Yahoo 頁面模板碎片），另 8 筆 raw_title 寫的是別年的同月份
 （如「宏碁智新 115年6月」被掛到任務 111/6）。降級前會把原值連同 raw_title 寫進 CSV 存證。
 
-前置：先跑 build_stock_dates.py + goodinfo_worker.py 讓 stock_dates.db 的 goodinfo_dates 有資料。
+前置：先跑 python3 -m goodinfo.build_stock_dates 與 python3 -m goodinfo.goodinfo_worker，
+      讓 stock_dates.db 的 goodinfo_dates 有資料。
 
 用法：
   python3 mark_prelisting.py --dry-run                     # 只看計畫，不寫入
@@ -112,7 +113,7 @@ def main():
     ap.add_argument("--grace-months", type=int, default=revlib.PRE_PUBLIC_GRACE_MONTHS,
                     help="降級緩衝月數：首次公開前這幾個月內的 success 視為合法補報，"
                          f"不降級（預設 {revlib.PRE_PUBLIC_GRACE_MONTHS}）。改了這個值，"
-                         "export.py --grace-months 要跟著改，否則 pre_public flag 會不一致")
+                         "日後重寫的匯出工具要跟著改，否則 pre_public flag 會不一致")
     ap.add_argument("--demoted-out", default="tmp/prelisting_demoted.csv",
                     help="降級前把原值（含 announce_date/raw_title）寫這裡存證")
     args = ap.parse_args()

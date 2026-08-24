@@ -20,8 +20,8 @@ Yahoo 兩種年份都試過仍找不到窗內日期的 failed，由 google_worke
     5. 只有「兩種年份都試過、頁面正常、仍無窗內日期」才回 failed。
     6. 每次查詢間 delay+jitter；偵測連續 rate_limited → 指數退避（多半是整個 IP 被擋）。
 
-部署：把 yahoo_worker.py 與 revlib.py 複製到任一台機器即可跑：
-  python3 yahoo_worker.py --server http://SERVER:8000 --token SECRET
+部署：在 worker 機器上 git clone 本 repo，從 repo 根目錄以模組形式執行：
+  python3 -m worker.yahoo_worker --server http://SERVER:8000 --token SECRET
 """
 
 import argparse

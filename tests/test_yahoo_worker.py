@@ -8,7 +8,7 @@ yahoo_worker 的退避/cooldown 與單筆分類邏輯回歸測試。純標準庫
   - crawl_task 對四種情境的分類（success / q_ad 補查 / failed / rate_limited）
   - 主迴圈的指數退避序列、連續 rate_limited 判定 IP 被擋、剩餘任務放回
 
-跑法：  python3 -m unittest test_yahoo_worker      或      python3 test_yahoo_worker.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_yahoo_worker
 """
 
 import contextlib
@@ -16,7 +16,7 @@ import io
 import types
 import unittest
 
-import yahoo_worker
+from worker import yahoo_worker
 
 
 class _FakeTime:

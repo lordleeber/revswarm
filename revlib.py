@@ -65,13 +65,14 @@ def iter_roc_months(start=ROC_START, end=ROC_END):
             m = 1
 
 
-# --- 上市前緩衝（mark_prelisting / export 共用）-----------------------------
+# --- 上市前緩衝（mark_prelisting 用；export 重寫後也走這個值）---------------
 # 公司在「首次公開當月」補報「前一個月」營收是合法的：實測 18 筆都長這樣且 raw_title
 # 對得上（例：竑騰 113/5 營收於 2024-06-07 公布、公開發行日 2024-06-04）。所以判定
 # 「這筆不可能存在」時要放這麼多個月的水。
 #
-# 放這裡是因為 mark_prelisting（回寫 DB 用它降級）與 export（標 pre_public flag 用它）
-# 必須用同一個數字——兩邊各寫各的會出現「已降級的留著、沒降級的被標 low」這種不一致。
+# 放這裡而不是放進 mark_prelisting，是因為「回寫 DB 降級」與「匯出時標 pre_public
+# flag」必須用同一個數字——兩邊各寫各的會出現「已降級的留著、沒降級的被標 low」這種
+# 不一致。export.py 待重寫（見 git log ad4810f），重寫時直接引用這個常數。
 PRE_PUBLIC_GRACE_MONTHS = 1
 
 
@@ -109,7 +110,7 @@ def _iter_dates(html):
 
 
 def _anchor_offsets(html, name, roc_year, roc_month):
-    """
+    r"""
     精確名稱標題錨點的字元位置（todo.txt 2.5：避免「統一」吃到「統一超」）。
     鎖定「{名稱} {年}年{月}月」，名稱後須緊接空白或數字。民國/西元年都接受。
 

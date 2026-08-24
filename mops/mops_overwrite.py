@@ -12,8 +12,8 @@
   故冪等、且對線上 worker 安全（worker 的 report() 本就不動 success 列）。
 
 用法：
-  python3 mops_overwrite.py --dry-run   # 只統計、不寫入
-  python3 mops_overwrite.py             # 實際覆蓋（會先自動用 SQLite backup API 備份 DB）
+  python3 -m mops.mops_overwrite --dry-run   # 只統計、不寫入
+  python3 -m mops.mops_overwrite             # 實際覆蓋（會先自動用 SQLite backup API 備份 DB）
 """
 
 import argparse

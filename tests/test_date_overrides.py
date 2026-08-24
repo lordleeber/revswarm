@@ -7,7 +7,7 @@ apply_date_overrides 的回歸（不連網；寫入路徑用 :memory: 跑真 sch
   ✓ 月份必須是「營收月的次月」——強不變量，錯了一定是打錯或誤判 → 拒
   ✗ 不限制幾號——遲交上限是個案問題，由 note 與人負責 → 16、17、28 號都要收
 
-跑法：  python3 -m unittest test_date_overrides
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_date_overrides
 """
 
 import csv

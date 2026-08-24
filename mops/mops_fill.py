@@ -11,8 +11,8 @@
   故填成 success 後 worker 遲到回報不會被降級；雙方皆 BEGIN IMMEDIATE，SQLite 序列化。
 
 用法：
-  python3 mops_fill.py --dry-run   # 只統計、不寫入
-  python3 mops_fill.py             # 實際回填（會先自動用 SQLite backup API 備份 DB）
+  python3 -m mops.mops_fill --dry-run   # 只統計、不寫入
+  python3 -m mops.mops_fill             # 實際回填（會先自動用 SQLite backup API 備份 DB）
 """
 
 import argparse

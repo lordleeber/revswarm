@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 
+# 虛擬環境（本機用，可由 python3 -m venv .venv 重建）
+.venv/
+venv/
+
 # 秘密：token 放這，別進版控
 .env
 
@@ -26,5 +30,6 @@ mops_validation.csv
 # 來源/衍生資料暫存區（官方 TWSE/TPEx 下載檔、build 產物，可重抓/重建，不進版控）
 tmp/
 
-# Goodinfo 爬取的第三方資料（受其 ToS 保護，勿進版控/散布）
-goodinfo/
+# Goodinfo 爬取的第三方原始頁（受其 ToS 保護，勿進版控/散布）
+# 只擋原始頁；goodinfo/ 底下的程式碼要進版控
+goodinfo/basicInfo/

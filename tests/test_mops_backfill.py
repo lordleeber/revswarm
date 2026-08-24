@@ -7,14 +7,14 @@ mops_fill / mops_overwrite 的純邏輯回歸測試（純標準庫 unittest，�
   mismatch / out_of_window / no_task / 超範圍 / 畸形日期）。
 - TestDaydiff：mops_overwrite.daydiff 的正負向與跨年。
 
-跑法：  python3 -m unittest test_mops_backfill    或    python3 test_mops_backfill.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_mops_backfill
 """
 
 import sqlite3
 import unittest
 
-import mops_fill
-import mops_overwrite
+from mops import mops_fill
+from mops import mops_overwrite
 import server
 
 

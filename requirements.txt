@@ -1,6 +1,6 @@
 # revswarm 的第三方相依 —— 只有 google_worker.py 需要。
 #
-# ⚠️ 核心是零依賴：server.py / yahoo_worker.py / revlib.py / init_tasks.py / export.py 等
+# ⚠️ 核心是零依賴：server.py / yahoo_worker.py / revlib.py / init_tasks.py 等
 #    全部只用 Python 標準庫（3.8+）與 curl。只跑 server 或 Yahoo 主線 worker 的機器
 #    【不需要】安裝這個檔案 —— 複製 yahoo_worker.py + revlib.py 過去就能跑。
 #

@@ -3,12 +3,12 @@
 """
 mops_validate 的解析/映射純函式回歸測試（不連網）。
 
-跑法：  python3 -m unittest test_mops      或      python3 test_mops.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_mops
 """
 
 import unittest
 
-import mops_validate as mv
+from mops import mops_validate as mv
 
 
 class TestMopsParsing(unittest.TestCase):
