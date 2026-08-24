@@ -113,7 +113,7 @@ def main():
     ap.add_argument("--grace-months", type=int, default=revlib.PRE_PUBLIC_GRACE_MONTHS,
                     help="降級緩衝月數：首次公開前這幾個月內的 success 視為合法補報，"
                          f"不降級（預設 {revlib.PRE_PUBLIC_GRACE_MONTHS}）。改了這個值，"
-                         "export.py --grace-months 要跟著改，否則 pre_public flag 會不一致")
+                         "日後重寫的匯出工具要跟著改，否則 pre_public flag 會不一致")
     ap.add_argument("--demoted-out", default="tmp/prelisting_demoted.csv",
                     help="降級前把原值（含 announce_date/raw_title）寫這裡存證")
     args = ap.parse_args()

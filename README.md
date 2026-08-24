@@ -47,7 +47,6 @@
 | `worker/google_worker.py` | 補搜 worker：Playwright 驅動系統 Chrome 查 Google，撿 Yahoo 救不回的 `failed`（見下）|
 | `requirements.txt` | **只服務 `google_worker.py`** 的相依（playwright）；核心零依賴，不必安裝|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
-| `export.py` | 匯出研究用 CSV：`revenue_dates.csv`（success + 可靠度分層）與 `missing.csv`（缺口）|
 | `goodinfo/build_stock_dates.py` | 從官方來源建 `stock_dates.db`（上市/上櫃日現況快照）|
 | `goodinfo/goodinfo_worker.py` | 補 goodinfo 的四板日期（上市/上櫃/興櫃/公開發行），拿到**已畢業公司的早年日期**，官方現況快照沒有 |
 | `mark_prelisting.py` | 用首次公開日把「公司當時還沒公開發行」的任務標成 `prelisting`；`--demote-success` 連上市前的假 success 一起降級（見「資料品質」）|
@@ -82,9 +81,6 @@ python3 -m worker.yahoo_worker --server http://<SERVER_IP>:8000
 # 5. 隨時看進度
 source .env
 curl -s -H "Authorization: Bearer $REVSWARM_TOKEN" http://<SERVER_IP>:8000/stats | python3 -m json.tool
-
-# 6. 匯出研究資料（一次出主檔 + 缺口清單）
-python3 export.py
 ```
 
 ## API
@@ -369,48 +365,6 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 - ⚠️ **非權威**：來源非官方、金額四捨五入到億/萬兩位，僅供**交叉校驗/研究參考**；要精確到元請用 MOPS 月營收。
 - 既有 DB 一次性回填（**不重爬**）：`python3 backfill_revenue.py`（先停 server、先備份；`--dry-run` 可預覽）。
   server 啟動時會自動 `ALTER TABLE` 補上這兩欄。
-
-## 匯出
-
-`export.py` 一次產出兩份，各司其職（都不進版控，隨時可重跑重建）：
-
-```bash
-python3 export.py                    # → revenue_dates.csv + missing.csv
-python3 export.py --no-missing       # 只出主檔
-```
-
-三段查詢（主檔／缺口／統計）跑在同一個唯讀交易裡，取的是同一個快照 —— 爬蟲還在跑時匯出
-也不會出現「某筆兩份檔案都沒有」。
-
-**`revenue_dates.csv`** — 分析主檔，只有 `state='success'`，一列 = 一個公布日事件。
-除了 DB 原欄位，另補下游一定會自己算的東西：
-
-| 欄位 | 說明 |
-|---|---|
-| `market` | 從 `stocks.csv` join（`sii`=上市 / `otc`=上櫃），上市櫃交易規則不同要分組 |
-| `rev_ym` | 營收**所屬**月份的西元 `YYYY-MM`，接股價資料用這欄（DB 存的是民國）|
-| `lag_days` | 公布日 − 營收月月底，依窗規則必落 1~15 |
-| `yoy_scope` | `yoy` 那個數字是單月（`monthly`）還是累計（`cumulative`）年增率 |
-| `confidence` | `high` / `low`。**做事件研究請先篩 `confidence='high'`** |
-| `flags` | 這列踩到哪幾條疑點，分號分隔；空 = 乾淨 |
-
-`yoy` 的 `999999.99` 哨兵值（worker 解析不到年增率時寫入）已清成空值。
-
-**`missing.csv`** — 缺口清單，所有非 success 的列。`state` 四種語意完全不同，別混為一談：
-
-| state | 意思 |
-|---|---|
-| `failed` | 爬過（民國年+西元年都試）仍找不到 → **真缺口**，可再撈 |
-| `prelisting` | 該月公司尚未公開發行 → **事件本來就不存在**，不該算進覆蓋率分母 |
-| `undone` | 還沒爬到（爬蟲未收工時才有）→ 不是缺口，是還沒做 |
-| `dispatched` | 已租給 worker、還沒回報 → 同上 |
-
-刻意不在 SQL 裡濾掉 `undone`/`dispatched`：那會讓「還沒爬」在缺口清單裡靜靜消失，
-下游把列數當成缺口總量就會低估。**要算真缺口請自己篩 `state='failed'`。**
-
-⚠️ `pre_public` flag 的緩衝月數（`export.py --grace-months`）必須與降級時用的
-`mark_prelisting.py --grace-months` 一致，兩者預設都取 `revlib.PRE_PUBLIC_GRACE_MONTHS`。
-只改一邊會把「刻意保留的合法補報」標成 `pre_public` / `confidence=low`。
 
 ## 資料品質
 
