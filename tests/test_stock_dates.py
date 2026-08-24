@@ -4,14 +4,14 @@
 上市前工具鏈的純函式回歸測試（不連網、不碰 DB）：
   build_stock_dates 日期正規化、mark_prelisting 民國換算、goodinfo_worker 擋爬偵測與日期解析。
 
-跑法：  python3 -m unittest test_stock_dates    或    python3 test_stock_dates.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_stock_dates
 """
 
 import unittest
 
-import build_stock_dates as bsd
-import goodinfo_worker as gw
-import mark_prelisting as mp
+from goodinfo import build_stock_dates as bsd
+from goodinfo import goodinfo_worker as gw
+import mark_prelisting as mp          # 主流程那端：寫入 revswarm.db，留在 repo 根目錄
 
 
 class TestDateNorm(unittest.TestCase):

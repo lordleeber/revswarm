@@ -3,7 +3,7 @@
 """
 revlib.parse_revenue 的純函式回歸測試（不連網）。
 
-跑法：  python3 -m unittest test_revlib      或      python3 test_revlib.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_revlib
 """
 
 import unittest

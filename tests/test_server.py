@@ -3,7 +3,7 @@
 """
 server 的統計導出、/status 頁渲染、dashboard 查詢的回歸測試。純標準庫 unittest。
 
-跑法：  python3 -m unittest test_server      或      python3 test_server.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_server
 """
 
 import os

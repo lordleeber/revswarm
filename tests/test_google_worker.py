@@ -13,7 +13,7 @@ fetch_google / open_searcher / Client 為假物件，就能確定性地驗證：
   - 解掉驗證後 wait_until_unblocked 立刻接續；非驗證碼的連續失敗則照舊長睡
   - 主迴圈的指數退避序列、連續 rate_limited 判定被擋、剩餘任務放回、瀏覽器有關掉
 
-跑法：  python3 -m unittest test_google_worker      或      python3 test_google_worker.py
+跑法（在 repo 根目錄）：  python3 -m unittest tests.test_google_worker
 """
 
 import contextlib
@@ -21,7 +21,7 @@ import io
 import types
 import unittest
 
-import google_worker
+from worker import google_worker
 
 
 class _FakeTime:
