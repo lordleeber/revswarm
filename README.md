@@ -50,13 +50,13 @@
 | `mops/mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
-**核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。部署 worker 只要複製 `worker/yahoo_worker.py` + `revlib.py`（兩支放同層即可）。
+**核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。worker 機器 `git clone` 本 repo 就能跑，不必額外安裝任何東西。
 唯一的例外是 `google_worker.py` 需要 playwright（`requirements.txt`），只在要跑 Google 補搜的機器上裝。
 
-> **worker 有兩種跑法，別搞混：** repo 內要用**模組形式** `python3 -m worker.yahoo_worker`，
-> 這樣根目錄才留在 `sys.path` 上、`import revlib` 才找得到；直接跑 `python3 worker/yahoo_worker.py`
-> 會 `ModuleNotFoundError: No module named 'revlib'`（`sys.path[0]` 是腳本所在目錄，不是 CWD）。
-> 遠端 worker 機器是**平鋪部署**（`yahoo_worker.py` 與 `revlib.py` 同層），照舊 `python3 yahoo_worker.py`。
+> **子目錄下的程式一律從 repo 根目錄以模組形式執行**，`worker/`、`mops/`、`goodinfo/` 都一樣：
+> `python3 -m worker.yahoo_worker`、`python3 -m mops.mops_validate`。
+> 直接跑 `python3 worker/yahoo_worker.py` 會 `ModuleNotFoundError: No module named 'revlib'`
+> ——`sys.path[0]` 是「腳本所在目錄」而不是 CWD，根目錄沒進 `sys.path` 就找不到 `revlib`。
 
 ## Quick start
 
@@ -71,9 +71,9 @@ python3 init_tasks.py                         # → revswarm.db (134,904 undone)
 echo "REVSWARM_TOKEN=$(head -c16 /dev/urandom | base64 | tr -d '\n')" > .env
 python3 server.py --host 0.0.0.0 --port 8000  # 自動讀 .env 的 REVSWARM_TOKEN
 
-# 4. 在「每一台」worker 機器上跑（複製 worker/yahoo_worker.py + revlib.py 過去，平鋪同層）
+# 4. 在「每一台」worker 機器上跑（git clone 本 repo，在 repo 根目錄執行）
 echo "REVSWARM_TOKEN=<與 server .env 同一組>" > .env
-python3 yahoo_worker.py --server http://<SERVER_IP>:8000
+python3 -m worker.yahoo_worker --server http://<SERVER_IP>:8000
 
 # 5. 隨時看進度
 source .env
@@ -151,7 +151,7 @@ google-chrome --version                   # 用系統的 /usr/bin/google-chrome�
 > ⚠️ **`requirements.txt` 只服務 `google_worker.py`。**
 > playwright 是本 repo 唯一的第三方依賴，`server.py` / `yahoo_worker.py` / `revlib.py`
 > 仍維持「純標準庫、零依賴」——**只跑 server 或 Yahoo 主線的機器不必安裝它**，
-> 複製 `worker/yahoo_worker.py` + `revlib.py` 過去就能跑。測試也不需要（playwright 是延後 import 的）。
+> `git clone` 下來就能跑。測試也不需要（playwright 是延後 import 的）。
 
 另外需要**圖形環境**（headful 才不會被擋）：Linux 上是 `DISPLAY=:0`。無頭機器請改派有桌面的
 機器跑（Windows 桌面本來就有圖形環境，見下面的 PowerShell 跑法）。
@@ -307,16 +307,14 @@ tmux kill-session -t revswarm      # 要停止 server 時
 ### ③ 每台 worker（其他機器）
 
 ```bash
-# 複製 worker 需要的兩個檔（用 scp 從 server 拉，或任何方式）
-mkdir -p ~/revswarm && cd ~/revswarm
-scp <user>@<server位址>:/path/to/revswarm/worker/yahoo_worker.py .
-scp <user>@<server位址>:/path/to/revswarm/revlib.py .
+# 把 repo clone 下來（worker 不需要 DB，只跟 server 走 HTTP）
+git clone <你的 repo 網址> revswarm && cd revswarm
 
 # token 寫進 .env（與 server 同一組），worker 自動讀
 echo "REVSWARM_TOKEN=<貼上 server 那串 token>" > .env
 
 curl http://<server位址>:8000/healthz          # 回 {"ok":true,...} 才代表連得到
-python3 yahoo_worker.py --server http://<server位址>:8000
+python3 -m worker.yahoo_worker --server http://<server位址>:8000
 ```
 多台 worker 就在每台重複本步驟（多機 = 多 IP，分攤 Yahoo 封鎖）。
 

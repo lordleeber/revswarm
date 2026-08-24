@@ -364,12 +364,12 @@ gcloud compute ssh &lt;VM&gt; --zone &lt;zone&gt; -- -D 1080 -N -f -o ExitOnForw
 
   <h3>再證明 worker 的 fetch() 真的能經 VM 抓到 Yahoo</h3>
   <div class="term">
-    <div class="term-hd">設 WORKER_PROXY 後直接呼叫 worker.fetch()（不啟整個 worker）</div>
-<pre><span class="prompt">$</span> WORKER_PROXY=socks5h://127.0.0.1:1080 python3 -c '…worker.fetch("台積電 2020年1月")…'
+    <div class="term-hd">設 WORKER_PROXY 後直接呼叫 yahoo_worker.fetch()（不啟整個 worker）</div>
+<pre><span class="prompt">$</span> WORKER_PROXY=socks5h://127.0.0.1:1080 python3 -c '…yahoo_worker.fetch("台積電 2020年1月")…'
 模組讀到的 PROXY = socks5h://127.0.0.1:1080     <span class="prompt">①</span>
 ok = <span class="ok">True</span> | html 長度 = <span class="ok">136872</span>              <span class="prompt">②</span>
 
-<span class="prompt">$</span> python3 -c 'import worker; print(worker.PROXY)'   <span class="c"># 沒設環境變數</span>
+<span class="prompt">$</span> python3 -c 'from worker import yahoo_worker; print(yahoo_worker.PROXY)'   <span class="c"># 沒設環境變數</span>
 PROXY(no env) = None                            <span class="prompt">③</span></pre>
   </div>
   <ul class="annot">

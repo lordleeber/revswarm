@@ -21,14 +21,15 @@ goodinfo 對畢業公司仍保有完整歷史（含「公開發行日期」＝�
   - 可續跑：goodinfo/basicInfo/<代號>.json 已存在即跳過。
   - 可走 SOCKS proxy（--proxy）繞 per-IP 限流。
   - 預設只爬「需要的那批」：stock_dates.db 中 first_public 落窗內(>2020-01)或空白者（--all 爬全部）。
-  - 長跑請用 tmux，不要 nohup。goodinfo 資料受其 ToS 保護、勿進版控/散布（goodinfo/ 已 gitignore）。
+  - 長跑請用 tmux，不要 nohup。goodinfo 資料受其 ToS 保護、勿進版控/散布：gitignore 只擋 goodinfo/basicInfo/，
+    goodinfo/ 底下的程式碼是進版控的——爬到的資料一律寫進 basicInfo/，別放別處。
 
 用法：
-  python3 goodinfo_worker.py --dry-run
-  python3 goodinfo_worker.py --limit 3
-  python3 goodinfo_worker.py --sleep 6
-  python3 goodinfo_worker.py --proxy socks5h://127.0.0.1:1080
-  python3 goodinfo_worker.py --all
+  python3 -m goodinfo.goodinfo_worker --dry-run
+  python3 -m goodinfo.goodinfo_worker --limit 3
+  python3 -m goodinfo.goodinfo_worker --sleep 6
+  python3 -m goodinfo.goodinfo_worker --proxy socks5h://127.0.0.1:1080
+  python3 -m goodinfo.goodinfo_worker --all
 """
 
 import argparse

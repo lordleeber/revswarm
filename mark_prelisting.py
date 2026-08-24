@@ -11,7 +11,8 @@
 - 冪等 + 對線上 worker 安全（BEGIN IMMEDIATE；標成 prelisting 後不再被 lease）。
 - first_public_gi 早於/等於任務窗頭(民國109/1)者→全窗已公開→不砍（其空白是 recall 漏抓）。
 
-前置：先跑 build_stock_dates.py + goodinfo_worker.py 讓 stock_dates.db 的 goodinfo_dates 有資料。
+前置：先跑 python3 -m goodinfo.build_stock_dates 與 python3 -m goodinfo.goodinfo_worker，
+      讓 stock_dates.db 的 goodinfo_dates 有資料。
 
 用法：
   python3 mark_prelisting.py --dry-run   # 列出每檔切點與砍除數 + 輸出 CSV，不寫入

@@ -13,13 +13,13 @@ MOPS 只涵蓋「自願把月營收發成重大訊息」的約 32 家（台積�
 
 用法：
   # 驗證目前 revswarm 已成功的那些股票（預設）
-  python3 mops_validate.py
+  python3 -m mops.mops_validate
 
   # 指定股票
-  python3 mops_validate.py --codes 2330 2454 1301 6505
+  python3 -m mops.mops_validate --codes 2330 2454 1301 6505
 
   # 建全量基準（1848 檔都問一次 MOPS，多數回空；建議 tmux 背景跑，可續跑）
-  python3 mops_validate.py --codes-file data/active_stocks.txt
+  python3 -m mops.mops_validate --codes-file data/active_stocks.txt
 
 輸出：
   mops_baseline.csv     MOPS 官方申報日快取（stock_id,roc_year,roc_month,announce_date,...）

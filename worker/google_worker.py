@@ -38,9 +38,9 @@ Chrome」查 Google 搜尋、回報結果。用來二次補搜 yahoo_worker.py�
   pip3 install --user playwright      # 不需要 playwright install chromium
   需要圖形環境（如 DISPLAY=:0）與系統 Chrome（/usr/bin/google-chrome）
 
-部署到別台機器：複製 google_worker.py + revlib.py，裝 playwright，.env 放同一組
-REVSWARM_TOKEN，然後：
-  python3 google_worker.py --server http://SERVER:8000
+部署到別台機器：git clone 本 repo，裝 playwright，.env 放同一組 REVSWARM_TOKEN，
+然後從 repo 根目錄：
+  python3 -m worker.google_worker --server http://SERVER:8000
 
 先把 failed 轉交 google 佇列（否則沒有 engine='google' 的任務可租）：
   curl -X POST -H "Authorization: Bearer SECRET" \\
