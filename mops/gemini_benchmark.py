@@ -61,9 +61,27 @@ FIELDS = ["stock_id", "name", "roc_year", "roc_month",
           "mops_date", "yahoo_date", "gemini_date", "gemini_source",
           "status", "searches", "raw_title", "search_queries"]
 
+# ⚠️ 絕不可以用 \b 當左界。Python 的 \w 包含 CJK，所以中文字與數字之間【沒有】
+# 詞界——"台塑111年10月" 用 r"\b1[01]\d年" 比對是 False，只有 "台塑 111年10月"
+# 這種剛好有空格的才會中。而模型下的中文查詢多半沒空格，於是整份報表會印
+# 「含民國年 0.0%／含西元年 0.0%」，剛好把本欄唯一的用途歸零（重跑要再花錢）。
+# 改用 (?<!\d) 只擋「數字中間」，例如 2022 不該被當成民國 202 年。
+_ROC_YEAR = re.compile(r"(?<!\d)1[01]\d\s*年")
+_AD_YEAR = re.compile(r"(?<!\d)20\d{2}\s*年")
+
 # search_queries 用它分隔。⚠️ 不用逗號：查詢字串本身就常含逗號，csv 引號雖然擋得住，
 # 但人用 grep/Excel 拆欄時會拆錯。管線符號在中文查詢裡幾乎不會出現。
 QUERY_SEP = " | "
+
+
+def _join_queries(queries):
+    """把查詢串成一欄。
+
+    ⚠️ 查詢字串是【模型】產生的，我們控制不到內容。萬一某個查詢自己含有 " | "，
+    split 回來就會多出幽靈項目，len(qs) 被灌水、所有百分比跟著歪掉。
+    join 時先把 | 換掉，讓 split 保持可逆。
+    """
+    return QUERY_SEP.join(q.replace("|", "／") for q in queries)
 
 
 # --- 抽樣 -------------------------------------------------------------------
@@ -168,7 +186,7 @@ def measure_one(row, backend, model, budget, retries=2, retry_sleep=8.0):
     # 決定下什麼、下幾次（不像 yahoo/google worker 是我們自己組查詢）。一致率不好時，
     # 只有這欄能分辨「模型下的查詢本身就爛」還是「查對了但抽錯日期」，也是唯一能驗證
     # 「它到底有沒有用民國年／西元年兩種」的證據。跑完才想加就得重花一次錢。
-    out["search_queries"] = QUERY_SEP.join(payload["searches"])
+    out["search_queries"] = _join_queries(payload["searches"])
     out["status"] = "ok"
     hit = gw.extract(payload, row["name"], row["roc_year"], row["roc_month"])
     if hit:
@@ -197,6 +215,22 @@ def load_done(path):
 
 
 def append_row(path, row):
+    """
+    逐筆 append，中斷也不會掉資料。
+
+    ⚠️ 開檔前先驗表頭。表頭只在「檔案不存在」時才寫，所以 FIELDS 一旦加欄，
+    舊的 CSV 就會變成「N+1 個值塞進 N 欄的表頭」——DictReader 會把多出來的值
+    默默丟進 restkey(None) 而不報錯，等於花了錢卻讀不回來。
+    欄位對不上就直接停，讓人決定要改名保留還是刪掉重跑。
+    """
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            header = next(csv.reader(f), [])
+        if header != FIELDS:
+            raise SystemExit(
+                f"⚠️ {path} 的欄位與現行版本不符，停止以免寫出讀不回來的資料。\n"
+                f"   檔案：{header}\n   現行：{FIELDS}\n"
+                f"   把舊檔改名保留（之後可用 --report-only 讀）或刪掉重跑。")
     new = not os.path.exists(path)
     with open(path, "a", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
@@ -323,8 +357,8 @@ def _report_queries(ok):
               f"平均 {statistics.fmean(counts):.1f}／最多 {max(counts)}"
               f"（計費按這個，不是按任務數）")
     qs = [q for r in withq for q in (r["search_queries"] or "").split(QUERY_SEP) if q]
-    roc = sum(1 for q in qs if re.search(r"\b1[01]\d\s*年", q))
-    ad = sum(1 for q in qs if re.search(r"\b20\d{2}\s*年", q))
+    roc = sum(1 for q in qs if _ROC_YEAR.search(q))
+    ad = sum(1 for q in qs if _AD_YEAR.search(q))
     rev = sum(1 for q in qs if "營收" in q)
     print(f"  共 {len(qs)} 個查詢：含民國年 {_pct(roc, len(qs))}、"
           f"含西元年 {_pct(ad, len(qs))}、含「營收」二字 {_pct(rev, len(qs))}")
