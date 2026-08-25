@@ -85,6 +85,9 @@ VERTEX_LOCATION = "global"
 TOOL_SPEC = {"googleSearch": {}}
 # ⚠️ Vertex 沒有 AI Studio 那 5,000 次/月的免費 grounding 額度；單價請以實際帳單校正。
 DEFAULT_UNIT_PRICE = 0.014
+# ⚠️ 呼叫次數上限，與搜尋次數上限【兩道都要】。理由見 Budget.attempt()：
+# 搜尋次數只有拿到回應才數得到，持續失敗時它永遠是 0，擋不住無限迴圈。
+DEFAULT_MAX_CALLS = 200
 # 預設用 3.x：AI Studio 每月 5,000 次 search 免費，且按 search 計費
 # （2.5/2.0 系列對新專案已 404 下架，"no longer available to new users"，退不回去）。
 DEFAULT_MODEL = "gemini-3.7-flash"
@@ -114,7 +117,11 @@ _MODEL_TITLE = re.compile(r"^[ \t]*TITLE:[ \t]*(\S.*?)[ \t]*$", re.M)
 # 所以只有訊息明確指向「永久性設定問題」時才 fatal，其餘 403 退避重試。
 _FATAL_403 = re.compile(
     r"has not been used in project|SERVICE_DISABLED|is disabled|"
-    r"billing|API key not valid|caller does not have permission", re.I)
+    r"billing|API key not valid|caller does not have permission|"
+    # ⚠️ 這三個才是 Vertex 在 --project 打錯／缺 aiplatform.user 時實際回的字樣。
+    # 漏掉的話設定錯會被判成 retry，每一筆無聲重排（_FATAL_400 早就收了
+    # PERMISSION_DENIED，兩條規則不該自相矛盾）。
+    r"PERMISSION_DENIED|Permission .{0,80}denied|does not have permission", re.I)
 
 
 
@@ -150,9 +157,20 @@ class VertexBackend:
     def token(self, force=False):
         now = time.time()
         if force or self._token is None or now - self._token_at > TOKEN_TTL:
-            out = subprocess.run(
-                [self.gcloud, "auth", "application-default", "print-access-token"],
-                capture_output=True, text=True, timeout=60)
+            cmd = [self.gcloud, "auth", "application-default", "print-access-token"]
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            except FileNotFoundError:
+                # ⚠️ 一定要在這裡轉成 RuntimeError(→fatal)。FileNotFoundError 是 OSError
+                # 的子類，會被 call_gemini 最後那個 except OSError 當成 ERR_RETRY 吃掉
+                # ——gcloud 沒裝的話每一筆都會這樣，worker 就變成無聲的無限迴圈。
+                raise RuntimeError(
+                    f"找不到 gcloud（試過 {self.gcloud}）。裝好 SDK 或用 --gcloud 指路。")
+            except subprocess.TimeoutExpired:
+                # 同理：不接的話會直接 traceback 出 run()，整個 worker 當掉。
+                raise RuntimeError(f"gcloud 取 token 逾時（{self.gcloud}）。")
+            except OSError as e:
+                raise RuntimeError(f"gcloud 無法執行（{self.gcloud}）：{e}")
             if out.returncode != 0:
                 raise RuntimeError(
                     "取不到 ADC token（先跑 `gcloud auth application-default login`）："
@@ -278,10 +296,20 @@ def call_gemini(prompt, backend, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT):
             if e.code == 400 and _FATAL_400.search(detail):
                 print(f"  ⚠️ HTTP 400：{detail}", file=sys.stderr)
                 return None, ERR_FATAL
+            if e.code in (404, 405):
+                # endpoint 是固定組出來的，404/405 只可能是型號打錯或已退役
+                # （gemini-2.5-* / 2.0-flash 對新專案就是 404）。這對每一筆都會重演，
+                # 判 retry 只會讓整批無聲 rate_limited，看不出是型號問題。
+                print(f"  ⚠️ HTTP {e.code}：型號 {model} 不存在或已退役。{detail}",
+                      file=sys.stderr)
+                return None, ERR_FATAL
             return None, ERR_RETRY
-        except RuntimeError as e:
-            # 取 token 失敗（沒跑 application-default login 等）——重試不會變好。
-            print(f"  ⚠️ {e}", file=sys.stderr)
+        except (RuntimeError, subprocess.SubprocessError) as e:
+            # 取 token 失敗（gcloud 沒裝、沒跑 application-default login、逾時…）
+            # ——重試不會變好，一律 fatal。
+            # ⚠️ SubprocessError 要一起接：TimeoutExpired 不是 OSError 也不是
+            # RuntimeError，漏接會直接 traceback 出 run()，整個 worker 當掉。
+            print(f"  ⚠️ 取 token 失敗：{e}", file=sys.stderr)
             return None, ERR_FATAL
         except (urllib.error.URLError, TimeoutError, ValueError, OSError):
             return None, ERR_RETRY
@@ -322,6 +350,14 @@ def extract(payload, name, roc_year, roc_month):
     """
     for blob, src in ((("\n".join(payload["chunks"])), SRC_CHUNK),
                       (payload["text"], SRC_TEXT)):
+        if src == SRC_CHUNK and not revlib._anchor_offsets(
+                blob, name, roc_year, roc_month):
+            # ⚠️ chunk 這條路一定要錨點命中才算數。blob 是把「一次任務 4~11 次搜尋」
+            # 的所有來源標題串起來的，裡面混著別家公司的結果；revlib.parse 在錨點沒中
+            # 時會退回「窗內第一個日期」，而 title_year_conflict 只擋得掉「錯年同月」。
+            # 不擋的話，台塑 109/1 的任務可能吃到「南亞 109年1月營收…2020/02/10」，
+            # 還被標成 m_src（高信任層）——那比標成 m_txt 更糟。
+            continue
         hit = revlib.parse(blob, name, roc_year, roc_month)
         if not hit:
             continue
@@ -353,6 +389,7 @@ def crawl_task(task, backend, model, budget):
     sid = task["stock_id"]
     ry, rm = task["roc_year"], task["roc_month"]
 
+    budget.attempt()          # ⚠️ 呼叫前就記，成功與否都算（見 Budget.attempt）
     payload, err = call_gemini(
         build_prompt(sid, name, ry, rm), backend, model=model)
     if err == ERR_FATAL:
@@ -382,26 +419,44 @@ class Budget:
     也不要半夜一個迴圈把額度燒穿還繼續往下刷。
     """
 
-    def __init__(self, limit, free_quota=0, unit_price=DEFAULT_UNIT_PRICE):
+    def __init__(self, limit, free_quota=0, unit_price=DEFAULT_UNIT_PRICE,
+                 max_calls=DEFAULT_MAX_CALLS):
         self.limit = limit
-        self.used = 0
+        self.used = 0                  # 已發出的搜尋次數（只有成功回應才數得到）
+        self.calls = 0                 # ⚠️ 呼叫嘗試次數，成功與否都數
+        self.max_calls = max_calls
         self.free_quota = free_quota
         self.unit_price = unit_price
+
+    def attempt(self):
+        """每次呼叫 API 前都要記一筆，⚠️ 不論結果。
+
+        為什麼不能只數搜尋次數：spend() 只在拿到回應時才累加，所以任何「持續失敗」的
+        情境（gcloud 沒裝、配額用完一直 429、模型每次都不搜）下 used 永遠是 0，
+        exhausted() 永遠 False，而 run() 的 while True 沒有別的出口——這道保險
+        剛好在它唯一該擋的場景失效。ERR_NOSEARCH 更糟：那是【已計費的 200 回應】，
+        會變成無上限的付費迴圈。
+        """
+        self.calls += 1
 
     def spend(self, n):
         self.used += n
 
     def exhausted(self):
-        return self.limit > 0 and self.used >= self.limit
+        if self.limit > 0 and self.used >= self.limit:
+            return True
+        return self.max_calls > 0 and self.calls >= self.max_calls
 
     def note(self):
         billable = max(0, self.used - self.free_quota)
         cost = billable * self.unit_price
         cap = self.limit if self.limit > 0 else "∞"
+        ccap = self.max_calls if self.max_calls > 0 else "∞"
+        tail = f"、呼叫 {self.calls}/{ccap} 次"
         if self.free_quota:
             return (f"搜尋 {self.used}/{cap} 次"
-                    f"（免費 {self.free_quota}/月，超出約 ${cost:.2f}）")
-        return f"搜尋 {self.used}/{cap} 次（約 ${cost:.2f}）"
+                    f"（免費 {self.free_quota}/月，超出約 ${cost:.2f}）{tail}")
+        return f"搜尋 {self.used}/{cap} 次（約 ${cost:.2f}）{tail}"
 
 
 # --- 與 server 溝通 ---------------------------------------------------------
@@ -438,7 +493,8 @@ def run(args, client, budget):
     tally = {"success": 0, "failed": 0, "rate_limited": 0, SRC_CHUNK: 0, SRC_TEXT: 0}
     while True:
         if budget.exhausted():
-            print(f"已達搜尋上限（{budget.note()}），結束。要繼續請調高 --max-searches。")
+            print(f"已達上限（{budget.note()}），結束。"
+                  f"要繼續請調高 --max-searches / --max-calls。")
             return tally
 
         try:
@@ -459,7 +515,7 @@ def run(args, client, budget):
         stopped = fatal = False
         for task in batch:
             if budget.exhausted():
-                print(f"  已達搜尋上限，本批剩餘放回。{budget.note()}")
+                print(f"  已達上限，本批剩餘放回。{budget.note()}")
                 stopped = True
                 break
             r, fatal = crawl_task(task, args.backend, args.model, budget)
@@ -553,6 +609,10 @@ def main():
                          "計費按搜尋次數，而【實測一個任務會發 4~11 次搜尋、平均約 7 次】"
                          "（2026-08-24 於 Vertex 量測），所以 300 大約只夠 40 筆任務。"
                          "預設刻意設小；要跑整批請顯式加大")
+    ap.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS,
+                    help=f"最多呼叫 API 幾次就停（0=不限，預設 {DEFAULT_MAX_CALLS}）。"
+                         f"⚠️ 與 --max-searches 是兩道獨立保險：搜尋次數只有拿到回應"
+                         f"才數得到，持續失敗時擋不住無限迴圈")
     ap.add_argument("--free-quota", type=int, default=0,
                     help="每月免費搜尋次數，只用來把 log 裡的花費估算算對。"
                          "⚠️ 預設 0——Vertex 沒有免費 grounding 額度"
@@ -576,7 +636,8 @@ def main():
 
     worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}-m"
     client = Client(args.server, args.token, worker_id)
-    budget = Budget(args.max_searches, args.free_quota, args.unit_price)
+    budget = Budget(args.max_searches, args.free_quota, args.unit_price,
+                    args.max_calls)
     print(f"gemini_worker {worker_id} → {args.server}  {args.backend.describe()}  "
           f"model={args.model} batch={args.batch} "
           f"max_searches={args.max_searches or '∞'}")

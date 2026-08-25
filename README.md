@@ -483,6 +483,9 @@ python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
 ```bash
 --model gemini-3.7-flash  # ⚠️ gemini-2.5-* / 2.0-flash 對新專案已 404 下架，退不回舊型號
 --max-searches 300        # ⚠️ 不是任務數，是搜尋次數（見下）。0=不限
+--max-calls 200           # ⚠️ 第二道保險：呼叫次數上限。搜尋次數只有「拿到回應」才數
+                          #   得到，所以 gcloud 沒裝／一直 429／模型每次都不搜這類
+                          #   持續失敗下它永遠是 0，擋不住無限迴圈
 --free-quota 0            # ⚠️ Vertex 沒有免費 grounding 額度；只影響 log 的花費估算
 --unit-price 0.014        # 每次搜尋單價，請以實際帳單校正
 --batch 10 --delay 1      # 沒有反爬顧慮，可以比 google_worker 快很多
@@ -622,6 +625,7 @@ service account，selector 才會出現。
 python3 -m mops.gemini_benchmark --dry-run     # 不呼叫 API，看抽樣組成與預估花費
 python3 -m mops.gemini_benchmark -n 5          # 煙霧測試：驗連得上、CSV 續跑正常
 python3 -m mops.gemini_benchmark -n 200        # 真的跑（約 800~2,200 次搜尋）
+                                              #   預設 --max-searches 2500 涵蓋高標
 python3 -m mops.gemini_benchmark --report-only # 只根據既有 CSV 重印報表
 ```
 

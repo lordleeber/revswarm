@@ -140,6 +140,7 @@ def measure_one(row, backend, model, budget, retries=2, retry_sleep=8.0):
                              row["roc_year"], row["roc_month"])
     payload = err = None
     for attempt in range(retries + 1):
+        budget.attempt()          # ⚠️ 重試也算一次呼叫（見 gw.Budget.attempt）
         payload, err = gw.call_gemini(prompt, backend, model=model)
         if err != gw.ERR_RETRY:
             break
@@ -290,10 +291,22 @@ def report(records, budget=None):
 
 
 def read_csv(path):
+    """
+    讀結果 CSV，並依 (股票,年,月) 去重、只保留最後一列。
+
+    ⚠️ 去重不可省：load_done() 只認 status='ok'，所以 nosearch/error 的列下次會被重試、
+    再 append 一次。report() 是逐列計數的，同一筆任務就會被算兩次——樣本 N 與
+    「排除 N 筆」會隨每次續跑往上飄（ok 的統計本身沒錯，但標題數字失真）。
+    取最後一列＝取該筆最新的結果。
+    """
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    latest = {}
+    for r in rows:
+        latest[_key(r)] = r          # 後面的覆蓋前面的
+    return list(latest.values())
 
 
 
@@ -317,8 +330,13 @@ def main():
     ap.add_argument("--model", default=gw.DEFAULT_MODEL)
     # ⚠️ 實測一個任務會發 4~11 次搜尋、平均約 7（2026-08-24 於 Vertex 量測），
     # 所以 200 筆抽樣大約要 1,400 次搜尋。1500 是照這個算出來的，不是隨手填的。
-    ap.add_argument("--max-searches", type=int, default=1500,
-                    help="搜尋次數上限（⚠️ 不是任務數；一個任務平均約 7 次）。0=不限")
+    # 實測每筆 4~11 次搜尋，200 筆的高標是 2,200——上限取 2500 才不會在正常情況下
+    # 提前收工（提前停不會壞資料、可續跑，但會讓報表樣本不足而誤導）。
+    ap.add_argument("--max-searches", type=int, default=2500,
+                    help="搜尋次數上限（⚠️ 不是任務數；一個任務 4~11 次）。0=不限")
+    ap.add_argument("--max-calls", type=int, default=0,
+                    help="最多呼叫 API 幾次就停（0=不限）。預設不限是因為本腳本的呼叫數"
+                         "本來就被 -n 綁死；worker 那邊才需要它擋無限迴圈")
     ap.add_argument("--free-quota", type=int, default=0,
                     help="⚠️ 預設 0：Vertex 沒有免費 grounding 額度")
     ap.add_argument("--unit-price", type=float, default=gw.DEFAULT_UNIT_PRICE,
@@ -379,10 +397,11 @@ def main():
     backend = gw.make_backend(args)
     print(f"  後端：{backend.describe()}  model={args.model}")
 
-    budget = gw.Budget(args.max_searches, args.free_quota, args.unit_price)
+    budget = gw.Budget(args.max_searches, args.free_quota, args.unit_price,
+                       args.max_calls)
     for i, row in enumerate(todo, 1):
         if budget.exhausted():
-            print(f"\n已達搜尋上限（{budget.note()}），停止。"
+            print(f"\n已達上限（{budget.note()}），停止。"
                   f"已完成的結果都在 {args.out}，調高 --max-searches 後重跑會續打。")
             break
         rec = measure_one(row, backend, args.model, budget,

@@ -104,6 +104,41 @@ class TestResumeCache(unittest.TestCase):
         self.assertTrue(lines[0].startswith("stock_id"))
 
 
+class TestReadCsvDedupes(unittest.TestCase):
+    """⚠️ load_done() 只認 status='ok'，所以 nosearch/error 的列下次會被重試並再
+    append 一次。report() 逐列計數，同一筆會被算兩次——樣本 N 會隨續跑往上飄。"""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        os.unlink(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def _put(self, status, date=""):
+        gb.append_row(self.path, dict(
+            _row("2330", 109, 1), status=status, gemini_date=date,
+            gemini_source="", searches=1, raw_title=""))
+
+    def test_keeps_only_latest_row_per_key(self):
+        self._put("error")                       # 第一次失敗
+        self._put("ok", "2020-02-10")            # 續跑成功
+        rows = gb.read_csv(self.path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ok")   # 取最後一列
+
+    def test_report_sample_count_does_not_inflate(self):
+        self._put("nosearch")
+        self._put("ok", "2020-02-10")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gb.report(gb.read_csv(self.path))
+        self.assertIn("樣本 1 筆", buf.getvalue())
+        self.assertNotIn("排除", buf.getvalue())
+
+
 # --- 逐筆量測的狀態分類 -----------------------------------------------------
 class TestMeasureOne(unittest.TestCase):
     def setUp(self):
@@ -171,6 +206,7 @@ class TestMeasureOne(unittest.TestCase):
         b = gw.Budget(0)
         r = gb.measure_one(_row("2330", 109, 1), _backend(), "m", b)
         self.assertEqual((r["searches"], b.used), (3, 3))
+        self.assertEqual(b.calls, 1)          # 呼叫次數也要記（擋無限迴圈用）
 
 
 # --- 報表統計 ---------------------------------------------------------------

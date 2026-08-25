@@ -305,6 +305,97 @@ class TestVertexBackend(unittest.TestCase):
         self.assertEqual(err, gw.ERR_FATAL)
 
 
+class TestFatalMisconfiguration(unittest.TestCase):
+    """設定錯誤必須 fatal。判成 retry 的話 worker 會無聲空轉——這正是 code review
+    抓到的核心問題：錯誤分類太寬鬆 + budget 只在成功時累加 = 無上限的付費迴圈。"""
+
+    def test_missing_gcloud_is_fatal_not_retry(self):
+        """⚠️ FileNotFoundError 是 OSError 子類，會被 call_gemini 最後那個
+        except OSError 當成 ERR_RETRY 吃掉。gcloud 沒裝時每一筆都會這樣。"""
+        b = gw.VertexBackend("p", gcloud="/nonexistent/gcloud")
+        with contextlib.redirect_stderr(io.StringIO()):
+            _, err = gw.call_gemini("q", b)
+        self.assertEqual(err, gw.ERR_FATAL)
+
+    def test_gcloud_timeout_is_fatal_not_traceback(self):
+        """subprocess.TimeoutExpired 沒人接的話會直接 traceback 出 run()。"""
+        import subprocess
+
+        class _Slow(gw.VertexBackend):
+            def token(self, force=False):
+                raise subprocess.TimeoutExpired("gcloud", 60)
+        with contextlib.redirect_stderr(io.StringIO()):
+            _, err = gw.call_gemini("q", _Slow("p"))
+        self.assertEqual(err, gw.ERR_FATAL)
+
+    def test_403_permission_denied_variants_are_fatal(self):
+        """--project 打錯／缺 aiplatform.user 時 Vertex 實際回的字樣。"""
+        for body in (b'{"error":{"status":"PERMISSION_DENIED"}}',
+                     b'{"error":{"message":"Permission \'aiplatform.endpoints.predict\''
+                     b' denied on resource"}}',
+                     b'{"error":{"message":"caller does not have permission"}}'):
+            with _HTTPPatch(_http_error(403, body)), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                _, err = gw.call_gemini("q", _backend())
+            self.assertEqual(err, gw.ERR_FATAL, body)
+
+    def test_404_retired_model_is_fatal(self):
+        """endpoint 是固定組出來的，404 只可能是型號打錯或已退役（2.5-* 就是）。"""
+        with _HTTPPatch(_http_error(404, b'no longer available to new users')), \
+             contextlib.redirect_stderr(io.StringIO()):
+            _, err = gw.call_gemini("q", _backend())
+        self.assertEqual(err, gw.ERR_FATAL)
+
+
+class TestBudgetStopsOnPersistentFailure(unittest.TestCase):
+    """⚠️ spend() 只在拿到回應時才累加，所以持續失敗時 used 永遠是 0。
+    沒有呼叫次數上限的話 run() 的 while True 沒有出口。"""
+
+    def setUp(self):
+        self._call, self._time, self._random = gw.call_gemini, gw.time, gw.random
+        gw.time, gw.random = _FakeTime(), _FakeRandom()
+
+    def tearDown(self):
+        gw.call_gemini, gw.time, gw.random = self._call, self._time, self._random
+
+    def test_attempts_counted_even_when_call_fails(self):
+        gw.call_gemini = lambda *a, **k: (None, gw.ERR_RETRY)
+        b = gw.Budget(0, max_calls=3)
+        for _ in range(3):
+            gw.crawl_task(TASK, _backend(), gw.DEFAULT_MODEL, b)
+        self.assertEqual((b.used, b.calls), (0, 3))
+        self.assertTrue(b.exhausted())
+
+    def test_nosearch_loop_terminates(self):
+        """ERR_NOSEARCH 是【已計費的 200 回應】，不擋就是無上限的付費迴圈。"""
+        gw.call_gemini = lambda *a, **k: (None, gw.ERR_NOSEARCH)
+        b = gw.Budget(0, max_calls=5)
+        client = _FakeClient([_tasks(3), _tasks(3), _tasks(3), _tasks(3)])
+        args = _Args()
+        args.once = False
+        gw.run(args, client, b)          # 不會無限迴圈
+        self.assertTrue(b.exhausted())
+
+    def test_max_calls_zero_means_unlimited(self):
+        b = gw.Budget(0, max_calls=0)
+        b.calls = 10 ** 6
+        self.assertFalse(b.exhausted())
+
+
+class TestChunkPathRequiresAnchor(unittest.TestCase):
+    def test_chunk_without_anchor_does_not_become_m_src(self):
+        """⚠️ chunks 是把 4~11 次搜尋的所有標題串起來的，混著別家公司。
+        錨點沒中時 revlib.parse 會退回「窗內第一個日期」，可能把南亞的日期
+        標成台塑的 m_src（高信任層）——比標成 m_txt 更糟。"""
+        p = _payload(text="", chunks=["南亞 109年1月營收 2020年2月10日 - MoneyDJ"])
+        self.assertIsNone(gw.extract(p, "台塑", 109, 1))
+
+    def test_chunk_with_correct_anchor_still_works(self):
+        p = _payload(text="", chunks=["南亞 109年1月營收\n台塑 109年1月營收 2020年2月10日"])
+        date, src, _ = gw.extract(p, "台塑", 109, 1)
+        self.assertEqual((date, src), ("2020-02-10", gw.SRC_CHUNK))
+
+
 class TestMakeBackend(unittest.TestCase):
     class _Args:
         project = None
