@@ -43,6 +43,7 @@ import csv
 import datetime
 import os
 import random
+import re
 import sqlite3
 import statistics
 import sys
@@ -58,7 +59,11 @@ DEFAULT_OUT = "gemini_benchmark.csv"
 
 FIELDS = ["stock_id", "name", "roc_year", "roc_month",
           "mops_date", "yahoo_date", "gemini_date", "gemini_source",
-          "status", "searches", "raw_title"]
+          "status", "searches", "raw_title", "search_queries"]
+
+# search_queries 用它分隔。⚠️ 不用逗號：查詢字串本身就常含逗號，csv 引號雖然擋得住，
+# 但人用 grep/Excel 拆欄時會拆錯。管線符號在中文查詢裡幾乎不會出現。
+QUERY_SEP = " | "
 
 
 # --- 抽樣 -------------------------------------------------------------------
@@ -135,7 +140,8 @@ def measure_one(row, backend, model, budget, retries=2, retry_sleep=8.0):
     ⚠️ nosearch 與 error 絕不可以併進「gemini 沒找到」：那會把「沒查成功」算成
     「查了但沒有」，直接灌水命中率的分母。這是 worker 那條戒律在報表端的對應。
     """
-    out = dict(row, gemini_date="", gemini_source="", searches=0, raw_title="")
+    out = dict(row, gemini_date="", gemini_source="", searches=0, raw_title="",
+               search_queries="")
     prompt = gw.build_prompt(row["stock_id"], row["name"],
                              row["roc_year"], row["roc_month"])
     payload = err = None
@@ -158,6 +164,11 @@ def measure_one(row, backend, model, budget, retries=2, retry_sleep=8.0):
 
     budget.spend(len(payload["searches"]))
     out["searches"] = len(payload["searches"])
+    # ⚠️ 存原文，不只存次數。查詢字串是我們【控制不到】的東西——grounding 由模型自己
+    # 決定下什麼、下幾次（不像 yahoo/google worker 是我們自己組查詢）。一致率不好時，
+    # 只有這欄能分辨「模型下的查詢本身就爛」還是「查對了但抽錯日期」，也是唯一能驗證
+    # 「它到底有沒有用民國年／西元年兩種」的證據。跑完才想加就得重花一次錢。
+    out["search_queries"] = QUERY_SEP.join(payload["searches"])
     out["status"] = "ok"
     hit = gw.extract(payload, row["name"], row["roc_year"], row["roc_month"])
     if hit:
@@ -272,6 +283,8 @@ def report(records, budget=None):
 
     # --- 錯誤樣本，人工看得到才修得動 ---
     wrong = [r for r in hits if r["gemini_date"] != r["mops_date"]]
+    _report_queries(ok)
+
     if wrong:
         print(f"\n【不一致清單】前 15 筆（共 {len(wrong)}）")
         for r in wrong[:15]:
@@ -279,6 +292,10 @@ def report(records, budget=None):
             print(f"  {r['stock_id']} {r['name']:<6} {r['roc_year']}/{r['roc_month']:<2}"
                   f"  MOPS {r['mops_date']}  gemini {r['gemini_date']} ({d:+d}d)"
                   f"  [{r['gemini_source']}]  {r['raw_title'][:40]}")
+            # ⚠️ 把模型實際下的查詢一起印出來：判斷「查錯」還是「抽錯」全靠這個。
+            qs = (r.get("search_queries") or "").split(QUERY_SEP)
+            for q in [q for q in qs if q][:4]:
+                print(f"        ↳ {q}")
 
     if budget:
         print(f"\n【花費】{budget.note()}")
@@ -288,6 +305,31 @@ def report(records, budget=None):
     print("   筆 failed 是冷門股與舊月份，表現只會更差。")
     print("   要放量的門檻建議：整體一致率 >= yahoo 對照組，且 m_txt 那層單獨也站得住。")
     print("=" * 72)
+
+
+def _report_queries(ok):
+    """模型實際下了什麼查詢的統計。
+
+    這是本 worker 與 yahoo/google worker 最根本的差別：查詢字串不是我們組的。
+    「絕不加『營收』二字」那條實測教訓在這裡管不到，只能事後量。
+    """
+    withq = [r for r in ok if (r.get("search_queries") or "").strip()]
+    if not withq:
+        return
+    counts = [int(r["searches"]) for r in ok if str(r.get("searches", "")).isdigit()]
+    print("\n【模型實際下的搜尋查詢】⚠️ 這是模型自己決定的，我們控制不到")
+    if counts:
+        print(f"  每筆查詢次數  中位數 {statistics.median(counts):.0f}／"
+              f"平均 {statistics.fmean(counts):.1f}／最多 {max(counts)}"
+              f"（計費按這個，不是按任務數）")
+    qs = [q for r in withq for q in (r["search_queries"] or "").split(QUERY_SEP) if q]
+    roc = sum(1 for q in qs if re.search(r"\b1[01]\d\s*年", q))
+    ad = sum(1 for q in qs if re.search(r"\b20\d{2}\s*年", q))
+    rev = sum(1 for q in qs if "營收" in q)
+    print(f"  共 {len(qs)} 個查詢：含民國年 {_pct(roc, len(qs))}、"
+          f"含西元年 {_pct(ad, len(qs))}、含「營收」二字 {_pct(rev, len(qs))}")
+    print("  （「營收」佔比高值得注意：yahoo/google 實測那兩個字會害 recall，"
+          "但這裡我們擋不掉）")
 
 
 def read_csv(path):
