@@ -4,7 +4,7 @@
 revswarm 共用核心：月營收公布日的「期望窗」與 Yahoo 搜尋頁解析。
 
 server 與 worker 都依賴這裡的窗邏輯，確保「worker 抓到的日期」與
-「server 存 success 前的再驗證」用的是同一套規則（見 todo.txt 2.4 / 5.5）。
+「server 存 success 前的再驗證」用的是同一套規則（見 README「踩過的雷 → 窗過濾」）。
 
 純函式、只用標準庫，沒有網路副作用；worker 的抓取(curl)放在 yahoo_worker.py。
 """
@@ -76,7 +76,7 @@ def iter_roc_months(start=ROC_START, end=ROC_END):
 PRE_PUBLIC_GRACE_MONTHS = 1
 
 
-# --- 期望窗（todo.txt 2.4）-------------------------------------------------
+# --- 期望窗（README「踩過的雷 → 窗過濾」）---------------------------------
 def expected_window(roc_year, roc_month):
     """
     月營收依規定次月10日前申報，遇假日順延。正確公布日一定落在
@@ -111,7 +111,7 @@ def _iter_dates(html):
 
 def _anchor_offsets(html, name, roc_year, roc_month):
     r"""
-    精確名稱標題錨點的字元位置（todo.txt 2.5：避免「統一」吃到「統一超」）。
+    精確名稱標題錨點的字元位置（README「踩過的雷 → 解析陷阱」：避免「統一」吃到「統一超」）。
     鎖定「{名稱} {年}年{月}月」，名稱後須緊接空白或數字。民國/西元年都接受。
 
     年份必須是「這個任務的年」（民國 roc_year 或西元 roc_year+1911）。早期版本這裡寫
@@ -180,7 +180,8 @@ _ISO = re.compile(r'^(20\d{2})-(\d{1,2})-(\d{1,2})$')
 
 def validate_date(date_str, roc_year, roc_month):
     """
-    server 收到 worker 回報的 success 日期時，用同一套窗再驗一次（todo.txt 5.5）。
+    server 收到 worker 回報的 success 日期時，用同一套窗再驗一次
+    （三道防污染的第三道，見 README「踩過的雷 → 窗過濾」）。
     通過回傳正規化 'YYYY-MM-DD'，否則 None。
     """
     if not date_str:

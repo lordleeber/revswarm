@@ -24,6 +24,10 @@ mops_baseline.csv
 mops_baseline.csv.done
 mops_validation.csv
 
+# Gemini grounding 對照實驗的逐筆結果（可由 gemini_benchmark.py 重跑，但重跑要再付費，
+# 所以想留就自己備份到別處；不進版控是因為它會隨模型版本變動、不是穩定基準）
+gemini_benchmark.csv
+
 # DB 備份快照（mops_fill.py / mops_overwrite.py 執行前自動備份，勿進版控）
 *.bak-*
 

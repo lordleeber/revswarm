@@ -5,7 +5,7 @@ revswarm google_worker：向 server 租 engine='google' 的任務、用 Playwrig
 Chrome」查 Google 搜尋、回報結果。用來二次補搜 yahoo_worker.py（爬 Yahoo）救不回的 failed 任務
 ——手動抽測 10 筆真實 failed，Google 命中 9 筆。
 
-為什麼是 Playwright 而不是 API 或 curl（三條死路，別重走，見 todo.txt 9.2）：
+為什麼是 Playwright 而不是 API 或 curl（三條死路，別重走，詳見下方對照表與 README）：
   ✗ Google Custom Search JSON API：已對新客戶關閉（2027-01 全面停用），一律回
     403 "This project does not have the access to Custom Search JSON API."
     換金鑰/換專案都無效。
