@@ -801,9 +801,6 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 標記替低信任的網址背書。`groundingChunks` 自己給的則是 Google 的快取轉址，有時效、過期
 就打不開。所以 `URL:` 跟 `TITLE:` 走同一條規則：**只在 `m_txt` 這層取**。
 
-⚠️ **既有 ~12 萬筆 success 這兩欄都是 NULL，補不回來**——當初沒存。查詢時
-「NULL = 不知道」，不要把它當成「沒有出處」或「未通過驗證」的結論。
-
 ⚠️ **凡是改寫 `announce_date` 的敘述，都必須把 `url` / `verified` 一起清成 NULL**。
 `url` 記的是「舊日期」出自哪一篇、`verified` 是對「舊日期」蓋的章；改了日期卻留著它們，
 就變成一個看起來有出處、有人驗過的新日期——那是這兩欄最糟的失效方式（有值、且是錯的，
@@ -818,6 +815,31 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 蓋章的判準一律是**日期真的一致**，不是「有跑過這一筆」。少了這個條件，`verified`
 就退化成「有人碰過」——欄位裡照樣有值，只是不再代表任何事。日期不一致的會被回報成
 `mismatch` 但**不蓋章也不改資料**：那是兩個來源打架的訊號，值得人逐筆去看。
+
+### ⚠️ `verified='mops'` 不全是「兩個獨立來源同意」
+
+```
+verified='mops' 共 2,376 筆
+  ├─ source='mops'      923 筆  ← 日期本來就是從 MOPS 灌進來的，這是自我驗證
+  └─ source 為 q_*/g_*  1,453 筆 ← 爬到的值被官方紀錄獨立確認，這才有資訊量
+       q_roc 1,308／q_ad 144／q_ad_manual 1
+```
+
+`mops/mops_fill.py` 與 `mops/mops_overwrite.py` 會把日期直接寫成 MOPS 的值並標
+`source='mops'`。那批再被 `stamp_verified --from mops` 蓋章，就成了「MOPS 同意 MOPS」
+——欄位裡有值，但沒有任何獨立確認發生過。而且每跑一次 `mops_overwrite` 這個比例就往上
+走一點（那 923 筆裡有 3 筆就是這樣來的），所以它只會愈來愈需要被指出來。
+
+要算真正被獨立驗證的量，一律排除它們：
+
+```sql
+SELECT COUNT(*) FROM tasks WHERE verified='mops' AND source != 'mops';
+```
+
+⚠️ **分母也要看清楚：1,453 / 122,932 success = 1.2%。** 這份資料的絕大多數從來沒有被
+第二個來源看過，`verified IS NULL` 是常態而不是例外——那是「不知道」，不是「驗過但沒過」。
+`verified` 這欄最危險的用法是拿它當品質背書：「我們有驗證機制」跟「這份資料被驗證過」
+是兩件不同的事。
 
 ```bash
 # server 要跑著（蓋章走 /verify，server 是這個 DB 的唯一寫入者）
