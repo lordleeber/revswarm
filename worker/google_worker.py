@@ -185,6 +185,25 @@ class Searcher:
             return f"讀不到 DOM：{e!r}"
         return f"頁面出現攔阻字樣：{url[:90]}"
 
+    def result_links(self):
+        """
+        取當前 SERP 上的 (連結文字, 網址) 清單，給 crawl_task 找出處用。
+
+        ⚠️ 刻意做成「search() 之後另外問一次」而不是讓 search() 多回一個值：
+        search() 的三元組回傳被主迴圈與測試四處對拆，為了一個附屬資訊改它的形狀
+        不划算。這裡讀的是 search() 剛導覽完的同一頁，不會再發任何請求。
+
+        取不到就回 []——出處是附屬資訊，絕不可以因為它失敗而影響一筆任務的判定。
+        """
+        if self._page is None:
+            return []
+        try:
+            return self._page.eval_on_selector_all(
+                SERP_SELECTOR + " a[href^='http']",
+                "els => els.map(e => [e.innerText.slice(0, 120), e.href])")
+        except Exception:
+            return []
+
     def search(self, query, timeout=NAV_TIMEOUT_MS):
         """
         回傳 (text, ok, reason)：
@@ -258,6 +277,13 @@ def fetch_google(query, timeout=NAV_TIMEOUT_MS):
     return SEARCHER.search(query, timeout=timeout)
 
 
+def google_links():
+    """對模組全域的 SEARCHER 要當前頁的結果連結；沒有瀏覽器就回 []。"""
+    if SEARCHER is None:
+        return []
+    return SEARCHER.result_links()
+
+
 def blocked_now():
     """
     對模組全域的 SEARCHER 問「當前頁現在還停在壞頁嗎」（不導覽）。
@@ -308,12 +334,16 @@ def wait_until_unblocked(searcher, limit, poll=5.0):
 def crawl_task(task, per_query_sleep):
     """
     回傳 (result, stop_batch)：
-      result     = {id, status, date?, source?, title?}，status ∈ success|failed|rate_limited
+      result     = {id, status, date?, source?, title?, url?}，status ∈ success|failed|rate_limited
       stop_batch = 是否該立刻停止導覽、把畫面留給人處理
 
     與 yahoo_worker.py 的 crawl_task 有三處差異：
       - 查詢順序：西元年（g_ad）優先，民國年（g_roc）補第二（見模組開頭 1.）
       - source 標 g_* 而非 q_*：讓 /status 與匯出資料看得出這筆是 Google 補搜來的
+      - ⚠️ url 的可信度比 yahoo 低一階：這條路解析的是 inner_text（整頁純文字，見模組
+        開頭 3.），日期的字元位置對不到 DOM 裡的連結，沒辦法像 yahoo 那樣靠位置鄰近
+        綁定，只能用「標題含公司名」去挑（見 revlib.pick_url_by_name）。當線索用，
+        不要當成已驗證的出處。
       - ⚠️ 多回一個 stop_batch（yahoo_worker.py 只回 dict）：Google 的驗證要人工解，
         撞到就必須「立刻停止導覽」，否則那個 goto 會把使用者正在解的驗證頁蓋掉。
         Yahoo 那邊被擋不需要人介入，所以沒這問題。
@@ -351,7 +381,8 @@ def crawl_task(task, per_query_sleep):
         if hit:
             date, title = hit
             return {"id": task["id"], "status": "success",
-                    "date": date, "source": variant, "title": title}, False
+                    "date": date, "source": variant, "title": title,
+                    "url": revlib.pick_url_by_name(google_links(), name)}, False
     # 走到這：兩種查詢都沒中窗內日期。
     if saw_rate_limited or not tried_ok:
         # 有任一查詢被擋（可能正好漏掉命中）→ 保守放回重試，不判 failed。

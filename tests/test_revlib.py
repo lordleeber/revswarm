@@ -159,3 +159,80 @@ class TestTitleYearConflict(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestUrlProvenance(unittest.TestCase):
+    """來源網址：解 Yahoo 轉址、往回綁定、格式把關（見 revlib「來源網址」段）。"""
+
+    def test_unwrap_yahoo_redirect(self):
+        u = ("https://r.search.yahoo.com/_ylt=AwrPqh1D;_ylu=Y29sbwNzZzMEcG9zAzM/"
+             "RV=2/RE=1788863555/RO=10/"
+             "RU=https%3a%2f%2fwww.moneydj.com%2fkmdj%2fnews%2fnewsviewer.aspx%3fa%3dabc"
+             "/RK=2/RS=xxxx-")
+        self.assertEqual(
+            R.unwrap_url(u),
+            "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc")
+
+    def test_unwrap_leaves_plain_url_alone(self):
+        self.assertEqual(R.unwrap_url("https://example.com/a?b=1"),
+                         "https://example.com/a?b=1")
+
+    def test_clean_url_scheme_whitelist(self):
+        self.assertIsNone(R.clean_url("javascript:alert(1)"))
+        self.assertIsNone(R.clean_url("//example.com"))
+        self.assertIsNone(R.clean_url(None))
+        self.assertIsNone(R.clean_url(12345))
+        self.assertEqual(R.clean_url("  https://a.tw/x  "), "https://a.tw/x")
+
+    def test_clean_url_truncates(self):
+        long = "https://a.tw/" + "x" * 1000
+        self.assertEqual(len(R.clean_url(long)), R.MAX_URL)
+
+    def test_nearest_url_looks_backward_not_forward(self):
+        # ⚠️ 這條是整個機制的關鍵：連結在日期【前面】。往前找會抓到下一筆結果的
+        # 連結，看起來像有效出處但完全指錯篇——比沒有 URL 更糟。
+        html = ('<a href="https://right.tw/a">台塑 111年10月營收</a>'
+                '<p>2022年11月8日 · 台塑10月營收</p>'
+                '<a href="https://wrong.tw/b">南亞 111年10月營收</a>')
+        hit = R.parse_detail(html, "台塑", 111, 10)
+        self.assertIsNotNone(hit)
+        self.assertEqual(R.nearest_url(html, hit[2]), "https://right.tw/a")
+
+    def test_nearest_url_none_on_plain_text(self):
+        # google 的 inner_text、gemini 的模型回覆都沒有標籤：回 None 是預期行為。
+        self.assertIsNone(R.nearest_url("台塑 111年10月 2022-11-08", 5))
+        self.assertIsNone(R.nearest_url("", 0))
+        self.assertIsNone(R.nearest_url("<a href='x'>y</a>", None))
+
+    def test_nearest_url_ignores_links_after_offset(self):
+        html = '<p>2022年11月8日</p><a href="https://after.tw/a">後面的</a>'
+        self.assertIsNone(R.nearest_url(html, 5))
+
+    def test_parse_detail_offset_and_parse_stays_two_tuple(self):
+        html = '<a href="https://x.tw/a">台塑 111年10月</a><p>2022-11-08</p>'
+        d = R.parse_detail(html, "台塑", 111, 10)
+        self.assertEqual(d[0], "2022-11-08")
+        self.assertEqual(html[d[2]:d[2] + 10], "2022-11-08")
+        # 既有呼叫端與測試都靠這個兩元組，不可以被 parse_detail 帶著改形狀。
+        self.assertEqual(R.parse(html, "台塑", 111, 10), (d[0], d[1]))
+
+    def test_parse_and_parse_detail_agree_on_miss(self):
+        self.assertIsNone(R.parse_detail("沒有日期", "台塑", 111, 10))
+        self.assertIsNone(R.parse("沒有日期", "台塑", 111, 10))
+
+    def test_pick_url_by_name(self):
+        links = [("Yahoo奇摩股市", "https://tw.stock.yahoo.com/"),
+                 ("台塑 111年10月營收 - MoneyDJ", "https://moneydj.com/a"),
+                 ("台塑化 111年10月營收", "https://other.tw/b")]
+        self.assertEqual(R.pick_url_by_name(links, "台塑"), "https://moneydj.com/a")
+
+    def test_pick_url_by_name_returns_none_rather_than_guess(self):
+        # 挑不到就回 None。退而求其次挑第一個連結幾乎一定是錯的（多半是頁面導覽列）。
+        links = [("Yahoo奇摩股市", "https://tw.stock.yahoo.com/")]
+        self.assertIsNone(R.pick_url_by_name(links, "台塑"))
+        self.assertIsNone(R.pick_url_by_name([], "台塑"))
+        self.assertIsNone(R.pick_url_by_name(links, ""))
+
+    def test_pick_url_by_name_skips_bad_scheme(self):
+        links = [("台塑 111年10月", "javascript:void(0)")]
+        self.assertIsNone(R.pick_url_by_name(links, "台塑"))

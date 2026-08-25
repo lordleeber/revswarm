@@ -646,3 +646,68 @@ class TestBackoffAndBlock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCrawlTaskUrl(unittest.TestCase):
+    """
+    出處網址：⚠️ 這條路的 url 比 yahoo 弱一階。解析的是 inner_text（純文字），
+    日期位置對不到 DOM 連結，只能靠「標題含公司名」去挑（revlib.pick_url_by_name）。
+    所以這裡測的重點是「挑不到就承認挑不到」，絕不退而求其次亂挑一個。
+    """
+
+    def setUp(self):
+        self._time, self._random, self._fetch, self._links = (
+            google_worker.time, google_worker.random,
+            google_worker.fetch_google, google_worker.google_links)
+        self._searcher = google_worker.SEARCHER
+        google_worker.time = _FakeTime()
+        google_worker.random = _FakeRandom()
+        google_worker.SEARCHER = None
+        google_worker.fetch_google = (
+            lambda q, timeout=google_worker.NAV_TIMEOUT_MS:
+            (_page_text("台積電", 109, 1), True, None))
+
+    def tearDown(self):
+        (google_worker.time, google_worker.random,
+         google_worker.fetch_google, google_worker.google_links) = (
+            self._time, self._random, self._fetch, self._links)
+        google_worker.SEARCHER = self._searcher
+
+    def _task(self):
+        return {"id": 1, "stock_id": "2330", "name": "台積電",
+                "roc_year": 109, "roc_month": 1}
+
+    def test_picks_link_whose_title_names_the_company(self):
+        google_worker.google_links = lambda: [
+            ("Yahoo奇摩股市", "https://tw.stock.yahoo.com/"),
+            ("台積電 109年1月營收 - MoneyDJ", "https://moneydj.com/a")]
+        r, _ = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertEqual(r["url"], "https://moneydj.com/a")
+
+    def test_no_matching_title_gives_none_rather_than_the_first_link(self):
+        google_worker.google_links = lambda: [
+            ("Yahoo奇摩股市", "https://tw.stock.yahoo.com/")]
+        r, _ = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertEqual(r["status"], "success")
+        self.assertIsNone(r["url"])
+
+    def test_link_harvest_failure_never_affects_the_verdict(self):
+        # 出處是附屬資訊。取連結時瀏覽器出事，不可以把一筆好好的 success 拖下水。
+        google_worker.google_links = lambda: []
+        r, _ = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["date"], "2020-02-10")
+        self.assertIsNone(r["url"])
+
+    def test_result_links_returns_empty_without_page(self):
+        self.assertEqual(google_worker.Searcher().result_links(), [])
+        self.assertEqual(google_worker.google_links(), [])   # SEARCHER is None
+
+    def test_result_links_swallows_browser_errors(self):
+        s = google_worker.Searcher()
+
+        class _Boom:
+            def eval_on_selector_all(self, *a):
+                raise RuntimeError("page crashed")
+        s._page = _Boom()
+        self.assertEqual(s.result_links(), [])

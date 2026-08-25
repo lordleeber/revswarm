@@ -54,6 +54,7 @@
 | `goodinfo/goodinfo_worker.py` | 補 goodinfo 的四板日期（上市/上櫃/興櫃/公開發行），拿到**已畢業公司的早年日期**，官方現況快照沒有 |
 | `mark_prelisting.py` | 用首次公開日把「公司當時還沒公開發行」的任務標成 `prelisting`；`--demote-success` 連上市前的假 success 一起降級（見「資料品質」）|
 | `mops/mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
+| `mops/stamp_verified.py` | 把「兩個獨立來源同意」的列蓋上 `verified` 欄（見「出處與驗證」）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
 **核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。worker 機器 `git clone` 本 repo 就能跑，不必額外安裝任何東西。
@@ -97,7 +98,8 @@ curl -s -H "Authorization: Bearer $REVSWARM_TOKEN" http://<SERVER_IP>:8000/stats
 | method | path | 說明 |
 |---|---|---|
 | POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），三支 worker 不會搶同一批；只收 `yahoo`\|`google`\|`gemini`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
-| POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?}]}`；status ∈ success/failed/rate_limited |
+| POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?,url?}]}`；status ∈ success/failed/rate_limited。`url` 是這個日期的出處，server 端會再驗一次格式（非 http/https 一律存 NULL）|
+| POST | `/verify` | `{by:"mops"\|"gemini", items:[{stock_id,roc_year,roc_month,date}]}`；**只有送上來的 date 與 DB 的 `announce_date` 一致才蓋 `verified`**，不一致回報成 `mismatch` 但不改資料。`by` 走白名單，其餘回 400（見「出處與驗證」）|
 | GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
 | GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
 | GET | `/healthz` | 存活探針（免 token）|
@@ -758,6 +760,58 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 - ⚠️ **非權威**：來源非官方、金額四捨五入到億/萬兩位，僅供**交叉校驗/研究參考**；要精確到元請用 MOPS 月營收。
 - 既有 DB 一次性回填（**不重爬**）：`python3 backfill_revenue.py`（先停 server、先備份；`--dry-run` 可預覽）。
   server 啟動時會自動 `ALTER TABLE` 補上這兩欄。
+
+## 出處與驗證（`url` / `verified`）
+
+兩個補在 `tasks` 上的欄位，回答兩個以前答不出來的問題：**這個日期是誰說的**、
+**有沒有第二個人也這麼說**。
+
+| 欄位 | 意義 |
+| --- | --- |
+| `url` | 這個 `announce_date` 是從哪一篇讀到的。worker 回報 success 時附上，server 端再驗一次格式（非 `http`/`https` 一律存 NULL）|
+| `verified` | 第二個獨立來源核對過並且**日期一致**才蓋章：`mops` \| `gemini`。NULL = 沒驗過（**不是**「驗過但錯」）|
+
+### 為什麼需要 `url`
+
+`raw_title` 只是一段佐證文字。事後想追「這個日期到底是哪一篇寫的」，就只能拿標題
+回頭再搜一次——而搜尋結果隨時在變。11.3 查 google 那批系統性偏早時就吃過這個虧：
+有標題、沒有出處，無法回去看原文，只能靠週末率、慣用申報日分布這些間接證據去推論。
+
+**三支 worker 的出處可信度不同，差一階就是差一階，別混用：**
+
+| worker | 怎麼拿到的 | 可信度 |
+| --- | --- | --- |
+| yahoo | 從 SERP 的 `<a href>` 讀出來，用日期的字元位置往回綁最近的那個連結（`revlib.nearest_url`）| **最硬**。頁面上客觀存在的連結，位置綁定 |
+| google | 解析的是 `inner_text`（整頁純文字），日期位置對不到 DOM 連結，只能用「標題含公司名」去挑（`revlib.pick_url_by_name`）| **弱一階**。只是線索，不保證就是那個日期的出處；挑不到寧可回 NULL 也不亂挑 |
+| gemini | 模型自報的 `URL:` 那行 | **弱一階**，而且是另一種弱：模型可能生一個不存在的網址。格式擋得掉、幻覺擋不掉 |
+
+⚠️ Yahoo 的結果連結全部包一層轉址（`r.search.yahoo.com/…/RU=<百分比編碼的原網址>/RK=…`），
+存轉址網址等於沒存：`_ylt` 是有時效的簽章、過期就 404，網址本身也看不出是哪一家媒體。
+`revlib.unwrap_url` 一律解回 `RU=` 裡那個真正的網址。
+
+⚠️ **既有 ~12 萬筆 success 這兩欄都是 NULL，補不回來**——當初沒存。查詢時
+「NULL = 不知道」，不要把它當成「沒有出處」或「未通過驗證」的結論。
+
+### 為什麼 `verified` 不是信心分數
+
+分數會逼我們發明一個沒有依據的數字。「有沒有第二個獨立來源同意」則是可查證的事實，
+而且可以事後補算。所以這欄存的是**誰同意**，不是**多有信心**。
+
+蓋章的判準一律是**日期真的一致**，不是「有跑過這一筆」。少了這個條件，`verified`
+就退化成「有人碰過」——欄位裡照樣有值，只是不再代表任何事。日期不一致的會被回報成
+`mismatch` 但**不蓋章也不改資料**：那是兩個來源打架的訊號，值得人逐筆去看。
+
+```bash
+# server 要跑著（蓋章走 /verify，server 是這個 DB 的唯一寫入者）
+python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000 --dry-run
+python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000
+
+# gemini 那條要先跑完對照實驗；只收「gemini 與 MOPS 都同意」的列
+python3 -m mops.stamp_verified --from gemini --server http://127.0.0.1:8000
+```
+
+跑完最值得看的數字是 **`mismatch`**，不是蓋章數。蓋章多但 `mismatch` 一堆，代表資料
+有系統性問題，不是「大部分都驗過了」。
 
 ## 資料品質
 

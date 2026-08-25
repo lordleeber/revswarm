@@ -11,6 +11,7 @@ server 與 worker 都依賴這裡的窗邏輯，確保「worker 抓到的日期�
 
 import os
 import re
+import urllib.parse
 
 
 # --- .env 自動載入 ---------------------------------------------------------
@@ -134,14 +135,17 @@ def _anchor_offsets(html, name, roc_year, roc_month):
     return [m.start() for m in pat.finditer(html)]
 
 
-def parse(html, name, roc_year, roc_month):
+def parse_detail(html, name, roc_year, roc_month):
     """
-    從 Yahoo 搜尋頁擷取該 (股票,月份) 的公布日。
+    parse() 的完整版：多回一個「命中的那個日期落在原文的哪個字元位置」。
 
-    回傳 (announce_date 'YYYY-MM-DD', matched_title_hint) 或 None。
+    回傳 (announce_date 'YYYY-MM-DD', matched_title_hint, offset) 或 None。
       - 只保留落在 expected_window 內的日期（窗過濾 → 0 髒資料）。
       - 若有精確名稱錨點，取「離錨點最近」的窗內日期；否則取第一個窗內日期。
     matched_title_hint 為錨點附近的一小段文字，作為 provenance 佐證。
+
+    拆出 offset 是為了 nearest_url——它要知道從哪裡開始往回找 <a href>，才能記錄
+    「這個日期是從哪一篇文章讀到的」。parse() 維持兩元組，既有呼叫端都不用改。
     """
     if not html:
         return None
@@ -160,7 +164,18 @@ def parse(html, name, roc_year, roc_month):
     else:
         off, date = cands[0]
         title = _clean_snippet(html[max(0, off - 40):off + 20])
-    return date, title
+    return date, title, off
+
+
+def parse(html, name, roc_year, roc_month):
+    """
+    從 Yahoo 搜尋頁擷取該 (股票,月份) 的公布日。回傳 (date, title) 或 None。
+
+    parse_detail 的兩元組版本。絕大多數呼叫端不需要 offset，只有要記來源網址的
+    yahoo_worker 用得到，所以完整版另外開一個函式，不動這裡的既有介面。
+    """
+    hit = parse_detail(html, name, roc_year, roc_month)
+    return (hit[0], hit[1]) if hit else None
 
 
 _TAG = re.compile(r'<[^>]+>')
@@ -172,6 +187,85 @@ def _clean_snippet(s):
     s = _TAG.sub('', s)
     s = _WS.sub(' ', s).strip()
     return s[:80]
+
+
+# --- 來源網址（provenance）--------------------------------------------------
+# 為什麼要存 URL：raw_title 只是一段佐證文字，事後想追「這個日期到底是哪一篇寫的」
+# 就只能靠關鍵字回頭再搜一次，而搜尋結果早就變了。11.3 查 google 那批系統性偏早時
+# 吃過這個虧——有標題、沒有出處，無法回去看原文（見 README「資料品質」）。
+#
+# ⚠️ Yahoo 的結果連結全部包一層轉址：
+#   https://r.search.yahoo.com/_ylt=.../RU=<百分比編碼的原網址>/RK=.../RS=...
+# 存轉址網址等於沒存：_ylt 是有時效的簽章、過期就 404，網址本身也看不出是哪一家媒體。
+# 所以一律解回 RU= 裡那個真正的網址。
+_YAHOO_RU = re.compile(r'/RU=(.*?)/RK=')
+_HREF = re.compile(r'<a\s[^>]*?href="(https?://[^"]+)"', re.I)
+MAX_URL = 500          # 存進 DB 前的長度上限（Yahoo 轉址網址本身就近 200 字元）
+
+
+def unwrap_url(u):
+    """Yahoo 轉址 → 原始網址；不是轉址的原樣回傳。"""
+    if not u:
+        return None
+    m = _YAHOO_RU.search(u)
+    if m:
+        u = urllib.parse.unquote(m.group(1))
+    return u
+
+
+def clean_url(u):
+    """
+    存進 DB 前的把關：必須是 http(s) 開頭、截到 MAX_URL。不合格回 None。
+
+    server 端也用這支再驗一次——url 跟 announce_date 一樣是 worker 送上來的，
+    不能因為「是自己人寫的 worker」就免驗（三道防污染的同一個道理）。
+    """
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u.startswith(("http://", "https://")):
+        return None
+    return u[:MAX_URL]
+
+
+def nearest_url(html, offset):
+    """
+    取 offset 之前「最近的一個 <a href="http...">」，當作這個日期的出處。
+
+    ⚠️ 一定要往回找、不能往前找：Yahoo 的一筆結果排成
+        <h3><a href=...>標題</a></h3> … <p>摘要（日期在這裡）</p>
+    連結永遠在日期前面。往前找會抓到「下一筆」結果的連結，張冠李戴——那比沒有 URL
+    更糟，因為它看起來像個有效的出處。
+
+    純文字（google_worker 的 inner_text、gemini 的模型回覆）沒有任何標籤，這裡會回
+    None。那是預期行為不是失敗，那兩支各有自己的取法。
+    """
+    if not html or offset is None:
+        return None
+    last = None
+    for m in _HREF.finditer(html, 0, offset):
+        last = m.group(1)
+    return clean_url(unwrap_url(last))
+
+
+def pick_url_by_name(links, name):
+    """
+    從 (連結文字, 網址) 清單裡挑出「標題含公司名」的第一個。google_worker 用。
+
+    ⚠️ 這比 nearest_url 弱一階，要知道自己在買什麼：Google 那條路解析的是整頁純文字
+    (inner_text)，日期的字元位置與 DOM 裡的連結對不起來，沒辦法像 Yahoo 那樣靠位置
+    鄰近去綁定。這裡只能用「標題提到這家公司」當關聯，不保證就是那個日期的出處。
+    所以 google 的 url 欄位只當線索用，別拿它當「已驗證的出處」。挑不到就回 None，
+    不要退而求其次挑第一個連結——那幾乎一定是錯的。
+    """
+    if not links or not name:
+        return None
+    for text, href in links:
+        if text and name in text:
+            u = clean_url(href)
+            if u:
+                return u
+    return None
 
 
 # --- 給 server 再驗證用 -----------------------------------------------------

@@ -112,6 +112,10 @@ _FATAL_400 = re.compile(r"API key not valid|API_KEY_INVALID|not supported|PERMIS
 # "DATE: 2022-11-08 TITLE: 台塑"），而整個 repo 拿 raw_title 當證據用
 # （parse_revenue / yoy_scope / title_year_conflict 都吃它）。
 _MODEL_TITLE = re.compile(r"^[ \t]*TITLE:[ \t]*(\S.*?)[ \t]*$", re.M)
+# URL 那行同理。⚠️ 這是三支 worker 裡唯一「出處由模型自己回報」的一支——yahoo 是從
+# SERP 的 <a href> 讀出來的客觀事實，這裡則是模型說它引了哪一篇，模型有可能生一個
+# 不存在的網址出來。所以只當線索，不當保證；revlib.clean_url 只擋格式，擋不了幻覺。
+_MODEL_URL = re.compile(r"^[ \t]*URL:[ \t]*(https?://\S+)[ \t]*$", re.M)
 # ⚠️ 403 在 Vertex 上**不可以一律當 fatal**：實測打過一次乾淨的 403 Forbidden（空 body），
 # 下一次同樣的請求就 200。若照 401 那樣直接停掉整個 worker，一次抖動就收工。
 # 所以只有訊息明確指向「永久性設定問題」時才 fatal，其餘 403 退避重試。
@@ -339,7 +343,8 @@ def call_gemini(prompt, backend, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT):
 
 def extract(payload, name, roc_year, roc_month):
     """
-    從一份回應裡取公布日，並標記可信度來源。回傳 (date, source, title) 或 None。
+    從一份回應裡取公布日，並標記可信度來源。回傳 (date, source, title, url) 或 None。
+    url 是模型自報的出處，可能為 None（見 _MODEL_URL 的警告）。
 
     先問「真實檢索文字」（groundingChunks 標題），再問「模型合成文字」——順序就是
     信任順序，不是效能考量。兩塊都要通過同一套 revlib.parse（窗過濾＋名稱錨點），
@@ -371,7 +376,12 @@ def extract(payload, name, roc_year, roc_month):
                 title = m.group(1)[:80]
         if revlib.title_year_conflict(title, roc_year, roc_month):
             continue
-        return date, src, title
+        # URL 兩條路都從模型的回覆文字取——groundingChunks 那條給的是 Google 的
+        # 快取轉址（vertexaisearch.cloud.google.com/grounding-api-redirect/...），
+        # 有時效、過期就打不開，存了也追不回原文。
+        m = _MODEL_URL.search(payload["text"])
+        url = revlib.clean_url(m.group(1)) if m else None
+        return date, src, title, url
     return None
 
 
@@ -379,7 +389,7 @@ def extract(payload, name, roc_year, roc_month):
 def crawl_task(task, backend, model, budget):
     """
     回傳 (result, fatal)：
-      result = {id, status, date?, source?, title?}，status ∈ success|failed|rate_limited
+      result = {id, status, date?, source?, title?, url?}，status ∈ success|failed|rate_limited
       fatal  = 是否該立刻停掉整個 worker（設定錯誤，重試沒有意義）
 
     budget 是 Budget 實例；呼叫前先問它還能不能花，回來後把實際發出的搜尋次數記進去
@@ -402,9 +412,9 @@ def crawl_task(task, backend, model, budget):
 
     hit = extract(payload, name, ry, rm)
     if hit:
-        date, src, title = hit
+        date, src, title, url = hit
         return {"id": task["id"], "status": "success",
-                "date": date, "source": src, "title": title}, False
+                "date": date, "source": src, "title": title, "url": url}, False
     # 模型確實搜了、正常回話了、仍無窗內日期 → 這才是真的 failed。
     return {"id": task["id"], "status": "failed"}, False
 

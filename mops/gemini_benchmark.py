@@ -59,7 +59,7 @@ DEFAULT_OUT = "gemini_benchmark.csv"
 
 FIELDS = ["stock_id", "name", "roc_year", "roc_month",
           "mops_date", "yahoo_date", "gemini_date", "gemini_source",
-          "status", "searches", "raw_title", "search_queries"]
+          "status", "searches", "raw_title", "url", "search_queries"]
 
 # ⚠️ 絕不可以用 \b 當左界。Python 的 \w 包含 CJK，所以中文字與數字之間【沒有】
 # 詞界——"台塑111年10月" 用 r"\b1[01]\d年" 比對是 False，只有 "台塑 111年10月"
@@ -190,7 +190,10 @@ def measure_one(row, backend, model, budget, retries=2, retry_sleep=8.0):
     out["status"] = "ok"
     hit = gw.extract(payload, row["name"], row["roc_year"], row["roc_month"])
     if hit:
-        out["gemini_date"], out["gemini_source"], out["raw_title"] = hit
+        # url 是模型自報的出處。差 1 天那種個案要回頭看原文時，只有這欄能直接點開
+        # ——沒有它就得拿標題再搜一次，而搜尋結果隨時在變（見 revlib「來源網址」）。
+        (out["gemini_date"], out["gemini_source"],
+         out["raw_title"], out["url"]) = hit
     return out
 
 
