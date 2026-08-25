@@ -625,12 +625,33 @@ class TestVerify(unittest.TestCase):
         self.assertEqual(self.store.conn.execute(
             "SELECT announce_date FROM tasks WHERE id=1").fetchone()[0], "2022-11-08")
 
-    def test_out_of_window_date_is_mismatch_not_stamp(self):
-        # 送上來的日期先過 validate_date：窗外的日期連比對都不該進行。
+    def test_a_date_that_differs_is_mismatch(self):
         c = self.store.verify("mops", [{"stock_id": "1301", "roc_year": 111,
                                         "roc_month": 10, "date": "2023-05-01"}])
         self.assertEqual(c["mismatch"], 1)
         self.assertIsNone(self._row(1)["verified"])
+
+    def test_a_legitimately_out_of_window_row_can_still_be_stamped(self):
+        """
+        ⚠️ 樂觀鎖只能比對字串，**不可以借用窗驗證**。
+
+        全庫唯一合法的窗外 success 是 data/date_overrides.csv 收的遲交個案
+        （3494 誠研 109/1 = 2020-02-17，17 > 15）。早期版本讓送上來的日期先過
+        validate_date，於是那一筆永遠 mismatch、永遠蓋不了章——title_audit 逐批
+        掃描時它會卡在隊首無限重複出現。
+        窗驗證是 report 那條路的職責（worker 送新日期進來時），verify 收的是
+        「我剛才看到的值」，只需要確認那列還沒被改過。
+        """
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,announce_date,"
+            "source,updated_at) VALUES(9,'3494','誠研',109,1,'success','2020-02-17',"
+            "'g_roc_manual',0)")
+        self.store.conn.commit()
+        c = self.store.verify("claude", [{"stock_id": "3494", "roc_year": 109,
+                                          "roc_month": 1, "date": "2020-02-17"}])
+        self.assertEqual(c["verified"], 1)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT verified FROM tasks WHERE id=9").fetchone()[0], "claude")
 
     def test_non_success_row_is_skipped(self):
         c = self.store.verify("mops", [{"stock_id": "2330", "roc_year": 109,

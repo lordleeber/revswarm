@@ -487,7 +487,8 @@ class Store:
           可以在 server 跑著的時候執行」。走 endpoint 兩邊都保住。
 
         ⚠️ 蓋章的前提是**日期真的一致**：呼叫端送上它那邊看到的 date，跟 DB 裡的
-        announce_date 對不上就記成 mismatch、不蓋。不然 verified 只是「有人跑過這一筆」，
+        announce_date 逐字對不上就記成 mismatch、不蓋（純字串比對，不套窗驗證
+        ——見下方註解）。不然 verified 只是「有人跑過這一筆」，
         不是「有人證實過這一筆」——那就一文不值了。
         日期不一致本身是有價值的訊號（代表兩個來源打架），留給呼叫端去看，這裡不改資料。
 
@@ -533,8 +534,13 @@ class Store:
                         # 還沒定案的列沒有 announce_date 可以核對，蓋章沒有意義。
                         counts["not_success"] += 1
                         continue
-                    claimed = revlib.validate_date(date, ry, rm)
-                    if claimed is None or claimed != row["announce_date"]:
+                    # ⚠️ 樂觀鎖只比對字串，**不可以借用 validate_date**：全庫唯一
+                    # 合法的窗外 success 是 date_overrides.csv 收的遲交個案
+                    # （3494 誠研 109/1 = 2020-02-17），窗驗證會讓它永遠 mismatch、
+                    # 永遠蓋不了章，逐批掃描時還會卡在隊首無限重複出現。
+                    # 窗驗證是 report 那條路的職責（worker 送新日期進來時）；這裡收的
+                    # 是「呼叫端剛才看到的值」，只需要確認那列還沒被改過。
+                    if date.strip() != (row["announce_date"] or ""):
                         counts["mismatch"] += 1
                         continue
                     if VERIFIER_RANK.get(row["verified"], 0) > rank:
