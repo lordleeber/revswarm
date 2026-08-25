@@ -370,6 +370,79 @@ class TestUrlColumn(unittest.TestCase):
         os.remove(old)
 
 
+class TestReportRejectsWrongCompany(unittest.TestCase):
+    """
+    第三道防污染再加一條：worker 回報的 raw_title 若講的是**別家公司**，不收。
+
+    ⚠️ 為什麼擋在 server：revlib.parse 找不到錨點時退回「取第一個窗內日期」，那條
+    後備路徑沒有任何公司名保護（_anchor_offsets 的 lookahead 只在錨點命中時起作用）。
+    實測 12 筆因此吃到別家公司的公告日：4113 聯上 → 聯上發(2537)、2906 高林 →
+    高林股(1531)…全部出自 google worker。
+    worker 擋不了——它只知道自己這一筆的公司名，不知道「聯上發」是另一檔股票。
+    server 有整個 tasks 表，name→stock_id 的對照本來就在手上，這裡才擋得住。
+
+    擋掉的處理與日期不過窗一致：退回 undone 重做，不當 success 也不當 failed
+    ——那不是「查不到」，是「查到了但查錯對象」。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,updated_at)"
+            " VALUES(1,'4113','聯上',109,4,'dispatched',0),"
+            "       (2,'2537','聯上發',109,4,'undone',0),"
+            "       (3,'1216','統一',110,6,'dispatched',0),"
+            "       (4,'2912','統一超',110,6,'undone',0)")
+        self.store.conn.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _report(self, tid, date, title):
+        return self.store.report("w", [{"id": tid, "status": "success",
+                                        "date": date, "source": "g_ad",
+                                        "title": title}])
+
+    def _state(self, tid):
+        return self.store.conn.execute(
+            "SELECT state, announce_date FROM tasks WHERE id=?", (tid,)).fetchone()
+
+    def test_rejects_a_title_about_a_longer_named_company(self):
+        c = self._report(1, "2020-05-08",
+                         "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253")
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["success"], 0)
+        r = self._state(1)
+        # 退回 undone 重做：這不是「查不到」，是「查錯對象」。
+        self.assertEqual(r["state"], "undone")
+        self.assertIsNone(r["announce_date"])
+
+    def test_accepts_when_our_own_anchor_matches(self):
+        # 實測誤報：1216 統一 110/6 的 title 開頭就是本檔正確的公告，
+        # 「統一超」只在尾巴的相關文章碎片裡。擋掉它會害正確資料被退。
+        c = self._report(3, "2021-07-12",
+                         "【公告】統一2021年6月合併營收392.53億元年增1.65%. 上一則 … 統一超表現備")
+        self.assertEqual(c["success"], 1)
+        self.assertEqual(self._state(3)["state"], "success")
+
+    def test_accepts_a_clean_title(self):
+        c = self._report(1, "2020-05-08", "聯上 109年4月營收1.41億")
+        self.assertEqual(c["success"], 1)
+
+    def test_missing_title_does_not_block(self):
+        # title 是選填的佐證，沒有就沒得檢查，不可以因此拒收。
+        c = self.store.report("w", [{"id": 1, "status": "success",
+                                     "date": "2020-05-08", "source": "g_ad"}])
+        self.assertEqual(c["success"], 1)
+
+
 class TestRequeue(unittest.TestCase):
     """
     把「已經 success 但確定抓錯」的列打回 undone 重爬。
@@ -436,6 +509,41 @@ class TestRequeue(unittest.TestCase):
         self.assertEqual(c["mismatch"], 1)
         self.assertEqual(self._row()["state"], "success")
         self.assertEqual(self._row()["announce_date"], "2020-05-08")
+
+    def test_failed_rows_can_be_requeued_with_an_empty_date(self):
+        """
+        failed 的列也要能指名重排——它沒有 announce_date，所以樂觀鎖傳空字串。
+
+        為什麼不用 requeue-failed：那支會把**全部** failed（實測 5,624 筆）一起丟進
+        指定佇列。想只挑幾筆換一條路試（例如 yahoo 沒抓到、改叫 google 試）就得有
+        指名的方式。
+        """
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "fail_count,updated_at) VALUES(2,'4113','聯上',109,8,'failed','yahoo',3,0)")
+        self.store.conn.commit()
+        c = self.store.requeue(
+            [{"stock_id": "4113", "roc_year": 109, "roc_month": 8, "date": ""}],
+            engine="google")
+        self.assertEqual(c["requeued"], 1)
+        r = self.store.conn.execute("SELECT * FROM tasks WHERE id=2").fetchone()
+        self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
+        self.assertEqual(r["fail_count"], 3)      # 爬取歷史留著
+
+    def test_undone_and_prelisting_are_left_alone(self):
+        # undone 已經在排隊了，prelisting 是刻意標的——兩者都不該被這支動到。
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,updated_at)"
+            " VALUES(2,'9001','甲',109,8,'undone',0),"
+            "       (3,'9002','乙',109,8,'prelisting',0)")
+        self.store.conn.commit()
+        c = self.store.requeue([
+            {"stock_id": "9001", "roc_year": 109, "roc_month": 8, "date": ""},
+            {"stock_id": "9002", "roc_year": 109, "roc_month": 8, "date": ""},
+        ], engine="google")
+        self.assertEqual(c["not_requeueable"], 2)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT state FROM tasks WHERE id=3").fetchone()[0], "prelisting")
 
     def test_non_success_and_unknown_rows(self):
         c = self.store.requeue([

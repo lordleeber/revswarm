@@ -315,6 +315,7 @@ class Store:
         self.db_path = db_path
         self.conn = connect(db_path)
         self._lock = threading.Lock()
+        self._name_cache = None    # _names() 的快取
 
     # --- 派工：原子鎖定 + 惰性回收 ---------------------------------------
     def lease(self, n, worker_id, engine=DEFAULT_ENGINE):
@@ -371,6 +372,21 @@ class Store:
                 raise
         return [dict(r) for r in batch]
 
+    def _names(self):
+        """
+        {公司名: 股號}，用來擋「raw_title 講的是別家公司」。
+
+        ⚠️ 這份對照只有 server 拿得到：worker 只知道自己這一筆的公司名，不知道
+        「聯上發」是另一檔股票，所以它擋不了（見 report 的說明）。
+        建一次就快取——tasks 的公司名在 init_tasks 之後就不會變，而 report 是熱路徑。
+        """
+        if self._name_cache is None:
+            self._name_cache = {
+                r["name"]: r["stock_id"]
+                for r in self.conn.execute(
+                    "SELECT DISTINCT name, stock_id FROM tasks")}
+        return self._name_cache
+
     # --- 回報：success 需窗再驗證；rate_limited 放回；failed 記數 --------
     def report(self, worker_id, results):
         now = int(time.time())
@@ -387,7 +403,8 @@ class Store:
                         counts["unknown"] += 1
                         continue
                     row = conn.execute(
-                        "SELECT state, roc_year, roc_month FROM tasks WHERE id=?", (tid,)
+                        "SELECT state, roc_year, roc_month, name, stock_id"
+                        " FROM tasks WHERE id=?", (tid,)
                     ).fetchone()
                     if row is None:
                         counts["unknown"] += 1
@@ -417,6 +434,16 @@ class Store:
                     else:  # success：server 端用同一套窗再驗一次（README「踩過的雷 → 窗過濾」）
                         valid = revlib.validate_date(
                             item.get("date"), row["roc_year"], row["roc_month"])
+                        # ⚠️ 再多擋一條：raw_title 講的若是「名字更長的另一家公司」，
+                        # 不收。revlib.parse 的後備路徑（錨點沒中 → 取第一個窗內日期）
+                        # 沒有任何公司名保護，實測 12 筆因此吃到別家的公告日
+                        # （4113 聯上 → 聯上發(2537)…），全部出自 google worker。
+                        # 帶 roc_year/roc_month：本檔自己的錨點命中就不算撞名，否則
+                        # 會誤擋「開頭是正確公告、尾巴提到相關公司」那種正確的列。
+                        if valid is not None and revlib.longer_name_in_text(
+                                item.get("title") or "", row["name"], row["stock_id"],
+                                self._names(), row["roc_year"], row["roc_month"]):
+                            valid = None
                         if valid is None:
                             # 日期不在窗內 → 不信任，退回 undone 重做（不當 success）。
                             conn.execute(
@@ -538,13 +565,17 @@ class Store:
         用途是「已經確定抓錯」的個案，例如 google 的後備路徑抓到別家公司的公告日
         （4113 聯上 吃到 聯上發(2537)，見 data/title_review.csv）。
 
+        也吃 failed 的列——那種沒有 announce_date，樂觀鎖傳空字串。這是為了「只挑
+        幾筆換一條路試」：requeue-failed 會把**全部** failed（實測 5,624 筆）一起
+        丟進指定佇列，想只動 11 筆就得有指名的方式。
+
         engine 給值就順便改佇列——google 抓錯的別再給 google。給 None 則沿用原佇列。
 
         清掉所有「抓來的內容」，但**保留 attempts/fail_count**：那是這筆被爬過幾次的
         歷史，清掉就查不出「這筆一直出問題」，而那正是之後該優先看的線索。
         """
         now = int(time.time())
-        counts = {"requeued": 0, "mismatch": 0, "not_success": 0, "unknown": 0}
+        counts = {"requeued": 0, "mismatch": 0, "not_requeueable": 0, "unknown": 0}
         conn = self.conn
         with self._lock:
             conn.execute("BEGIN IMMEDIATE;")
@@ -571,9 +602,12 @@ class Store:
                     if row is None:
                         counts["unknown"] += 1
                         continue
-                    if row["state"] != "success":
-                        counts["not_success"] += 1
+                    if row["state"] not in ("success", "failed"):
+                        # undone 已經在排隊、dispatched 正在被爬、prelisting 是刻意
+                        # 標的——三者都不該被這支動到。
+                        counts["not_requeueable"] += 1
                         continue
+                    # 樂觀鎖：failed 的列沒有 announce_date，呼叫端傳空字串即可。
                     if date.strip() != (row["announce_date"] or ""):
                         counts["mismatch"] += 1
                         continue

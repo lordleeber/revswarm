@@ -127,8 +127,8 @@ def main():
     if applied["mismatch"]:
         # 我看過之後那列被改過了，判斷不再適用——不動是對的。
         print(f"⚠️ 日期對不上而未處理 {applied['mismatch']} 筆（那列在此之間被改過）")
-    if applied["not_success"] or applied["unknown"]:
-        print(f"   非 success {applied['not_success']} 筆／查無 {applied['unknown']} 筆")
+    if applied["not_requeueable"] or applied["unknown"]:
+        print(f"   狀態不可重排 {applied['not_requeueable']} 筆／查無 {applied['unknown']} 筆")
 
 
 if __name__ == "__main__":
