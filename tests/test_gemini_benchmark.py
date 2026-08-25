@@ -93,6 +93,26 @@ class TestResumeCache(unittest.TestCase):
         done = gb.load_done(self.path)
         self.assertEqual(set(k[0] for k in done), {"ok"})
 
+    def test_append_refuses_stale_header(self):
+        """⚠️ 表頭只在檔案不存在時才寫。FIELDS 加欄後，舊 CSV 會變成
+        「N+1 個值塞進 N 欄的表頭」——DictReader 把多的值默默丟進 restkey(None)
+        而不報錯，等於花了錢卻讀不回來。欄位對不上要當場停。"""
+        with open(self.path, "w", encoding="utf-8", newline="") as f:
+            f.write(",".join(gb.FIELDS[:-1]) + "\n")      # 少一欄的舊表頭
+        with self.assertRaises(SystemExit):
+            gb.append_row(self.path, dict(_row("A", 109, 1), status="ok",
+                                          gemini_date="", gemini_source="",
+                                          searches=1, raw_title="", search_queries=""))
+
+    def test_append_accepts_current_header(self):
+        gb.append_row(self.path, dict(_row("A", 109, 1), status="ok", gemini_date="",
+                                      gemini_source="", searches=1, raw_title="",
+                                      search_queries=""))
+        gb.append_row(self.path, dict(_row("B", 109, 1), status="ok", gemini_date="",
+                                      gemini_source="", searches=1, raw_title="",
+                                      search_queries=""))
+        self.assertEqual(len(gb.read_csv(self.path)), 2)
+
     def test_append_writes_header_once(self):
         for i in (1, 2):
             gb.append_row(self.path, dict(_row("A", 109, i), status="ok",
@@ -200,6 +220,21 @@ class TestMeasureOne(unittest.TestCase):
         r = gb.measure_one(_row("2330", 109, 1), _backend(), "m", gw.Budget(0))
         self.assertEqual(r["status"], "fatal")
 
+    def test_records_raw_search_queries_not_just_count(self):
+        """⚠️ 查詢字串是模型自己決定的、我們控制不到。一致率不好時，只有這欄能分辨
+        「模型下的查詢本身就爛」還是「查對了但抽錯日期」。跑完才想加就得重花錢。"""
+        gw.call_gemini = lambda *a, **k: (self._payload(
+            "DATE: NONE", searches=["台塑 2022年10月營收", "台塑 111年10月"]), None)
+        r = gb.measure_one(_row("1301", 111, 10), _backend(), "m", gw.Budget(0))
+        self.assertEqual(r["searches"], 2)
+        self.assertEqual(r["search_queries"],
+                         "台塑 2022年10月營收" + gb.QUERY_SEP + "台塑 111年10月")
+
+    def test_search_queries_empty_when_call_failed(self):
+        gw.call_gemini = lambda *a, **k: (None, gw.ERR_NOSEARCH)
+        r = gb.measure_one(_row("1301", 111, 10), _backend(), "m", gw.Budget(0))
+        self.assertEqual(r["search_queries"], "")
+
     def test_searches_counted_per_query_not_per_task(self):
         gw.call_gemini = lambda *a, **k: (
             self._payload("DATE: NONE", searches=["a", "b", "c"]), None)
@@ -259,6 +294,59 @@ class TestReportStats(unittest.TestCase):
         self.assertIn(gw.SRC_TEXT, out)
         self.assertIn("偏早 1", out)              # B 偏早 4 天
         self.assertIn("樂觀上界", out)            # 解讀提醒一定要印
+
+    def test_year_detection_works_without_spaces(self):
+        """⚠️ 絕不可以用 \\b 當左界：Python 的 \\w 含 CJK，中文字與數字之間沒有詞界，
+        所以 "台塑111年10月" 會比對失敗，只有剛好有空格的才中。而模型下的中文查詢
+        多半沒空格 → 報表會印「含民國年 0.0%／含西元年 0.0%」，把本欄唯一的用途歸零。"""
+        for q in ("台塑111年10月營收", "2330台積電113年5月營收"):
+            self.assertTrue(gb._ROC_YEAR.search(q), q)
+            self.assertFalse(gb._AD_YEAR.search(q), q)
+        for q in ("台塑2022年10月", "台積電2020年1月營收"):
+            self.assertTrue(gb._AD_YEAR.search(q), q)
+            self.assertFalse(gb._ROC_YEAR.search(q), q)
+
+    def test_year_detection_does_not_match_inside_digit_run(self):
+        """2022 不該被當成民國 202 年。"""
+        self.assertFalse(gb._ROC_YEAR.search("2113年"))
+
+    def test_join_queries_sanitizes_separator(self):
+        """查詢字串由模型產生，含 ' | ' 的話 split 會多出幽靈項目、灌水所有百分比。"""
+        joined = gb._join_queries(["台塑 | 南亞 111年10月", "台塑111年10月"])
+        self.assertEqual(len(joined.split(gb.QUERY_SEP)), 2)
+
+    def test_report_shows_query_stats_and_year_forms(self):
+        """報表要能回答「模型到底有沒有用民國年／西元年兩種」。"""
+        rows = [dict(_row("A", 109, 1), status="ok", gemini_date="2020-02-10",
+                     gemini_source=gw.SRC_TEXT, searches=2, raw_title="t",
+                     search_queries="台塑2020年1月營收" + gb.QUERY_SEP + "台塑109年1月")]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gb.report(rows)
+        out = buf.getvalue()
+        self.assertIn("模型實際下的搜尋查詢", out)
+        self.assertIn("含民國年 50.0%", out)
+        self.assertIn("含西元年 50.0%", out)
+        self.assertIn("含「營收」二字 50.0%", out)
+
+    def test_report_lists_queries_under_mismatches(self):
+        """不一致的個案要把模型下的查詢一起印出來，才判斷得出是查錯還是抽錯。"""
+        rows = [dict(_row("6277", 110, 5, mops="2021-06-08"), status="ok",
+                     gemini_date="2021-06-09", gemini_source=gw.SRC_TEXT,
+                     searches=1, raw_title="t", search_queries="宏正 2021年5月營收")]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gb.report(rows)
+        self.assertIn("↳ 宏正 2021年5月營收", buf.getvalue())
+
+    def test_report_survives_rows_without_query_column(self):
+        """舊的 CSV 沒有這一欄，不可以炸掉。"""
+        rows = [dict(_row("A", 109, 1), status="ok", gemini_date="2020-02-10",
+                     gemini_source=gw.SRC_TEXT, searches=1, raw_title="t")]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gb.report(rows)
+        self.assertIn("召回", buf.getvalue())
 
     def test_report_survives_empty_and_all_skipped(self):
         buf = io.StringIO()
