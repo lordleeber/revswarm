@@ -411,8 +411,18 @@ def verify_url(url, timeout=URL_CHECK_TIMEOUT):
     403（擋機器人）、429、5xx、逾時、連不上全部當作沒有。
 
     用 GET 不用 HEAD：實測不少新聞站對 HEAD 直接回 403。只讀狀態碼、不讀 body。
+
+    ⚠️ 這道檢查只驗「網址活著」，驗不了「這是一篇關於這家公司這個月的報導」。
+    沒有路徑的首頁擋得掉，但一個活著的無關文章擋不掉——所以 gemini 的 url 就算
+    通過驗證，可信度仍然低於 yahoo 從 SERP 的 <a href> 讀出來的那種。
     """
     if not url:
+        return False
+    # ⚠️ 光禿禿的首頁不可能是「某公司某月的公告」，當出處毫無用處，先擋掉再說。
+    # 實測 2906 高林 111/9 那筆模型給的是 https://www.masterlink.com.tw/（元富證券
+    # 首頁）——它當然打得開，於是通過了「網址活著」這道檢查，卻證明不了任何事。
+    # 擋在發請求之前：省一次 HTTP，也省得被自己的檢查騙過。
+    if urllib.parse.urlparse(url).path.strip("/") == "":
         return False
     try:
         req = urllib.request.Request(

@@ -676,6 +676,26 @@ class TestVerifyUrl(unittest.TestCase):
         self.assertFalse(gw.verify_url(None))
         self.assertFalse(gw.verify_url(""))
 
+    def test_bare_homepage_is_refused_without_a_request(self):
+        """
+        ⚠️ 光禿禿的首頁不可能是「某公司某月的公告」，當出處毫無用處。
+
+        實測：2906 高林 111/9 那筆，模型給的是 https://www.masterlink.com.tw/
+        ——元富證券首頁。它當然打得開，於是通過了「網址活著」這道檢查，但它證明不了
+        任何事。這種要在發請求之前就擋掉（省一次 HTTP，也省得被自己的檢查騙過）。
+        """
+        called = []
+        gw.urllib.request.urlopen = lambda *a, **k: called.append(1) or self._resp(200)
+        for u in ("https://www.masterlink.com.tw/", "https://a.tw",
+                  "http://b.com.tw/", "https://c.tw/?x=1"):
+            self.assertFalse(gw.verify_url(u), u)
+        self.assertEqual(called, [], "首頁不該發出任何請求")
+
+    def test_a_real_article_path_still_goes_through(self):
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(200)
+        self.assertTrue(gw.verify_url(
+            "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc"))
+
 
 class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
     def setUp(self):
