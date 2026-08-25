@@ -10,7 +10,7 @@ state machine:  undone → dispatched → (success | failed)
 
 endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可設）：
   POST /lease?n=30&worker=<id>&engine=yahoo   原子租一批任務
-                                     （engine 分流佇列，預設 yahoo；只收 yahoo|google，其餘 400）
+                                     （engine 分流佇列，預設 yahoo；只收 yahoo|google|gemini，其餘 400）
   POST /result   {results:[{id,status,date?,source?,title?}, ...]}  批次回報
   GET  /stats                        進度、各 state 計數、近況
   GET  /healthz                      存活探針（免 token）
@@ -37,7 +37,7 @@ import revlib
 
 LEASE_TTL = 600          # 秒；dispatched 超過此值未回覆即可被重派
 MAX_LEASE = 200          # 單次 lease 上限，避免一隻 worker 掃光佇列
-ENGINES = ("yahoo", "google")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
+ENGINES = ("yahoo", "google", "gemini")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
 DEFAULT_ENGINE = "yahoo"
 
 SCHEMA = """
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   raw_title     TEXT,
   revenue       INTEGER,          -- 月營收(元)，由 raw_title 解析；非官方、四捨五入，僅供校驗
   yoy           REAL,             -- 年增率(%)，同上
-  engine        TEXT NOT NULL DEFAULT 'yahoo',  -- 佇列分流：yahoo|google（見 lease/requeue_failed）
+  engine        TEXT NOT NULL DEFAULT 'yahoo',  -- 佇列分流：yahoo|google|gemini（見 lease/requeue_failed）
   attempts      INTEGER DEFAULT 0,
   fail_count    INTEGER DEFAULT 0,
   dispatched_at INTEGER,
@@ -386,7 +386,7 @@ class Store:
                         )
                         counts["failed"] += 1
 
-                    else:  # success：server 端用同一套窗再驗一次（todo.txt 5.5）
+                    else:  # success：server 端用同一套窗再驗一次（README「踩過的雷 → 窗過濾」）
                         valid = revlib.validate_date(
                             item.get("date"), row["roc_year"], row["roc_month"])
                         if valid is None:
@@ -446,7 +446,7 @@ class Store:
         d["recent"] = recent
         return d
 
-    # --- 管理：把所有 failed 重開做「最後一輪」（todo.txt 5.1）----------
+    # --- 管理：把所有 failed 重開做「最後一輪」（README「API」）--------
     def requeue_failed(self, engine=None):
         """把 state='failed' 的任務重開回 undone。
 

@@ -9,7 +9,8 @@
 - 為什麼要分散式：單一 IP 對 Yahoo 高頻查詢會被封。多機 = 多 IP，才能把 13.5 萬筆爬完。
 
 > 資料源探索的完整結論與所有踩過的雷（為何不用 MOPS、查詢字串禁忌、窗過濾、名稱撞庫…）
-> 見 [`todo.txt`](todo.txt)。這份 README 只講怎麼跑。
+> 見下面的「[踩過的雷](#踩過的雷資料源探索結論)」。**要改任何一支 worker 之前先讀那一節**
+> ——裡面每一條都是實測撞出來的，重走一次很貴。
 
 ## 架構
 
@@ -45,6 +46,8 @@
 | `server.py` | 工作佇列 server（標準庫 http.server + sqlite3，零依賴）|
 | `worker/yahoo_worker.py` | 爬蟲 worker（curl --http1.1、民國+西元雙查、窗過濾、退避）|
 | `worker/google_worker.py` | 補搜 worker：Playwright 驅動系統 Chrome 查 Google，撿 Yahoo 救不回的 `failed`（見下）|
+| `worker/gemini_worker.py` | **實驗性**補搜 worker：Gemini API 的 Grounding with Google Search，零依賴、免圖形環境，但**要錢**且日期出自模型合成文字（見下）|
+| `mops/gemini_benchmark.py` | 拿 MOPS 官方申報日當基準，量測 `gemini_worker` 的日期品質（放量前的對照實驗，見下）|
 | `requirements.txt` | **只服務 `google_worker.py`** 的相依（playwright）；核心零依賴，不必安裝|
 | `revlib.py` | 共用核心：期望窗 + Yahoo 頁解析（server/worker 都用同一套窗）|
 | `goodinfo/build_stock_dates.py` | 從官方來源建 `stock_dates.db`（上市/上櫃日現況快照）|
@@ -83,18 +86,22 @@ source .env
 curl -s -H "Authorization: Bearer $REVSWARM_TOKEN" http://<SERVER_IP>:8000/stats | python3 -m json.tool
 ```
 
+> 補搜 `failed` 的另外兩支 worker 各有自己的前置與跑法：
+> [`google_worker`](#google_worker補搜-failedplaywright-系統-chrome)（Playwright，免費）與
+> [`gemini_worker`](#gemini_worker用-gemini-grounding-補搜實驗性會花錢)（Vertex，**要錢、實驗性**）。
+
 ## API
 
 所有 endpoint 需 header `Authorization: Bearer <token>`（`/healthz` 除外）。
 
 | method | path | 說明 |
 |---|---|---|
-| POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），yahoo_worker.py 與 google_worker.py 不會搶同一批；只收 `yahoo`\|`google`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
+| POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），三支 worker 不會搶同一批；只收 `yahoo`\|`google`\|`gemini`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
 | POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?}]}`；status ∈ success/failed/rate_limited |
 | GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
 | GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
 | GET | `/healthz` | 存活探針（免 token）|
-| POST | `/admin/requeue-failed` | 把所有 `failed` 重開成 `undone`，做「最後一輪」（改西元年常能救回）。加 `?engine=google` 則連 engine 一併轉過去，交給 google_worker 專門處理，不影響其餘 yahoo 佇列；未知 engine 回 400（否則 3 萬筆會被丟進沒有 worker 會租的佇列）|
+| POST | `/admin/requeue-failed` | 把所有 `failed` 重開成 `undone`，做「最後一輪」（改西元年常能救回）。加 `?engine=google`（或 `gemini`）則連 engine 一併轉過去，交給該 worker 專門處理，不影響其餘 yahoo 佇列；未知 engine 回 400（否則 3 萬筆會被丟進沒有 worker 會租的佇列）|
 
 ## worker 調參
 
@@ -130,6 +137,98 @@ WORKER_PROXY=socks5h://127.0.0.1:1080 python3 -m worker.yahoo_worker --server ht
   （所以 server 只在 tailnet 也 OK）。不設時行為完全不變。
 - 一台 VM ＝ 一顆 IP；退避邏輯照舊留著（換 IP 是分攤，不是拿來加速轟炸）。
 - 詳解見 `docs/worker-proxy.html`。
+
+## 踩過的雷（資料源探索結論）
+
+⚠️ 這一節每一條都是實測撞出來的，不是設計偏好。改 worker 之前先讀。
+
+### 為什麼不用 MOPS 當主資料源
+
+- MOPS「歷史重大訊息」`t05st01` 只涵蓋**自願**把月營收發成重大訊息的公司。抽樣全 1848 檔
+  只有約 **49 家**有資料（台積電/聯發科/台塑/中鋼/台塑化…）。這批有精確到「時、分」的
+  官方申報時間，是最高信度基準（見「交叉驗證」），但涵蓋太少，撐不起 13.5 萬筆。
+- MOPS 的結構化營收報表（`t21sc04_ifrs` 彙總 / `t05st10_ifrs` 逐檔）、Yahoo 與 MoneyDJ 的
+  結構化營收頁：**都只有年月+金額，沒有公布日期**。
+- → **公布日期只存在於「新聞文章」裡**，所以只能用搜尋引擎撈。
+
+### 為什麼是 Yahoo 台灣搜尋
+
+搜尋「`{公司名} {年}年{月}月`」會把該月營收的新聞帶出來，文章日期就是公布日。
+日期準確度已驗證 —— MoneyDJ / Yahoo 文章日期 **等於** MOPS 官方申報日：
+
+> 台積電 2022 年 1 月營收：MOPS 申報 `2022-02-10 13:41`，MoneyDJ 文章 `2022-02-10 13:56`。
+
+而且涵蓋所有公司，連 MOPS 重大訊息查不到的（穩懋等）都有。
+
+### 查詢字串的兩個關鍵教訓
+
+**(a) 絕不在查詢後面加「營收」兩個字。**
+
+```
+✓ "台積電 109年8月"          對
+✗ "台積電 109年8月營收"       recall 掉一半
+```
+
+加了會讓搜尋引擎去比對「最近的營收新聞」→ 回傳近期（錯年份）文章。
+`google_worker` 也一樣，而且**額外**不能加 `moneydj`（實測會把 CMoney/中央社/Yahoo
+來源的命中排擠掉，任一 90%→80%，純損失）。
+
+**(b) 民國年與西元年兩種都要查，取聯集** —— 它們釣到不同來源，互補是結構性的：
+
+| 查詢 | 釣到 | 因為 |
+|---|---|---|
+| 民國年 `穩懋 109年1月` | MoneyDJ | 標題用民國年：「穩懋 109年1月營收…」|
+| 西元年 `台塑 2020年6月` | Yahoo股市【公告】| 標題用西元年：「【公告】台塑 2020年6月合併營收…」|
+
+⚠️ **兩支 worker 的順序相反**：Yahoo 民國年優先（`q_roc`→`q_ad`），
+Google 西元年優先（`g_ad`→`g_roc`，因為 Google 直接忽略民國年 token，
+頁面會顯示「缺少字詞：110」）。
+
+### 窗過濾 —— 把髒資料清成 0 的關鍵
+
+月營收依規定次月 10 日前申報，遇假日順延。所以正確公布日**一定**落在
+「營收月的次月 1~15 號」：
+
+- `roc_month <= 11` → 西元 `roc_year+1911` 年、`roc_month+1` 月、1~15 日
+- `roc_month == 12` → 西元 `roc_year+1912` 年、1 月、1~15 日
+
+（11、13 號常見 = 週末順延；15 號 = 1 月營收遇春節順延。>15 號一律丟棄。）
+
+不在窗內的日期一律當作沒抓到。實作在 `revlib.expected_window` / `in_window`。
+
+> ⚠️ **server 端要用同一個窗再驗一次** worker 回報的日期，不要全信 worker
+> （`revlib.validate_date`，`/result` 熱路徑）。這是三道防污染的第三道。
+
+### 解析陷阱：公司名是子字串會撞
+
+「統一」vs「統一超」、「台塑」vs「台塑化」。必須**精確名稱比對**：鎖定標題形如
+「`{名稱} {年}年{月}月`」或「`【公告】{名稱} {年}年{月}月`」，且名稱後緊接空白或數字，
+不可被更長的名稱吃掉。實作在 `revlib._anchor_offsets`。
+
+> ⚠️ 錨點**必須連年份一起鎖**。早期版本只鎖月不鎖年（`\d{2,4}年`），於是搜尋結果頁上
+> 「同月份、別年份」的近期文章會被當成錨點 —— 例：任務 111/6、112/6、113/6 三筆都錨到
+> 同一篇「宏碁智新 115年6月」。窗過濾擋不掉這種「錨錯地方、卻剛好挑到一個窗內日期」的
+> 靜默錯配（實測全庫 705 筆、佔 0.57%，見「資料品質」）。
+
+### rate-limit / 封鎖（唯一真正的操作瓶頸，也是為什麼要分散式）
+
+- ⚠️ **curl 打 Yahoo 一定要 `--http1.1`。** HTTP/2 在某些環境會 SSL unexpected eof、
+  回 HTTP 000；加了就正常 200。
+- 單一 IP 持續高頻查詢 → 連線被 reset（SSL EOF / size=0 / 非 200）。實測狂打一天後
+  單 IP 幾乎全被擋 → **把 worker 分散到多台機器 / 多個 IP，這就是 revswarm 的核心**。
+- rate-limited 的訊號：curl 失敗 / 非 200 / **頁面 < 2000 bytes**（`MIN_PAGE_BYTES`）。
+- ⚠️ **這種絕不可回報 `failed`**，要退避重試。`failed` 只能是「頁面正常、兩種年份都試過、
+  仍無窗內日期」。把「還沒查成功」寫成 `failed` 會靜靜污染研究資料 —— 這條戒律在三支
+  worker 上各有一個對應的判準（Yahoo 看頁面大小、Google 看 `#search` 容器、
+  Gemini 看 `webSearchQueries` 是否為空）。
+
+### pilot 實測數據（10 檔 × 民國 109 年）
+
+- 修正查詢（不加「營收」）+ 窗過濾：連得上的請求 **~78% 正確、0 髒**。
+- 西元年補查再救回漏抓的約一半。
+- 每次查詢純抓取 ~0.8~1.5s（不含退避）。單 IP 會被封是主要限制。
+
+> ⚠️ 大量爬 Yahoo 可能違反其 ToS，也會招致更強封鎖 —— 務必節制、分散、加延遲。
 
 ## google_worker：補搜 failed（Playwright + 系統 Chrome）
 
@@ -263,6 +362,294 @@ ISP 重新配發 IP 後，Google 就把「舊 cookie + 新 IP」視為可疑。
   清掉舊綁定。代價是失去同意 cookie，第一次查詢會遇到同意頁 —— 但同意頁會被正確判
   `rate_limited` 而不是 `failed`，所以清設定檔是安全的。
 - 動態 IP 的機器會反覆遇到；固定出口 IP（例如走 SOCKS）可從根本消除這個觸發源。
+
+## gemini_worker：用 Gemini grounding 補搜（實驗性、**會花錢**）
+
+第三支 worker，走 `engine=gemini` 佇列。用 Gemini API 的 **Grounding with Google Search**
+問「這檔股票這個月的營收是哪天公布的」，而不是自己爬 SERP。
+
+> **這是實驗，不是主力。** `google_worker.py` 已經把 30,877 筆補搜完（24,196 success）。
+> 這支存在的目的是回答一個問題：**同樣的題目，grounding 拿到的日期品質比直爬 SERP 好還是壞。**
+
+> **接通這條路的完整經過（含所有死路）在下面的「[怎麼走到 Vertex 這條路的](#怎麼走到-vertex-這條路的2026-08-24-實測)」。要動這支 worker 之前先讀，可以省下重走一次的半天。**
+
+| | google_worker | gemini_worker |
+|---|---|---|
+| 依賴 | playwright + 系統 Chrome + 圖形環境 | **無**（純 urllib 打 REST）|
+| 人工介入 | 會撞驗證碼，要人解 | 不會 |
+| 成本 | 0 | **要錢**：走 Vertex，額度算在 Google Cloud 帳單（**沒有**免費 grounding 額度）|
+| 拿到的東西 | 搜尋結果頁原文 | **模型合成的文字** ← 這就是要驗的地方 |
+
+### 使用順序（⚠️ 別跳步）
+
+```
+① python3 -m mops.gemini_benchmark --dry-run    不花錢，看抽樣組成與預估花費
+② python3 -m mops.gemini_benchmark -n 5         煙霧測試（約 $0.5）：驗連得上、CSV 續跑正常
+③ python3 -m mops.gemini_benchmark -n 30        看趨勢（約 $2~5）
+④ python3 -m mops.gemini_benchmark -n 200       完整結論（約 $11~31）
+⑤ 過關才跑 worker 去補 failed                    見「跑法」
+```
+
+`--dry-run` 之外每一步都會 append 進 `gemini_benchmark.csv`，**中斷或加大 `-n` 重跑
+都會跳過已完成的列，不重複付費** —— 所以 ②→③→④ 是累加的，不是重來。
+
+前置：`.env` 放 `GOOGLE_CLOUD_PROJECT=`（見下面「設定：Vertex AI」），之後所有指令
+都不必再打 `--project`。
+
+> **①~④ 不需要 server**，也不碰 `revswarm.db` 的任何 state（`mode=ro`）。
+> 只有 ⑤ 需要 server 與 `requeue-failed?engine=gemini`。
+
+### 設定：Vertex AI（額度走 Google Cloud 帳單）
+
+> ⚠️ **另一道門（AI Studio / Gemini Developer API，`x-goog-api-key`）已經刻意移除，別加回來。**
+> 兩件事讓它不可用：
+> 1. 2026-03 起 Google Cloud 的額度**不能**付 AI Studio 的帳，它走自己的 Prepay 餘額。
+> 2. 2026-08 實測本專案的 AI Studio 金鑰**全部**回 `429 prepayment credits are depleted`
+>    ——那是 Google 側的已知 bug（全新、確認 free tier、零使用量的專案也照樣被擋），
+>    Google 自己的文件卻寫著 free tier 不需要 Prepay。
+>
+> 完整經過見下面的「怎麼走到 Vertex 這條路的」。那是一條走過的死路，**不要重走**。
+> Vertex 走的是同一批 Gemini 模型、同一個 grounding、同一種回應結構，只是換一道門進去。
+
+一次性設定：
+
+```bash
+curl https://sdk.cloud.google.com | bash && exec -l $SHELL   # 1. 裝 gcloud
+gcloud auth application-default login                        # 2. 建 ADC（會開瀏覽器）
+gcloud config set project <你的專案ID>
+gcloud services enable aiplatform.googleapis.com             # 3. 開 Vertex（現名 Agent Platform API）
+```
+
+專案 ID 可以放進 `.env`（跟 `REVSWARM_TOKEN` 同一個檔），之後就不必每次打 `--project`：
+
+```bash
+GOOGLE_CLOUD_PROJECT=your-project-id
+```
+
+驗一次整條鏈（API 有沒有開、ADC 有沒有效、grounding 有沒有真的觸發）：
+
+```bash
+PROJ=$(gcloud config get-value project)
+curl -s "https://aiplatform.googleapis.com/v1/projects/$PROJ/locations/global\
+/publishers/google/models/gemini-3.7-flash:generateContent" \
+  -H "Authorization: Bearer $(gcloud auth application-default print-access-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"台積電 2330 2020年1月營收哪一天公布？"}]}],
+       "tools":[{"googleSearch":{}}]}' \
+  | python3 -c "import json,sys; m=json.load(sys.stdin)['candidates'][0].get('groundingMetadata',{}); print('搜尋查詢:', m.get('webSearchQueries'))"
+```
+
+| 輸出 | 意思 |
+|---|---|
+| `搜尋查詢: ['...']` | 全通了 |
+| `搜尋查詢: None` | 通了但 grounding 沒觸發 —— 正是 worker 判 `rate_limited` 而非 `failed` 的情況 |
+| `403` + `has not been used in project` | 第 3 步的 enable 沒生效（剛開要等一兩分鐘）|
+| `403` 但 body 是空的 | ⚠️ **偶發，會自己好**。實測打過一次空 body 的 403、下一次同樣請求就 200 —— 所以 worker 只在訊息指向永久性問題時才 fatal，其餘 403 退避重試 |
+| `401` | ADC 過期或沒建，重跑 `gcloud auth application-default login` |
+
+> ⚠️ **`gcloud auth login` 與 `gcloud auth application-default login` 是兩組不同的憑證。**
+> worker 用的是後者（ADC），取 token 的指令是
+> `gcloud auth application-default print-access-token`。只跑過 `application-default login`
+> 的機器上，`gcloud auth print-access-token` 會失敗說 `No credentialed accounts`
+> ——那不是壞掉，是問錯了憑證。
+>
+> ⚠️ **Vertex 沒有免費 grounding 額度**（每月 5,000 次那個是 AI Studio 的），
+> 所以 `--free-quota` 預設 0。單價請以實際帳單校正 `--unit-price`。
+>
+> ⚠️ **`gemini-2.5-*` / `gemini-2.0-flash` 對新專案已 404 下架**
+> （`no longer available to new users`），退不回便宜的舊型號。`DEFAULT_MODEL` 是 `gemini-3.7-flash`。
+
+### 跑法（⚠️ 這是上面的第 ⑤ 步，先做完對照實驗）
+
+> **別跳到這裡。** 直接拿 gemini 去補 `failed`，拿到的日期沒有任何外部基準可驗
+> ——理由見下面「[放量前先做對照實驗](#放量前先做對照實驗mopsgemini_benchmarkpy)」。
+
+```bash
+# ⚠️ 不做這步 worker 會租不到任何任務（gemini 佇列預設是空的）
+curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
+  "http://<SERVER>:8000/admin/requeue-failed?engine=gemini"
+
+# 先小額試跑（預設 --max-searches 300 ≈ 40 筆任務，就是為此）
+python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
+    --project <你的專案ID> --once
+
+# 確認結果合理後再放量
+python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
+    --project <你的專案ID> --max-searches 40000
+```
+
+> `--project` 可省略，只要 `.env` 裡有 `GOOGLE_CLOUD_PROJECT=`。
+
+```bash
+--model gemini-3.7-flash  # ⚠️ gemini-2.5-* / 2.0-flash 對新專案已 404 下架，退不回舊型號
+--max-searches 300        # ⚠️ 不是任務數，是搜尋次數（見下）。0=不限
+--max-calls 200           # ⚠️ 第二道保險：呼叫次數上限。搜尋次數只有「拿到回應」才數
+                          #   得到，所以 gcloud 沒裝／一直 429／模型每次都不搜這類
+                          #   持續失敗下它永遠是 0，擋不住無限迴圈
+--free-quota 0            # ⚠️ Vertex 沒有免費 grounding 額度；只影響 log 的花費估算
+--unit-price 0.014        # 每次搜尋單價，請以實際帳單校正
+--batch 10 --delay 1      # 沒有反爬顧慮，可以比 google_worker 快很多
+--rl-threshold 3          # 連續 3 筆 rate_limited（多半是 429）就收批退避
+```
+
+> ⚠️ **`--max-searches` 算的是搜尋次數，不是任務數**，而兩者差了一個數量級。
+> 計費按「模型實際發出的搜尋查詢」，**實測一個任務會發 4~11 次搜尋、平均約 7 次**
+> （2026-08-24 於 Vertex 量測 5 筆：4/4/8/8/11）——不是直覺的 1 次。
+> worker 累加回應裡 `groundingMetadata.webSearchQueries` 的長度，超過上限就把剩餘租約
+> 放回佇列並結束。預設 300 因此大約只夠 **40 筆任務**。
+> 預設值刻意設得小：另外兩支跑錯只是浪費時間，這支跑錯是刷 Google Cloud 帳單。
+
+### 三道防污染原封不動，外加一條新戒律
+
+窗過濾、名稱錨點、server 端再驗窗全部沿用 `revlib.parse`——**模型回什麼日期都沒有特權，
+一律要通過同一套規則才算數**，另外再過 `title_year_conflict` 擋掉「語氣肯定但年份錯掉」
+的合成句。新增的一條是：
+
+> ⚠️ **回應裡 `webSearchQueries` 是空的 → `rate_limited`，絕不是 `failed`。**
+> 那代表模型根本沒去搜、是憑記憶回答的。把「沒查過」記成「Google 也沒有」會靜靜污染
+> 研究資料——這跟 google_worker 的「頁面沒有 `#search` 容器就不是 SERP」是同一條戒律。
+> 同理，金鑰錯／API 沒開／權限不足（401/403/400 API key not valid）會**直接停掉整個
+> worker**、剩餘租約放回，而不是把整批刷成 `failed`。
+
+### 命中來源分級：這才是實驗的產出
+
+同一份回應會拆成兩塊分別餵 `revlib.parse`，`source` 記錄命中的是哪一塊：
+
+| source | 意思 | 可信度 |
+|---|---|---|
+| `m_src` | 日期出現在 `groundingChunks` 的來源標題裡 | Google 索引回來的真實文字，接近 SERP |
+| `m_txt` | 日期只出現在模型自己寫的回答裡 | **合成文字，可能是幻覺** |
+
+worker 結束時會印出兩者比例。實務上 Gemini API 的 `groundingChunks.title` 常常只給網域名
+（`moneydj.com`）而不是文章標題，所以 `m_src` 命中率可能很低——**那本身就是實驗結論，
+不是 bug**：它代表這條路拿到的日期多半是模型「講」出來的，不是「查」出來的。
+
+> `m_txt` 那批併入主資料前，請先跟 `yahoo` / MOPS 的重疊區對照，做「資料品質」那節對
+> `google` 批做過的同一套檢查（週末率、偏早分布）。「資料品質 → 沒修掉、要知道的殘留風險」
+> 已經記過 `google` 批
+> 日期系統性偏早占 8% 且沒有外部基準可驗；grounding 這批只會更需要這道檢查。
+
+### 怎麼走到 Vertex 這條路的（2026-08-24 實測）
+
+寫這節的理由跟上面「踩過的雷」一樣：下一個人看到「Gemini grounding」四個字，會很自然地
+照網路上的教學去申請 AI Studio 金鑰 —— **那條路已經走過而且是死的**。
+每一步撞到什麼、怎麼確認不是自己設定錯，都記在這裡。
+
+**1. 以為 Custom Search JSON API 還能用** → 錯。2025 起對新客戶關閉，2026-01 宣布
+2027-01-01 全面停用。Vertex AI Search（現名 Agent Search）搜的是「你自己的內容」，
+不回傳公開網頁結果，不能替代。→ Google 現在唯一還買得到的「查公開網頁」只剩 Gemini grounding。
+
+**2. Console 搜不到「Generative Language API」** → 顯示名已改成 **Gemini API**
+（有時寫 Gemini Developer API），service 名稱沒變。
+
+**3. Create credentials 的「引導式 wizard」永遠給不出 API key** → 那個 wizard 只有
+User data(OAuth client) / Application data(service account) 兩個選項。API key 在
+「+ CREATE CREDENTIALS」的**下拉選單**裡，不在 wizard 裡。
+
+**4. Gemini API 的 checkbox 是灰的** → tooltip 寫
+`This API requires authentication with a service account-bound API key`。
+Google 正在淘汰舊的 `AIza` 標準金鑰，換成綁 service account 的 auth key（`AQ.` 開頭）：
+2026-06-19 起未加限制的被拒，**2026-09 起全部被拒**。走 Console 必須先自己建一個
+service account，selector 才會出現。
+
+**5. 金鑰拿到了、認證全通，但一行都跑不動 —— 429**
+
+| 檢查 | 結果 |
+|---|---|
+| `ListModels` | ✅ 回 37 個模型 → auth key 有效、API 已啟用、header 正確 |
+| `generateContent` | ❌ 一律 `429 Your prepayment credits are depleted` |
+
+帶不帶 `google_search`、換任何型號、換 `-latest` 別名，全都一樣 → **是專案層級**。
+
+> ⚠️ 這是 **Google 的已知 bug**，不是漏設什麼。Google 自己的 billing 文件寫著
+> 「The free tier operates independently — it doesn't require Prepay setup」，
+> 免費層根本不該檢查 prepay 餘額；但 2026-08-03 起開發者論壇一連串同樣回報：
+> 全新、確認 free tier、零使用量的專案，`generateContent` 全部 429。
+> 背景是 Prepay/Postpay 兩種 billing plan 2026-03-23 上線，新帳號預設 Prepay，
+> 疑似把 free tier 專案也錯誤歸類進 Prepay 而餘額是 0。
+>
+> ⚠️ 順帶發現：`gemini-2.5-*` / `2.0-flash` 對新使用者已 404 下架
+> （`no longer available to new users`），「退回便宜舊型號」這條路也沒了。
+
+**6. 關鍵轉折：Google Cloud 的餘額能不能用？→ 能，但只能走 Vertex**
+
+2026-03 起 Cloud 的 $300 歡迎額度**不能**付 AI Studio 的帳，但**可以**付 Vertex 的。
+同樣的模型、同樣的 grounding、同樣的 `groundingMetadata` 結構 —— 只是換一道門進去。
+
+**7. Vertex 實際接通** —— 四個錯誤訊息都很好認：
+
+| 訊息 | 意思 |
+|---|---|
+| `gcloud: command not found` | `curl https://sdk.cloud.google.com \| bash` |
+| `No credentialed accounts` | ⚠️ **不是壞掉，是問錯憑證**（見上面的 ⚠️ 兩組憑證）|
+| `403 ... has not been used in project` | `gcloud services enable aiplatform.googleapis.com` |
+| `200 OK` 但 `webSearchQueries: None` | 那句 prompt 不需要搜尋 —— 正是 worker 判 `nosearch` 的情況，不是錯 |
+
+> ⚠️ 還打過一次**乾淨的 403 Forbidden（空 body），下一次同樣的請求就 200**。
+> 所以 403 不可以一律當 fatal，否則一次抖動就收掉整個 worker。
+
+**8. 首次真實量測：5 筆已知答案（MOPS 重疊區）**
+
+```
+6277 宏正  110/5   MOPS 2021-06-08  gemini 2021-06-09  ✗ (+1d)   searches=8
+1301 台塑  111/10  MOPS 2022-11-08  gemini 2022-11-08  ✓        searches=11
+2428 興勤  112/7   MOPS 2023-08-07  gemini 2023-08-07  ✓        searches=4
+2476 鉅祥  111/7   MOPS 2022-08-08  gemini 2022-08-08  ✓        searches=8
+8109 博大  111/10  MOPS 2022-11-02  gemini 2022-11-02  ✓        searches=4
+```
+
+有效 5/5，與 MOPS 一致 4/5。兩個發現：
+
+- ⚠️ **一個任務會發 4~11 次搜尋、平均約 7 次**，不是直覺的 1 次。計費按搜尋次數，
+  所以成本是原估的 7 倍 —— `--max-searches` 的預設值已照這個修正。
+- ⚠️ **命中全部是 `m_txt`，`m_src` = 0/4。** `groundingChunks` 只有 1~2 筆且是網域名
+  → 日期是模型「講」出來的，不是從檢索原文抽出來的。樣本放大後要重看這個比例。
+
+**9. 決定：AI Studio 那條整個砍掉**（金鑰已刪除）
+
+程式碼只剩 Vertex 一道門，不留旗標、不留 `AIStudioBackend`、不留 `GEMINI_API_KEY`。
+
+> ⚠️ **別因為「多一個 fallback 比較保險」就把它加回來**：Cloud 額度付不了它的帳，
+> 而它現在對新專案一律 429。留著只會讓下一個人再走一次第 2~5 步。
+
+### 放量前先做對照實驗：`mops/gemini_benchmark.py`
+
+**別直接拿 gemini 去補 `failed`。** 那批沒有任何外部基準可驗，會複製「資料品質」那節
+`google` 批的困境：補到了，但發現日期系統性偏早時只能靠週末率、慣用申報日分布這些
+間接證據去推論，無法直接算對錯。
+
+先打「已經知道答案」的那批 —— MOPS 有官方申報日、`yahoo` 也已經成功的重疊區
+（目前 **2,376 筆 / 49 檔**，`yahoo` 對 MOPS 的一致率是 **99.83%**，這就是要打敗的基準線；200 筆抽樣約發 800~2,200 次搜尋，實測每筆 4~11 次）：
+
+```bash
+python3 -m mops.gemini_benchmark --dry-run     # 不呼叫 API，看抽樣組成與預估花費
+python3 -m mops.gemini_benchmark -n 5          # 煙霧測試：驗連得上、CSV 續跑正常
+python3 -m mops.gemini_benchmark -n 200        # 真的跑（約 800~2,200 次搜尋）
+                                              #   預設 --max-searches 2500 涵蓋高標
+python3 -m mops.gemini_benchmark --report-only # 只根據既有 CSV 重印報表
+```
+
+只讀 `revswarm.db`（`mode=ro`），**不 lease、不 report、不寫任何 state**，server 跑著也能執行。
+逐筆 append 進 `gemini_benchmark.csv`，中斷後重跑會跳過已完成的列（**不重複付費**）。
+
+抽樣是**跨 49 檔輪抽**、不是純隨機：重疊區各檔筆數差很多（有的 73 個月全有、有的只有幾個月），
+純隨機會讓樣本被少數幾檔灌爆，量到的就變成「模型對某一家的熟悉度」。`--seed` 固定可重現。
+
+報表印四塊，每一塊都是為了擋掉一種誤讀：
+
+| 區塊 | 擋掉什麼誤讀 |
+|---|---|
+| **召回** | 分母只算 `status=ok`（模型真的搜了）。⚠️ `nosearch`／`error` 不計入——沒查成功不等於查不到 |
+| **準確率 + 對照組** | 同一批 `yahoo` 的一致率也算一次。沒有對照組的「gemini 92%」是沒有意義的數字 |
+| **信任分級** | `m_src` / `m_txt` 分開算。整體好看但全靠 `m_txt` 撐 → 是「講」對的不是「查」對的 |
+| **偏向** | 有號日差（負=偏早）＋週末率，跟「資料品質」那節量 `google` 批用的是同一把尺，結論才可比 |
+
+> ⚠️ **這個實驗量到的是樂觀上界。** MOPS t05st01 只涵蓋約 49 家自願揭露月營收的公司，
+> 幾乎都是大型股 —— 正是模型最可能單靠記憶就答得出來的一群。真正要補的 5,613 筆
+> `failed` 是冷門股與舊月份，表現只會更差。
+>
+> **放量門檻建議：整體一致率 ≥ `yahoo` 對照組，且 `m_txt` 那層單獨也站得住。**
+> 不過關就把結論補進這一節、關掉這條路——那也是一個有價值的產出。
 
 ## 部署（讓多台 worker 連到 server）
 

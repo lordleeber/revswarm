@@ -7,12 +7,12 @@ revswarm 的 Yahoo worker：可在任意機器啟動，向 server 租任務、�
 Yahoo 兩種年份都試過仍找不到窗內日期的 failed，由 google_worker.py 走 engine='google'
 佇列二次補搜——兩者共用同一套佇列協定與 revlib 窗過濾，只換抓取來源。
 
-爬取配方（todo.txt 第3節）：
+爬取配方（完整理由見 README「踩過的雷」）：
   對單一 (股票,月份)：
     1. 依序試查詢字串（中一個就停）：
          q_roc = "{stock_id} {name} {roc_year}年{roc_month}月"     # 民國年 → 常釣到 MoneyDJ
          q_ad  = "{stock_id} {name} {roc_year+1911}年{roc_month}月" # 西元年 → 常釣到 Yahoo【公告】
-       ⚠️ 絕不在查詢後加「營收」二字（會害 recall 掉一半，todo 2.3a）。
+       ⚠️ 絕不在查詢後加「營收」二字（會害 recall 掉一半，見 README「查詢字串的兩個關鍵教訓」）。
        名稱前綴 4 碼代號，冷門股/舊月份的命中率通常較純名稱高。
     2. curl 一定加 --http1.1（否則 HTTP/2 在某些環境 SSL EOF、回 000）。
     3. 分類：curl 非0 / http!=200 / 頁面 <2000B → RATE_LIMITED（退避重試，不算 failed）。
@@ -39,7 +39,7 @@ import revlib
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
-MIN_PAGE_BYTES = 2000        # 小於此視為被限流/擋（todo 2.6）
+MIN_PAGE_BYTES = 2000        # 小於此視為被限流/擋（README「rate-limit / 封鎖」）
 # 讓 curl 走 proxy（例 socks5h://127.0.0.1:1080，經 SSH SOCKS 從別的 IP 出去繞 per-IP
 # rate limit）。只影響爬 Yahoo 的 curl；worker↔server 的 urllib 不受影響、仍走原路。
 PROXY = os.environ.get("WORKER_PROXY") or None
