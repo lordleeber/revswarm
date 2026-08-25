@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-覆蓋既有 success 中「Yahoo 公布日晚於 MOPS 官方申報日」(diff>0) 的那批，改用 MOPS 官方日。
+覆蓋既有 success 中「公布日與 MOPS 官方申報日不符」的那批，一律改用 MOPS 官方日。
 
 - 母體：mops_baseline.csv（官方申報日）∩ 任務範圍 ∩ 過窗 ∩ DB 現為 success 且日期不符。
-- 只動 diff>0（Yahoo 晚於 MOPS，多為 Yahoo 匹配到較晚的回顧型文章）。
-- diff<0（Yahoo 反而早於官方，可疑）一律**保留待查**，只列出、不覆蓋。
-- 覆蓋後標 source='mops'，並清掉 Yahoo 衍生的 raw_title/revenue/yoy（避免與新日期矛盾；
-  與 mops_fill.py 對 mops 列的處理一致）。
+- **兩個方向都覆蓋**。MOPS t05st01 是公開資訊觀測站的官方申報紀錄，就是「這筆營收哪天
+  公布」的權威定義；兩邊不一致時沒有第二種解讀，以 MOPS 為準。
+- ⚠️ 早期版本只動 diff>0（Yahoo 晚於 MOPS），diff<0 保留待查，理由是「新聞早於官方申報
+  日很可疑，覆蓋掉就看不見那個訊號」。改掉的依據：5465 富驊 112/12 原本 diff=-1，
+  2026-08-25 用原本那兩種查詢重抓，Yahoo 自己也給出 MOPS 那個日期——偏早只是配錯文章，
+  不是新聞真的搶先（見 data/date_overrides.csv 那筆的 note）。
+  訊號沒有丟掉：diff<0 仍單獨列出來印，只是不再擋著不寫。
+- 覆蓋後標 source='mops'，並清掉 Yahoo 衍生的 raw_title/revenue/yoy 與 url/verified
+  （避免與新日期矛盾；與 mops_fill.py 對 mops 列的處理一致）。
 - 樂觀鎖：WHERE id=? AND state='success' AND announce_date=<原Yahoo日>；只在該列未變動時覆蓋，
   故冪等、且對線上 worker 安全（worker 的 report() 本就不動 success 列）。
 
@@ -41,21 +46,22 @@ def daydiff(a, b):
     return (date(ya, ma, da) - date(yb, mb, db)).days
 
 
-def main():
-    ap = argparse.ArgumentParser(description="用 MOPS 官方日覆蓋 Yahoo 晚報的 success")
-    ap.add_argument("--db", default="revswarm.db")
-    ap.add_argument("--baseline", default="mops_baseline.csv")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+def select_overwrites(conn, base, now):
+    """
+    挑出「DB 現為 success 但日期與 MOPS 不符」的列。
 
-    base = load_baseline(args.baseline)
-    now = int(time.time())
-    conn = sqlite3.connect(args.db, timeout=60)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=60000")
+    回傳 (overwrite, negatives)：
+      overwrite = [(mops_date, now, id, 原日期), ...]  ← 直接餵 executemany，最後一個
+                  欄位是樂觀鎖用的原值（見 main 的 UPDATE ... AND announce_date=?）
+      negatives = [(sid, ry, rm, 原日期, mops_date, diff), ...]
+                  overwrite 的子集合，只挑 diff<0（DB 早於官方）那些，單獨印出來當訊號。
+                  ⚠️ 它不再是「保留不寫」的名單——兩個方向都會覆蓋，見模組 docstring。
 
-    overwrite = []      # (mops_date, now, id, orig_yahoo_date)
-    keep_neg = []       # (sid, ry, rm, yahoo, mops, diff)
+    跳過的四種：不在任務範圍、MOPS 日期畸形、MOPS 日期落在窗外（拿它覆蓋會把窗外值寫進
+    DB，破壞「所有 announce_date 都過窗」這個專案級保證）、DB 不是 success（那是
+    mops_fill 的守備範圍，這支只改已經定案但值不對的列）。
+    """
+    overwrite, negatives = [], []
     for (sid, ry, rm), md in base.items():
         if (ry, rm) < revlib.ROC_START or (ry, rm) > revlib.ROC_END:
             continue
@@ -72,16 +78,34 @@ def main():
         if not row or row["state"] != "success" or not row["announce_date"] \
                 or row["announce_date"] == md:
             continue
-        diff = daydiff(row["announce_date"], md)      # Yahoo - MOPS
-        if diff > 0:
-            overwrite.append((md, now, row["id"], row["announce_date"]))
-        elif diff < 0:
-            keep_neg.append((sid, ry, rm, row["announce_date"], md, diff))
+        overwrite.append((md, now, row["id"], row["announce_date"]))
+        diff = daydiff(row["announce_date"], md)      # DB - MOPS
+        if diff < 0:
+            negatives.append((sid, ry, rm, row["announce_date"], md, diff))
+    return overwrite, negatives
 
-    print(f"要覆蓋（Yahoo 晚於 MOPS, diff>0）：{len(overwrite)} 筆")
-    print(f"保留待查（Yahoo 早於 MOPS, diff<0）：{len(keep_neg)} 筆")
-    for sid, ry, rm, yd, md, diff in sorted(keep_neg):
-        print(f"   保留 {sid} {ry}/{rm:02d}  Yahoo={yd}  MOPS={md}  ({diff:+d}天)")
+
+def main():
+    ap = argparse.ArgumentParser(description="用 MOPS 官方日覆蓋不符的 success")
+    ap.add_argument("--db", default="revswarm.db")
+    ap.add_argument("--baseline", default="mops_baseline.csv")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    base = load_baseline(args.baseline)
+    now = int(time.time())
+    conn = sqlite3.connect(args.db, timeout=60)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=60000")
+
+    overwrite, negatives = select_overwrites(conn, base, now)
+
+    print(f"要覆蓋（與 MOPS 官方申報日不符）：{len(overwrite)} 筆")
+    # ⚠️ diff<0 仍單獨印出來：DB 的日期早於官方申報日是異常，即使照樣覆蓋，也該讓人
+    # 看見它出現在哪幾筆、是不是集中在某種 raw_title 格式或某段時間。
+    print(f"   其中 DB 早於官方（diff<0，異常，仍會覆蓋）：{len(negatives)} 筆")
+    for sid, ry, rm, yd, md, diff in sorted(negatives):
+        print(f"   ⚠️ {sid} {ry}/{rm:02d}  DB={yd}  MOPS={md}  ({diff:+d}天)")
 
     if args.dry_run:
         print("\n[dry-run] 不寫入。")

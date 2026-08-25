@@ -86,3 +86,75 @@ class TestDaydiff(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSelectOverwrites(unittest.TestCase):
+    """
+    mops_overwrite.select_overwrites 的分類。
+
+    ⚠️ 這組盯的是一個**刻意改掉的預設**：早期版本只覆蓋 diff>0（Yahoo 晚於 MOPS），
+    diff<0 一律保留待查，理由是「新聞早於官方申報日很可疑，覆蓋掉就看不見那個訊號」。
+    後來的決定是 MOPS t05st01 是官方申報紀錄、就是公布日的權威定義，兩邊不一致時
+    一律以 MOPS 為準，diff<0 也覆蓋。佐證：5465 富驊 112/12 原本 diff=-1，重抓後
+    Yahoo 自己也給出 MOPS 那個日期，代表偏早只是配錯文章、不是新聞真的搶先。
+    訊號沒有丟掉——diff<0 仍單獨列出來印，只是不再擋著不寫。
+    """
+
+    def _conn_with(self, rows):
+        conn = make_conn()
+        for sid, ry, rm, state, ad in rows:
+            add_task(conn, sid, ry, rm, state=state, announce_date=ad)
+        return conn
+
+    def test_overwrites_both_directions(self):
+        conn = self._conn_with([
+            ("1101", 110, 5, "success", "2021-06-14"),   # Yahoo 晚 → diff>0
+            ("1102", 110, 5, "success", "2021-06-02"),   # Yahoo 早 → diff<0
+        ])
+        base = {("1101", 110, 5): "2021-06-08", ("1102", 110, 5): "2021-06-08"}
+        ow, neg = mops_overwrite.select_overwrites(conn, base, now=0)
+        self.assertEqual({o[3] for o in ow}, {"2021-06-14", "2021-06-02"})
+        self.assertEqual([n[0] for n in neg], ["1102"])   # 仍然單獨列出來當訊號
+
+    def test_matching_date_is_left_alone(self):
+        conn = self._conn_with([("1101", 110, 5, "success", "2021-06-08")])
+        ow, neg = mops_overwrite.select_overwrites(
+            conn, {("1101", 110, 5): "2021-06-08"}, now=0)
+        self.assertEqual((ow, neg), ([], []))
+
+    def test_non_success_is_skipped(self):
+        # 那是 mops_fill 的守備範圍；這支只改「已經定案但值不對」的列。
+        for state in ("undone", "failed", "prelisting"):
+            conn = self._conn_with([("1101", 110, 5, state, None)])
+            ow, _ = mops_overwrite.select_overwrites(
+                conn, {("1101", 110, 5): "2021-06-08"}, now=0)
+            self.assertEqual(ow, [], state)
+
+    def test_out_of_window_mops_date_is_skipped(self):
+        # MOPS 自己的日期若落在窗外，不可以拿它去覆蓋——那會把窗外值寫進 DB，
+        # 破壞「所有 announce_date 都過窗」這個專案級保證。
+        conn = self._conn_with([("1101", 110, 5, "success", "2021-06-08")])
+        ow, _ = mops_overwrite.select_overwrites(
+            conn, {("1101", 110, 5): "2021-07-20"}, now=0)
+        self.assertEqual(ow, [])
+
+    def test_out_of_task_range_is_skipped(self):
+        conn = self._conn_with([("1101", 108, 5, "success", "2019-06-02")])
+        ow, _ = mops_overwrite.select_overwrites(
+            conn, {("1101", 108, 5): "2019-06-08"}, now=0)
+        self.assertEqual(ow, [])
+
+    def test_malformed_mops_date_does_not_abort_the_run(self):
+        conn = self._conn_with([("1101", 110, 5, "success", "2021-06-02"),
+                                ("1102", 110, 5, "success", "2021-06-02")])
+        ow, _ = mops_overwrite.select_overwrites(
+            conn, {("1101", 110, 5): "不是日期",
+                   ("1102", 110, 5): "2021-06-08"}, now=0)
+        self.assertEqual([o[2] for o in ow], [2])        # 壞的跳過，好的照做
+
+    def test_row_shape_matches_the_update_statement(self):
+        # (mops_date, now, id, orig_date)：最後那個是樂觀鎖用的原值。
+        conn = self._conn_with([("1101", 110, 5, "success", "2021-06-02")])
+        ow, _ = mops_overwrite.select_overwrites(
+            conn, {("1101", 110, 5): "2021-06-08"}, now=1234)
+        self.assertEqual(ow, [("2021-06-08", 1234, 1, "2021-06-02")])
