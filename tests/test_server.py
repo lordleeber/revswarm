@@ -297,3 +297,212 @@ class TestAuth(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestUrlColumn(unittest.TestCase):
+    """report 存 url：worker 送上來的一律再驗格式，不合格存 NULL 而不是原樣寫進去。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,updated_at)"
+            " VALUES(1,'1301','台塑',111,10,'dispatched',0)")
+        self.store.conn.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _url(self):
+        return self.store.conn.execute(
+            "SELECT url FROM tasks WHERE id=1").fetchone()["url"]
+
+    def _report(self, url):
+        self.store.report("w", [{"id": 1, "status": "success",
+                                 "date": "2022-11-08", "source": "q_roc",
+                                 "title": "台塑 111年10月營收", "url": url}])
+
+    def test_stores_valid_url(self):
+        self._report("https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc")
+        self.assertEqual(self._url(),
+                         "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc")
+
+    def test_rejects_non_http_scheme(self):
+        # javascript:/file: 之類進了 provenance 欄位，事後有人照著點就是個洞。
+        self._report("javascript:alert(1)")
+        self.assertIsNone(self._url())
+
+    def test_missing_url_is_null_not_crash(self):
+        # yahoo/google 抓不到出處時就是不送這個鍵，不可以因此炸掉整批回報。
+        self.store.report("w", [{"id": 1, "status": "success",
+                                 "date": "2022-11-08", "source": "q_roc",
+                                 "title": "台塑"}])
+        self.assertIsNone(self._url())
+        self.assertEqual(self.store.conn.execute(
+            "SELECT state FROM tasks WHERE id=1").fetchone()["state"], "success")
+
+    def test_migration_adds_columns_to_old_db(self):
+        # 舊 DB 沒有這兩欄；_migrate 要補上，否則 report 的 UPDATE 會整個炸開。
+        import sqlite3
+        old = os.path.join(self.dir, "old.db")
+        c = sqlite3.connect(old)
+        c.execute("CREATE TABLE tasks(id INTEGER PRIMARY KEY, stock_id TEXT NOT NULL,"
+                  " name TEXT NOT NULL, roc_year INTEGER NOT NULL,"
+                  " roc_month INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'undone',"
+                  " announce_date TEXT, source TEXT, raw_title TEXT,"
+                  " revenue INTEGER, yoy REAL, attempts INTEGER DEFAULT 0,"
+                  " fail_count INTEGER DEFAULT 0, dispatched_at INTEGER,"
+                  " worker_id TEXT, updated_at INTEGER,"
+                  " UNIQUE(stock_id, roc_year, roc_month))")
+        c.commit()
+        c.close()
+        st = server.Store(old)
+        cols = {r[1] for r in st.conn.execute("PRAGMA table_info(tasks)")}
+        self.assertIn("url", cols)
+        self.assertIn("verified", cols)
+        st.conn.close()
+        os.remove(old)
+
+
+class TestVerify(unittest.TestCase):
+    """
+    verified 蓋章：**只有日期真的一致才蓋**。
+
+    這一組測試守的是這個欄位的全部意義——若「跑過就蓋」，verified 就退化成
+    「有人碰過這一筆」，跟沒有這欄一樣（見 Store.verify 的 docstring）。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,"
+            "announce_date,updated_at) VALUES"
+            "(1,'1301','台塑',111,10,'success','2022-11-08',111),"
+            "(2,'2330','台積電',109,1,'failed',NULL,222)")
+        self.store.conn.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _row(self, tid):
+        return self.store.conn.execute(
+            "SELECT verified, updated_at FROM tasks WHERE id=?", (tid,)).fetchone()
+
+    def test_stamps_when_date_agrees(self):
+        c = self.store.verify("mops", [{"stock_id": "1301", "roc_year": 111,
+                                        "roc_month": 10, "date": "2022-11-08"}])
+        self.assertEqual(c["verified"], 1)
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_mismatch_does_not_stamp_and_does_not_overwrite_date(self):
+        c = self.store.verify("gemini", [{"stock_id": "1301", "roc_year": 111,
+                                          "roc_month": 10, "date": "2022-11-09"}])
+        self.assertEqual(c["mismatch"], 1)
+        self.assertIsNone(self._row(1)["verified"])
+        # 兩個來源打架時，verify 只負責回報，絕不動 announce_date。
+        self.assertEqual(self.store.conn.execute(
+            "SELECT announce_date FROM tasks WHERE id=1").fetchone()[0], "2022-11-08")
+
+    def test_out_of_window_date_is_mismatch_not_stamp(self):
+        # 送上來的日期先過 validate_date：窗外的日期連比對都不該進行。
+        c = self.store.verify("mops", [{"stock_id": "1301", "roc_year": 111,
+                                        "roc_month": 10, "date": "2023-05-01"}])
+        self.assertEqual(c["mismatch"], 1)
+        self.assertIsNone(self._row(1)["verified"])
+
+    def test_non_success_row_is_skipped(self):
+        c = self.store.verify("mops", [{"stock_id": "2330", "roc_year": 109,
+                                        "roc_month": 1, "date": "2020-02-10"}])
+        self.assertEqual(c["not_success"], 1)
+        self.assertIsNone(self._row(2)["verified"])
+
+    def test_unknown_row_and_bad_month(self):
+        c = self.store.verify("mops", [
+            {"stock_id": "9999", "roc_year": 111, "roc_month": 10, "date": "2022-11-08"},
+            {"stock_id": "1301", "roc_year": "x", "roc_month": 10, "date": "2022-11-08"},
+        ])
+        self.assertEqual(c["unknown"], 2)
+
+    def test_does_not_touch_updated_at(self):
+        # updated_at 餵 /stats 的「近 5 分完成數」與吞吐/ETA。蓋章不是重新抓到，
+        # 動了它會讓進度看板憑空多出一批剛完成的任務。
+        before = self._row(1)["updated_at"]
+        self.store.verify("mops", [{"stock_id": "1301", "roc_year": 111,
+                                    "roc_month": 10, "date": "2022-11-08"}])
+        self.assertEqual(self._row(1)["updated_at"], before)
+
+    def test_idempotent(self):
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("mops", item)
+        c = self.store.verify("mops", item)
+        self.assertEqual(c["verified"], 1)
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_weak_verifier_never_downgrades_a_strong_stamp(self):
+        """
+        ⚠️ README 教的跑法就是先 mops 後 gemini，而一列只有一個 verified 欄。若後蓋的
+        無條件覆寫，使用者照著文件跑就會把 MOPS 官方文件蓋的章默默換成 gemini
+        ——最硬的證據被弱來源弄丟，而且沒有任何跡象。
+        """
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("mops", item)
+        c = self.store.verify("gemini", item)
+        self.assertEqual(c["kept"], 1)
+        self.assertEqual(c["verified"], 0)
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_strong_verifier_upgrades_a_weak_stamp(self):
+        # 反方向要通：gemini 蓋過的列，mops 來了要升級。
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("gemini", item)
+        c = self.store.verify("mops", item)
+        self.assertEqual(c["verified"], 1)
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_malformed_items_never_abort_the_batch(self):
+        """
+        ⚠️ 整批是一個交易，而 handler 只接 sqlite3.OperationalError。任何一個元素
+        丟出 AttributeError 都會 rollback 掉其餘 499 筆，並回 500 加一段 traceback。
+        （validate_date 對非字串做 .strip()、item.get 對非 dict——兩種都會炸。）
+        """
+        good = {"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                "date": "2022-11-08"}
+        c = self.store.verify("mops", [
+            "我不是 dict",
+            None,
+            {"stock_id": "1301", "roc_year": 111, "roc_month": 10, "date": 20221108},
+            {"stock_id": None, "roc_year": 111, "roc_month": 10, "date": "2022-11-08"},
+            good,
+        ])
+        self.assertEqual(c["unknown"], 4)
+        self.assertEqual(c["verified"], 1)          # 好的那筆照樣蓋成
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_report_clears_a_stale_stamp_when_the_date_changes(self):
+        # 舊的章是對「上一個日期」蓋的；新抓到日期還留著它，就成了替沒人驗過的值背書。
+        self.store.conn.execute(
+            "UPDATE tasks SET state='dispatched', verified='mops' WHERE id=1")
+        self.store.conn.commit()
+        self.store.report("w", [{"id": 1, "status": "success",
+                                 "date": "2022-11-09", "source": "q_roc",
+                                 "title": "台塑"}])
+        row = self.store.conn.execute(
+            "SELECT announce_date, verified FROM tasks WHERE id=1").fetchone()
+        self.assertEqual(row["announce_date"], "2022-11-09")
+        self.assertIsNone(row["verified"])

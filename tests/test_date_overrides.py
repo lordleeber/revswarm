@@ -13,6 +13,7 @@ apply_date_overrides 的回歸（不連網；寫入路徑用 :memory: 跑真 sch
 import csv
 import io
 import sqlite3
+import os
 import unittest
 
 import apply_date_overrides as ado
@@ -294,3 +295,37 @@ class TestShippedCsv(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRealOverridesFile(unittest.TestCase):
+    """
+    版控裡那份 data/date_overrides.csv 本身要通過驗證。
+
+    ⚠️ 這支盯的是「真檔案」而不是合成字串：這個檔是人工逐行維護的，最典型的失誤
+    （複製一行改一半、note 裡打了半形逗號、日期沒補零）只有拿真檔去驗才擋得到。
+    DB 是執行期產物、不進版控，所以這個檔就是那些人工判斷的唯一存放處。
+    """
+
+    PATH = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "data", "date_overrides.csv")
+
+    def test_real_file_validates(self):
+        fn, rows = ado.load_overrides(self.PATH)
+        self.assertEqual(ado.validate_all(fn, rows), [])
+
+    def test_carries_the_fuhua_correction(self):
+        """
+        5465 富驊 112/12：DB 原本是 2024-01-08，比 MOPS 官方申報日早 1 天。
+
+        這一筆與那份檔案原本收的「遲交」個案不同——它不是窗外，是**窗內但抓錯**。
+        重跑證實了：今天用同樣兩種查詢重抓，兩種都得到 2024-01-09（＝MOPS），
+        出處是玉山證券那篇，原文寫「2024年1月9日 · 公司名稱：富驊 (5465)發言人：
+        王駿東 (總經理)」——那是 MOPS 申報公告的格式。
+        """
+        _, rows = ado.load_overrides(self.PATH)
+        hit = [r for _, r in rows
+               if (r["stock_id"], r["roc_year"], r["roc_month"]) == ("5465", "112", "12")]
+        self.assertEqual(len(hit), 1, "富驊 112/12 的更正不在 date_overrides.csv 裡")
+        self.assertEqual(hit[0]["announce_date"], "2024-01-09")
+        self.assertTrue(hit[0]["source"].endswith("manual"))
+        self.assertIn("2024-01-09", hit[0]["note"])

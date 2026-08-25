@@ -206,3 +206,44 @@ class TestFetchRetry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCrawlTaskUrl(unittest.TestCase):
+    """
+    出處網址：三支 worker 裡就這支最硬——SERP 上的 <a href>，客觀存在、位置綁定。
+    測的重點是「綁到正確的那一筆」，不是「有沒有值」。
+    """
+
+    def setUp(self):
+        self._time, self._random, self._fetch = (
+            yahoo_worker.time, yahoo_worker.random, yahoo_worker.fetch)
+        yahoo_worker.time = _FakeTime()
+        yahoo_worker.random = types.SimpleNamespace(uniform=lambda a, b: 0.0)
+
+    def tearDown(self):
+        yahoo_worker.time, yahoo_worker.random, yahoo_worker.fetch = (
+            self._time, self._random, self._fetch)
+
+    def _task(self):
+        return {"id": 1, "stock_id": "2330", "name": "台積電",
+                "roc_year": 109, "roc_month": 1}
+
+    def test_unwraps_yahoo_redirect_and_binds_to_the_right_result(self):
+        html = (
+            '<a href="https://r.search.yahoo.com/_ylt=A/RV=2/'
+            'RU=https%3a%2f%2fmoneydj.com%2fright/RK=2/RS=z-">'
+            '台積電 109年1月營收10.17億</a>'
+            '<p>2020年2月10日 發布</p>'
+            '<a href="https://r.search.yahoo.com/_ylt=B/RV=2/'
+            'RU=https%3a%2f%2fmoneydj.com%2fwrong/RK=2/RS=z-">下一筆結果</a>'
+            + "x" * 3000)
+        yahoo_worker.fetch = lambda q, timeout=25: (html, True)
+        r = yahoo_worker.crawl_task(self._task(), per_query_sleep=1.5)
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["url"], "https://moneydj.com/right")
+
+    def test_no_link_before_date_gives_none_not_crash(self):
+        yahoo_worker.fetch = lambda q, timeout=25: (_page("台積電", 109, 1), True)
+        r = yahoo_worker.crawl_task(self._task(), per_query_sleep=1.5)
+        self.assertEqual(r["status"], "success")
+        self.assertIsNone(r["url"])       # 純文字假頁沒有 <a>，不是失敗

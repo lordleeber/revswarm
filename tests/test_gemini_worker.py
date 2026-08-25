@@ -79,14 +79,14 @@ class TestExtract(unittest.TestCase):
         """日期在 groundingChunks 標題裡（真實檢索文字）→ source=m_src，優先於模型文字。"""
         p = _payload(text="台積電 109年1月營收於 2020年2月11日 公布。",
                      chunks=[_titled()])
-        date, src, _ = gw.extract(p, "台積電", 109, 1)
+        date, src, _, _u = gw.extract(p, "台積電", 109, 1)
         self.assertEqual(src, gw.SRC_CHUNK)
         self.assertEqual(date, "2020-02-10")     # 取 chunk 的，不是模型文字的 02-11
 
     def test_model_text_only_is_marked_m_txt(self):
         """groundingChunks 只給網域名（Gemini API 的常態）→ 只能靠模型文字，標 m_txt。"""
         p = _payload(text=_titled(), chunks=["moneydj.com", "cna.com.tw"])
-        date, src, _ = gw.extract(p, "台積電", 109, 1)
+        date, src, _, _u = gw.extract(p, "台積電", 109, 1)
         self.assertEqual(src, gw.SRC_TEXT)
         self.assertEqual(date, "2020-02-10")
 
@@ -101,7 +101,7 @@ class TestExtract(unittest.TestCase):
         p = _payload(text=("DATE: 2022-11-08\n"
                            "TITLE: 台塑四寶10月營收3降1升台塑化獨成長\n"
                            "URL: https://ctee.com.tw/news/industry/750438.html"))
-        date, src, title = gw.extract(p, "台塑", 111, 10)
+        date, src, title, _u = gw.extract(p, "台塑", 111, 10)
         self.assertEqual(date, "2022-11-08")
         self.assertEqual(src, gw.SRC_TEXT)
         self.assertEqual(title, "台塑四寶10月營收3降1升台塑化獨成長")
@@ -111,14 +111,14 @@ class TestExtract(unittest.TestCase):
         """m_src 的 title 來自檢索原文，不該被模型自己寫的 TITLE 蓋掉。"""
         p = _payload(text="TITLE: 模型自己寫的標題",
                      chunks=[_titled()])
-        _, src, title = gw.extract(p, "台積電", 109, 1)
+        _, src, title, _u = gw.extract(p, "台積電", 109, 1)
         self.assertEqual(src, gw.SRC_CHUNK)
         self.assertNotIn("模型自己寫的", title)
 
     def test_falls_back_when_no_title_line(self):
         """模型沒照格式回 TITLE: 時，仍沿用 revlib.parse 的後備截字，不要炸掉。"""
         p = _payload(text=_titled())
-        date, _, title = gw.extract(p, "台積電", 109, 1)
+        date, _, title, _u = gw.extract(p, "台積電", 109, 1)
         self.assertEqual(date, "2020-02-10")
         self.assertTrue(title)
 
@@ -392,7 +392,7 @@ class TestChunkPathRequiresAnchor(unittest.TestCase):
 
     def test_chunk_with_correct_anchor_still_works(self):
         p = _payload(text="", chunks=["南亞 109年1月營收\n台塑 109年1月營收 2020年2月10日"])
-        date, src, _ = gw.extract(p, "台塑", 109, 1)
+        date, src, _, _u = gw.extract(p, "台塑", 109, 1)
         self.assertEqual((date, src), ("2020-02-10", gw.SRC_CHUNK))
 
 
@@ -563,3 +563,61 @@ class TestRunLoop(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtractUrl(unittest.TestCase):
+    """
+    模型自報的出處。三支 worker 裡就這支的 url 是模型「說」的，不是頁面上讀到的
+    ——所以測的重點是「格式不合就丟掉」，而不是「一定要有」。
+    """
+
+    def setUp(self):
+        # ⚠️ 換掉的是模組全域，測完一定要換回來：漏掉會讓後面所有測試都吃到這個假的
+        # call_gemini（實測會讓 8 個錯誤分類的測試莫名其妙一起紅）。
+        self._call = gw.call_gemini
+
+    def tearDown(self):
+        gw.call_gemini = self._call
+
+    def _p(self, text):
+        return _payload(text=text, chunks=["moneydj.com"])
+
+    def test_takes_model_url_line(self):
+        p = self._p(_titled() + "\nURL: https://www.moneydj.com/kmdj/news/x.aspx?a=1")
+        self.assertEqual(gw.extract(p, "台積電", 109, 1)[3],
+                         "https://www.moneydj.com/kmdj/news/x.aspx?a=1")
+
+    def test_no_url_line_is_none_not_failure(self):
+        # 模型少回一行是常態，日期照樣要成立。
+        hit = gw.extract(self._p(_titled()), "台積電", 109, 1)
+        self.assertEqual(hit[0], "2020-02-10")
+        self.assertIsNone(hit[3])
+
+    def test_url_none_when_model_says_none(self):
+        p = self._p(_titled() + "\nURL: NONE")
+        self.assertIsNone(gw.extract(p, "台積電", 109, 1)[3])
+
+    def test_rejects_non_http_scheme(self):
+        p = self._p(_titled() + "\nURL: javascript:alert(1)")
+        self.assertIsNone(gw.extract(p, "台積電", 109, 1)[3])
+
+    def test_chunk_path_refuses_the_model_url(self):
+        """
+        ⚠️ m_src 那層一定要 url=None。日期來自 groundingChunks（真實檢索文字），而
+        模型的 URL: 那行是它自己寫的、不保證就是那個 chunk 的出處。掛上去等於讓
+        「date 來自檢索原文」這個高信任標記，替一個低信任的網址背書。
+        TITLE: 那行在這條路上已經被拒收了，URL: 沒有理由破例。
+        """
+        p = _payload(text=_titled() + "\nURL: https://cna.com.tw/a",
+                     chunks=[_titled()])
+        hit = gw.extract(p, "台積電", 109, 1)
+        self.assertEqual(hit[1], gw.SRC_CHUNK)
+        self.assertIsNone(hit[3])
+
+    def test_crawl_task_carries_url_into_result(self):
+        p = self._p(_titled() + "\nURL: https://cna.com.tw/a")
+        gw.call_gemini = lambda *a, **k: (p, None)
+        r, fatal = gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(10, 0))
+        self.assertFalse(fatal)
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["url"], "https://cna.com.tw/a")

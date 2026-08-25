@@ -108,8 +108,11 @@ def main():
     conn.execute("BEGIN IMMEDIATE;")
     try:
         cur = conn.executemany(
+            # url/verified 一起清。這裡打的是 state!='success' 的列，照理不會有值，
+            # 但「凡是寫 announce_date 的敘述都要重設這兩欄」比「逐條推理這條路徑會
+            # 不會有殘值」好守——少想一次就是一個假出處。
             "UPDATE tasks SET state='success', announce_date=?, source='mops',"
-            " raw_title=NULL, revenue=NULL, yoy=NULL,"
+            " raw_title=NULL, revenue=NULL, yoy=NULL, url=NULL, verified=NULL,"
             " dispatched_at=NULL, worker_id=NULL, updated_at=?"
             " WHERE id=? AND state!='success'",
             updates)

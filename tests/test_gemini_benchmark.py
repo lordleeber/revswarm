@@ -230,6 +230,19 @@ class TestMeasureOne(unittest.TestCase):
         self.assertEqual(r["search_queries"],
                          "台塑 2022年10月營收" + gb.QUERY_SEP + "台塑 111年10月")
 
+    def test_records_model_reported_url(self):
+        """差 1 天那種個案要回頭看原文時，只有這欄能直接點開（見 measure_one）。"""
+        gw.call_gemini = lambda *a, **k: (self._payload(
+            "【公告】台積電 109年1月營收 2020年2月10日\nURL: https://cna.com.tw/a"), None)
+        r = gb.measure_one(_row("2330", 109, 1), _backend(), "m", gw.Budget(0))
+        self.assertEqual(r["url"], "https://cna.com.tw/a")
+
+    def test_url_blank_when_model_omits_it(self):
+        gw.call_gemini = lambda *a, **k: (self._payload(
+            "【公告】台積電 109年1月營收 2020年2月10日"), None)
+        r = gb.measure_one(_row("2330", 109, 1), _backend(), "m", gw.Budget(0))
+        self.assertIn(r.get("url"), (None, ""))
+
     def test_search_queries_empty_when_call_failed(self):
         gw.call_gemini = lambda *a, **k: (None, gw.ERR_NOSEARCH)
         r = gb.measure_one(_row("1301", 111, 10), _backend(), "m", gw.Budget(0))

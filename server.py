@@ -11,7 +11,9 @@ state machine:  undone → dispatched → (success | failed)
 endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可設）：
   POST /lease?n=30&worker=<id>&engine=yahoo   原子租一批任務
                                      （engine 分流佇列，預設 yahoo；只收 yahoo|google|gemini，其餘 400）
-  POST /result   {results:[{id,status,date?,source?,title?}, ...]}  批次回報
+  POST /result   {results:[{id,status,date?,source?,title?,url?}, ...]}  批次回報
+  POST /verify   {by:"mops"|"gemini", items:[{stock_id,roc_year,roc_month,date}, ...]}
+                                     第二來源同意才蓋 verified（見 Store.verify）
   GET  /stats                        進度、各 state 計數、近況
   GET  /healthz                      存活探針（免 token）
   POST /admin/requeue-failed?engine=google   把 failed 轉去指定 engine 的佇列重掃
@@ -39,6 +41,17 @@ LEASE_TTL = 600          # 秒；dispatched 超過此值未回覆即可被重派
 MAX_LEASE = 200          # 單次 lease 上限，避免一隻 worker 掃光佇列
 ENGINES = ("yahoo", "google", "gemini")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
 DEFAULT_ENGINE = "yahoo"
+# verified 欄位的合法值白名單與**強弱排序**。刻意用白名單而不是自由字串：這一欄的
+# 全部價值就在於「看到它就知道有第二個獨立來源核對過」，放任何人寫任何字進去就等於
+# 沒有這個保證。
+#
+# ⚠️ 排序不是裝飾，是必要的：一列只有一個 verified 欄，裝不下「兩個來源都同意」。
+# 而 README 教的跑法就是先 mops 後 gemini，若後蓋的無條件覆寫，那些 MOPS 官方文件
+# 蓋過的章會被 gemini 這個弱來源默默降級——使用者照著文件跑就會把最硬的證據弄丟。
+# 數字大 = 強。mops 是官方申報文件；gemini 是模型 grounding（實測 m_src 為 0，全靠
+# 模型合成文字，見 README「對照實驗」）。
+VERIFIER_RANK = {"mops": 2, "gemini": 1}
+VERIFIERS = tuple(VERIFIER_RANK)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks(
@@ -51,6 +64,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   announce_date TEXT,
   source        TEXT,
   raw_title     TEXT,
+  url           TEXT,             -- 這個日期是從哪一篇讀到的（provenance；見 revlib「來源網址」）
+  verified      TEXT,             -- 第二個獨立來源同意 announce_date 才蓋章：mops|gemini（見 Store.verify）
   revenue       INTEGER,          -- 月營收(元)，由 raw_title 解析；非官方、四捨五入，僅供校驗
   yoy           REAL,             -- 年增率(%)，同上
   engine        TEXT NOT NULL DEFAULT 'yahoo',  -- 佇列分流：yahoo|google|gemini（見 lease/requeue_failed）
@@ -88,7 +103,10 @@ def _migrate(conn):
     """既有 DB 補欄位：CREATE TABLE IF NOT EXISTS 不會替舊表加欄位，故手動 ALTER。"""
     have = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     for col, decl in (("revenue", "INTEGER"), ("yoy", "REAL"),
-                      ("engine", "TEXT NOT NULL DEFAULT 'yahoo'")):
+                      ("engine", "TEXT NOT NULL DEFAULT 'yahoo'"),
+                      # ⚠️ 既有 ~12 萬筆 success 這兩欄一定是 NULL，補不回來——當初沒存。
+                      # 「NULL = 不知道」，不要在查詢裡把它當成「沒有出處/未驗證」的結論。
+                      ("url", "TEXT"), ("verified", "TEXT")):
         if col not in have:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
     # 這個索引依賴 engine 欄位，須放在上面 ALTER TABLE 之後才能建（SCHEMA 的
@@ -401,14 +419,96 @@ class Store:
                             title = item.get("title")
                             rev = revlib.parse_revenue(title)   # 順手抽營收(非權威，僅校驗)
                             revenue, yoy = rev if rev else (None, None)
+                            # url 跟 date 一樣是 worker 送上來的，一律再驗一次格式：
+                            # 不合格就存 NULL，不要讓垃圾字串混進 provenance 欄位。
+                            url = revlib.clean_url(item.get("url"))
                             conn.execute(
+                                # verified=NULL：這是一個新抓到的日期，舊的章是對
+                                # 「上一個日期」蓋的，留著就會替一個沒人驗過的值背書。
                                 "UPDATE tasks SET state='success', announce_date=?,"
-                                " source=?, raw_title=?, revenue=?, yoy=?, worker_id=?,"
+                                " source=?, raw_title=?, url=?, revenue=?, yoy=?,"
+                                " verified=NULL, worker_id=?,"
                                 " dispatched_at=NULL, updated_at=? WHERE id=?",
-                                (valid, item.get("source"), title, revenue, yoy,
+                                (valid, item.get("source"), title, url, revenue, yoy,
                                  worker_id, now, tid),
                             )
                             counts["success"] += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return counts
+
+    # --- 蓋章：第二個獨立來源同意 announce_date ------------------------------
+    def verify(self, by, items):
+        """
+        把「已經被第二個來源核對過」的列蓋上 verified=by。
+
+        為什麼蓋章要走 server、而不是讓對照實驗自己開 DB 寫：
+          server 是這個 DB 的**唯一寫入者**（全靠 self._lock + BEGIN IMMEDIATE 串行化）。
+          多開一個寫入者就得自己處理鎖競爭，而 gemini_benchmark 的賣點之一正是「唯讀，
+          可以在 server 跑著的時候執行」。走 endpoint 兩邊都保住。
+
+        ⚠️ 蓋章的前提是**日期真的一致**：呼叫端送上它那邊看到的 date，跟 DB 裡的
+        announce_date 對不上就記成 mismatch、不蓋。不然 verified 只是「有人跑過這一筆」，
+        不是「有人證實過這一筆」——那就一文不值了。
+        日期不一致本身是有價值的訊號（代表兩個來源打架），留給呼叫端去看，這裡不改資料。
+
+        ⚠️ 弱來源不會蓋掉強來源（見 VERIFIER_RANK）：已經是 mops 的列再被 gemini
+        打到會記成 kept、原樣不動。
+
+        回傳各類計數。重複蓋同一個 by 是冪等的。
+        """
+        rank = VERIFIER_RANK[by]
+        counts = {"verified": 0, "kept": 0, "mismatch": 0,
+                  "not_success": 0, "unknown": 0}
+        conn = self.conn
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                for item in items:
+                    # ⚠️ 整批是一個交易：任何一個元素丟出例外都會 rollback 掉其餘
+                    # 499 筆，而 handler 只接 sqlite3.OperationalError，會變成 500
+                    # 加一段 traceback。所以型別一律在這裡擋掉、記成 unknown。
+                    if not isinstance(item, dict):
+                        counts["unknown"] += 1
+                        continue
+                    sid = item.get("stock_id")
+                    date = item.get("date")
+                    if not isinstance(sid, (str, int)) or not isinstance(date, str):
+                        # validate_date 會對非字串做 .strip() → AttributeError。
+                        counts["unknown"] += 1
+                        continue
+                    try:
+                        ry = int(item.get("roc_year"))
+                        rm = int(item.get("roc_month"))
+                    except (TypeError, ValueError):
+                        counts["unknown"] += 1
+                        continue
+                    row = conn.execute(
+                        "SELECT id, state, announce_date, verified FROM tasks"
+                        " WHERE stock_id=? AND roc_year=? AND roc_month=?",
+                        (str(sid), ry, rm)).fetchone()
+                    if row is None:
+                        counts["unknown"] += 1
+                        continue
+                    if row["state"] != "success":
+                        # 還沒定案的列沒有 announce_date 可以核對，蓋章沒有意義。
+                        counts["not_success"] += 1
+                        continue
+                    claimed = revlib.validate_date(date, ry, rm)
+                    if claimed is None or claimed != row["announce_date"]:
+                        counts["mismatch"] += 1
+                        continue
+                    if VERIFIER_RANK.get(row["verified"], 0) > rank:
+                        # 已經有更強的章了，別降級（見 VERIFIER_RANK）。
+                        counts["kept"] += 1
+                        continue
+                    # ⚠️ 只動 verified，不碰 updated_at：updated_at 是「這筆資料何時被
+                    # 抓到/改過」，/stats 的近 5 分計數與最近成功排序都吃它。蓋章不是
+                    # 重新抓到，混進去會讓進度看板憑空多出一批「剛完成」的任務。
+                    conn.execute("UPDATE tasks SET verified=? WHERE id=?", (by, row["id"]))
+                    counts["verified"] += 1
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -565,6 +665,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "results must be a list"})
             try:
                 counts = self.store.report(worker, results)
+            except sqlite3.OperationalError as e:
+                return self._send(503, {"error": f"db busy: {e}"})
+            return self._send(200, {"applied": counts})
+
+        if u.path == "/verify":
+            body = self._read_json()
+            if body is None:
+                return self._send(400, {"error": "bad json"})
+            by = body.get("by")
+            if by not in VERIFIERS:
+                return self._send(400, {"error": f"unknown verifier; 可用: {list(VERIFIERS)}"})
+            items = body.get("items", [])
+            if not isinstance(items, list):
+                return self._send(400, {"error": "items must be a list"})
+            try:
+                counts = self.store.verify(by, items)
             except sqlite3.OperationalError as e:
                 return self._send(503, {"error": f"db busy: {e}"})
             return self._send(200, {"applied": counts})

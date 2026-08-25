@@ -112,8 +112,12 @@ def _curl_page(cmd, timeout):
 
 def crawl_task(task, per_query_sleep):
     """
-    回傳結果 dict：{id, status, date?, source?, title?}
+    回傳結果 dict：{id, status, date?, source?, title?, url?}
       status ∈ success | failed | rate_limited
+
+    url 是「這個日期是從 SERP 上哪一篇讀到的」——用 parse_detail 給的字元位置往回
+    找最近的 <a href>（見 revlib.nearest_url）。三支 worker 裡就這支的出處最硬：
+    它是頁面上的客觀連結，不是模型自報、也不是靠標題猜的。
     """
     name = task["name"]
     sid = task["stock_id"]
@@ -134,11 +138,12 @@ def crawl_task(task, per_query_sleep):
             saw_rate_limited = True
             continue
         tried_ok = True
-        hit = revlib.parse(html, name, ry, rm)
+        hit = revlib.parse_detail(html, name, ry, rm)
         if hit:
-            date, title = hit
+            date, title, off = hit
             return {"id": task["id"], "status": "success",
-                    "date": date, "source": variant, "title": title}
+                    "date": date, "source": variant, "title": title,
+                    "url": revlib.nearest_url(html, off)}
     # 走到這：兩種查詢都沒中窗內日期。
     if saw_rate_limited or not tried_ok:
         # 有任一查詢被限流（可能正好漏掉命中）→ 保守放回重試，不判 failed。
