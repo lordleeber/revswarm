@@ -530,11 +530,32 @@ class TestRequeue(unittest.TestCase):
         self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
         self.assertEqual(r["fail_count"], 3)      # 爬取歷史留著
 
-    def test_undone_and_prelisting_are_left_alone(self):
-        # undone 已經在排隊了，prelisting 是刻意標的——兩者都不該被這支動到。
+    def test_undone_can_be_rerouted_to_another_engine(self):
+        """
+        already-undone 的列也要能改佇列——「這條路試過了不行，換一條」是正當操作。
+
+        ⚠️ 早期版本連 undone 一起擋，理由是「已經在排隊了」。那道防呆擋錯對象：
+        undone 沒有 announce_date/raw_title，沒有任何東西可以損失，重排是無害的；
+        它唯一的效果就是換 engine，而那正是呼叫端要的。真正該擋的是 dispatched
+        （正在被爬，改了會跟回報打架）與 prelisting（刻意標的，不是待辦）。
+        """
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,updated_at)"
+            " VALUES(2,'9001','甲',109,8,'undone','google',0)")
+        self.store.conn.commit()
+        c = self.store.requeue(
+            [{"stock_id": "9001", "roc_year": 109, "roc_month": 8, "date": ""}],
+            engine="gemini")
+        self.assertEqual(c["requeued"], 1)
+        r = self.store.conn.execute("SELECT state,engine FROM tasks WHERE id=2").fetchone()
+        self.assertEqual((r["state"], r["engine"]), ("undone", "gemini"))
+
+    def test_dispatched_and_prelisting_are_left_alone(self):
+        # dispatched 正在被某隻 worker 爬，改了會跟它的回報打架；
+        # prelisting 是「公司當時還沒公開發行」的刻意標記，不是待辦。
         self.store.conn.execute(
             "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,updated_at)"
-            " VALUES(2,'9001','甲',109,8,'undone',0),"
+            " VALUES(2,'9001','甲',109,8,'dispatched',0),"
             "       (3,'9002','乙',109,8,'prelisting',0)")
         self.store.conn.commit()
         c = self.store.requeue([

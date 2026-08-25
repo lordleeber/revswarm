@@ -602,9 +602,12 @@ class Store:
                     if row is None:
                         counts["unknown"] += 1
                         continue
-                    if row["state"] not in ("success", "failed"):
-                        # undone 已經在排隊、dispatched 正在被爬、prelisting 是刻意
-                        # 標的——三者都不該被這支動到。
+                    if row["state"] not in ("success", "failed", "undone"):
+                        # dispatched 正在被某隻 worker 爬，改了會跟它的回報打架；
+                        # prelisting 是「公司當時還沒公開發行」的刻意標記，不是待辦。
+                        # ⚠️ undone 刻意**放行**：它沒有 announce_date/raw_title，沒有
+                        # 任何東西可以損失，重排唯一的效果就是換 engine——而「這條路
+                        # 試過了不行，換一條」正是這支存在的理由。
                         counts["not_requeueable"] += 1
                         continue
                     # 樂觀鎖：failed 的列沒有 announce_date，呼叫端傳空字串即可。

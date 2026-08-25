@@ -574,10 +574,13 @@ class TestExtractUrl(unittest.TestCase):
     def setUp(self):
         # ⚠️ 換掉的是模組全域，測完一定要換回來：漏掉會讓後面所有測試都吃到這個假的
         # call_gemini（實測會讓 8 個錯誤分類的測試莫名其妙一起紅）。
-        self._call = gw.call_gemini
+        self._call, self._verify = gw.call_gemini, gw.verify_url
+        # ⚠️ verify_url 會真的連外網。測試不連網是這整份檔案的前提（見模組
+        # docstring），漏掉這行會讓測試時間翻倍、且結果取決於對方站台活不活著。
+        gw.verify_url = lambda u, **k: True
 
     def tearDown(self):
-        gw.call_gemini = self._call
+        gw.call_gemini, gw.verify_url = self._call, self._verify
 
     def _p(self, text):
         return _payload(text=text, chunks=["moneydj.com"])
@@ -621,3 +624,79 @@ class TestExtractUrl(unittest.TestCase):
         self.assertFalse(fatal)
         self.assertEqual(r["status"], "success")
         self.assertEqual(r["url"], "https://cna.com.tw/a")
+
+
+class TestVerifyUrl(unittest.TestCase):
+    """
+    模型自報的 URL 存進 DB 前要先確認它真的存在。
+
+    ⚠️ 這條是實測踩到的：1216 統一 109/2 那筆，模型回的
+    chinatimes.com/newspapers/20200311000404-260204 格式完全正確（日期碼、版面碼
+    都對），用瀏覽器 UA 抓回來卻是「404錯誤 - 中時新聞網」。日期本身另有旁證是對的，
+    但出處是編的——一個 404 的網址看起來像有憑有據，比沒有出處更危險。
+
+    取捨刻意不對稱：存到假網址的代價高（正是要防的失效），漏掉真網址的代價低
+    （就是 NULL，跟加這欄之前一樣）。所以**確認不了就丟掉**。
+    """
+
+    def _resp(self, code):
+        class _R:
+            status = code
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+        return _R()
+
+    def test_keeps_a_live_url(self):
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(200)
+        self.assertTrue(gw.verify_url("https://a.tw/real"))
+
+    def test_drops_a_404(self):
+        def boom(*a, **k):
+            raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+        gw.urllib.request.urlopen = boom
+        self.assertFalse(gw.verify_url("https://a.tw/fake"))
+
+    def test_drops_when_blocked_or_erroring(self):
+        # 403/429/5xx 都是「確認不了」，不是「確認存在」。照上面的取捨一律丟掉。
+        for code in (403, 429, 500, 503):
+            def boom(*a, **k):
+                raise urllib.error.HTTPError("u", code, "x", {}, None)
+            gw.urllib.request.urlopen = boom
+            self.assertFalse(gw.verify_url("https://a.tw/x"), code)
+
+    def test_network_failure_never_raises(self):
+        # 驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉。
+        for exc in (urllib.error.URLError("down"), TimeoutError(), OSError()):
+            def boom(*a, **k):
+                raise exc
+            gw.urllib.request.urlopen = boom
+            self.assertFalse(gw.verify_url("https://a.tw/x"))
+
+    def test_empty_url(self):
+        self.assertFalse(gw.verify_url(None))
+        self.assertFalse(gw.verify_url(""))
+
+
+class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
+    def setUp(self):
+        self._call, self._verify = gw.call_gemini, gw.verify_url
+
+    def tearDown(self):
+        gw.call_gemini, gw.verify_url = self._call, self._verify
+
+    def _run(self):
+        p = _payload(text=_titled() + "\nURL: https://a.tw/x", chunks=["moneydj.com"])
+        gw.call_gemini = lambda *a, **k: (p, None)
+        return gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(10, 0))
+
+    def test_dead_url_becomes_none_but_the_date_still_counts(self):
+        gw.verify_url = lambda u, **k: False
+        r, fatal = self._run()
+        self.assertEqual(r["status"], "success")     # ⚠️ 日期不受影響
+        self.assertEqual(r["date"], "2020-02-10")
+        self.assertIsNone(r["url"])
+
+    def test_live_url_is_kept(self):
+        gw.verify_url = lambda u, **k: True
+        r, _ = self._run()
+        self.assertEqual(r["url"], "https://a.tw/x")

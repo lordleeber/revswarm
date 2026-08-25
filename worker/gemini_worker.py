@@ -92,6 +92,11 @@ DEFAULT_MAX_CALLS = 200
 # （2.5/2.0 系列對新專案已 404 下架，"no longer available to new users"，退不回去）。
 DEFAULT_MODEL = "gemini-3.7-flash"
 HTTP_TIMEOUT = 90          # grounding 要真的去搜，比純生成慢；實測一次會發 4~11 個查詢
+URL_CHECK_TIMEOUT = 12     # 驗證模型自報的 URL；附屬動作，不值得等太久
+# 驗證時裝成瀏覽器：實測用預設 UA 打 chinatimes 直接吃 403（擋機器人），
+# 換成瀏覽器 UA 才拿得到真正的狀態碼（那次是 404）。不裝的話每個網址都「確認不了」。
+URL_CHECK_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 # ADC token 的實際壽命是 1 小時；提早 10 分鐘換掉，免得剛好在請求途中過期。
 TOKEN_TTL = 3000
 
@@ -390,6 +395,37 @@ def extract(payload, name, roc_year, roc_month):
     return None
 
 
+# --- 模型自報 URL 的驗證 ----------------------------------------------------
+def verify_url(url, timeout=URL_CHECK_TIMEOUT):
+    """
+    確認模型回的 URL 真的打得開。打不開或確認不了一律 False。
+
+    ⚠️ 為什麼非驗不可：實測 1216 統一 109/2 那筆，模型回的
+    chinatimes.com/newspapers/20200311000404-260204 格式完全正確（日期碼、版面碼
+    都對得上新聞網的規則），實際抓回來卻是「404錯誤 - 中時新聞網」。日期本身另有
+    旁證是對的，但出處是編的——一個 404 的網址看起來像有憑有據，比沒有出處更危險，
+    而 revlib.clean_url 只擋格式、擋不了幻覺。
+
+    取捨刻意不對稱：**確認不了就丟掉**。存到假網址的代價高（正是要防的失效模式），
+    漏掉真網址的代價低（就是 NULL，跟沒有這欄之前一樣）。所以只有 2xx/3xx 才留，
+    403（擋機器人）、429、5xx、逾時、連不上全部當作沒有。
+
+    用 GET 不用 HEAD：實測不少新聞站對 HEAD 直接回 403。只讀狀態碼、不讀 body。
+    """
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(
+            url, method="GET",
+            headers={"User-Agent": URL_CHECK_UA,
+                     "Accept": "text/html", "Accept-Language": "zh-TW,zh;q=0.9"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= getattr(resp, "status", 0) < 400
+    except Exception:
+        # ⚠️ 一律吞掉。驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉。
+        return False
+
+
 # --- 單筆任務 ---------------------------------------------------------------
 def crawl_task(task, backend, model, budget):
     """
@@ -418,6 +454,11 @@ def crawl_task(task, backend, model, budget):
     hit = extract(payload, name, ry, rm)
     if hit:
         date, src, title, url = hit
+        if url and not verify_url(url):
+            # 模型編出來的網址：丟掉，但日期照算——日期是 revlib.parse 通過窗過濾
+            # 與名稱錨點抽出來的，跟這個網址真不真沒有關係。
+            print(f"  ⚠️ 模型給的 URL 打不開，不存：{url}", file=sys.stderr)
+            url = None
         return {"id": task["id"], "status": "success",
                 "date": date, "source": src, "title": title, "url": url}, False
     # 模型確實搜了、正常回話了、仍無窗內日期 → 這才是真的 failed。
