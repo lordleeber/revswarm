@@ -29,7 +29,12 @@ mops_validation.csv
 gemini_benchmark.csv
 
 # DB 備份快照（mops_fill.py / mops_overwrite.py 執行前自動備份，勿進版控）
+# *.bak 是手動備份（如蓋 verified 前的 revswarm.db.bak）；⚠️ 別用 cp 備 WAL 模式的 DB，
+# 那只會複製主檔、漏掉 -wal 裡還沒 checkpoint 的東西。用 sqlite3 的 backup API：
+#   python3 -c "import sqlite3;s=sqlite3.connect('file:revswarm.db?mode=ro',uri=True);\
+#     d=sqlite3.connect('revswarm.db.bak');s.backup(d)"
 *.bak-*
+*.bak
 
 # 來源/衍生資料暫存區（官方 TWSE/TPEx 下載檔、build 產物，可重抓/重建，不進版控）
 tmp/
