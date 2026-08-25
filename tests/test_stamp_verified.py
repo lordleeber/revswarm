@@ -78,6 +78,67 @@ class TestItemsFromGemini(unittest.TestCase):
             sv.items_from_gemini(os.path.join(self.dir, "nope.csv"))
 
 
+class TestItemsFromReview(unittest.TestCase):
+    """
+    人工讀 title 的判斷 → 候選清單。
+
+    ⚠️ 判斷存成版控裡的 CSV 而不是直接寫 DB，是因為它是**主觀的**：mops/gemini 那兩條
+    路隨時可以重跑重現，這條不行。留檔才有得稽核「當初為什麼判高信心」，DB 重建後也
+    補得回來（DB 是執行期產物、不進版控）。
+
+    CSV 的 announce_date 是「讀的當下看到的日期」，送進 /verify 當樂觀鎖：那之後日期
+    若被別的東西改掉（mops_overwrite、date_overrides…），比對不上就記成 mismatch、
+    不蓋章——判斷是對著舊日期做的，不該套到新日期上。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "r.csv")
+
+    def tearDown(self):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        os.rmdir(self.dir)
+
+    def _write(self, body):
+        io.open(self.path, "w", encoding="utf-8").write(
+            "stock_id,roc_year,roc_month,announce_date,verdict,note\n" + body)
+
+    def test_filters_by_verdict(self):
+        self._write("1301,111,10,2022-11-08,claude,標題三要素齊全\n"
+                    "2330,109,1,2020-02-10,tbd,標題被截斷\n")
+        self.assertEqual(sv.items_from_review(self.path, "claude"),
+                         [{"stock_id": "1301", "roc_year": 111,
+                           "roc_month": 10, "date": "2022-11-08"}])
+        self.assertEqual([i["stock_id"] for i in
+                          sv.items_from_review(self.path, "tbd")], ["2330"])
+
+    def test_unknown_verdict_is_rejected(self):
+        # 打錯字不可以靜默變成「這個 verdict 沒有任何列」——那會讓整批無聲跳過。
+        self._write("1301,111,10,2022-11-08,claude,ok\n"
+                    "2330,109,1,2020-02-10,claud,打錯字\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_review(self.path, "claude")
+
+    def test_note_is_required(self):
+        # 判斷是主觀的，沒有理由就沒有稽核價值。
+        self._write("1301,111,10,2022-11-08,claude,\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_review(self.path, "claude")
+
+    def test_duplicate_key_is_rejected(self):
+        self._write("1301,111,10,2022-11-08,claude,第一版\n"
+                    "1301,111,10,2022-11-08,tbd,第二版\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_review(self.path, "claude")
+
+    def test_missing_file_exits(self):
+        with self.assertRaises(SystemExit):
+            sv.items_from_review(os.path.join(self.dir, "nope.csv"), "claude")
+
+
 class TestPostPayload(unittest.TestCase):
     """送出去的形狀要跟 server 的 /verify 對得上（by + items）。"""
 

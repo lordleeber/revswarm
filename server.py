@@ -48,9 +48,16 @@ DEFAULT_ENGINE = "yahoo"
 # ⚠️ 排序不是裝飾，是必要的：一列只有一個 verified 欄，裝不下「兩個來源都同意」。
 # 而 README 教的跑法就是先 mops 後 gemini，若後蓋的無條件覆寫，那些 MOPS 官方文件
 # 蓋過的章會被 gemini 這個弱來源默默降級——使用者照著文件跑就會把最硬的證據弄丟。
-# 數字大 = 強。mops 是官方申報文件；gemini 是模型 grounding（實測 m_src 為 0，全靠
-# 模型合成文字，見 README「對照實驗」）。
-VERIFIER_RANK = {"mops": 2, "gemini": 1}
+# 數字大 = 強：
+#   mops    官方申報文件（公開資訊觀測站 t05st01）——最硬
+#   gemini  模型 grounding 獨立查出同一個日期（實測 m_src 為 0，全靠模型合成文字，
+#           見 README「對照實驗」）
+#   claude  ⚠️ **人工讀 raw_title 的判斷，不是第二個獨立來源**。title 正是產生
+#           announce_date 的那段文字（revlib.parse 從它附近抽日期），再讀一次同一段
+#           字沒有引入新證據——這是循環。它只回答「這段佐證文字撐不撐得起這個日期」，
+#           例如標題其實是股東會通知、或只是一段 JSON 碎片。當篩選線索用，不是驗證。
+#   tbd     看過了、但不是高信心。與 NULL 的差別是「已經有人看過」，避免重複讀。
+VERIFIER_RANK = {"mops": 4, "gemini": 3, "claude": 2, "tbd": 1}
 VERIFIERS = tuple(VERIFIER_RANK)
 
 SCHEMA = """

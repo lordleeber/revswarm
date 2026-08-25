@@ -452,6 +452,37 @@ class TestVerify(unittest.TestCase):
         self.assertEqual(c["verified"], 1)
         self.assertEqual(self._row(1)["verified"], "mops")
 
+    def test_claude_and_tbd_are_the_weakest_verifiers(self):
+        """
+        ⚠️ claude/tbd 是**人工讀 raw_title 的判斷**，不是第二個獨立來源。
+
+        title 正是產生 announce_date 的那段文字（revlib.parse 從它附近抽日期），
+        再讀一次同一段字沒有引入任何新證據——這是循環，跟 mops/gemini 那種
+        「另一個來源獨立查出同一個日期」不是同一件事。
+        所以排序上一定要墊底：它們永遠不可以覆蓋 mops 或 gemini 的章。
+        """
+        self.assertLess(server.VERIFIER_RANK["tbd"], server.VERIFIER_RANK["claude"])
+        self.assertLess(server.VERIFIER_RANK["claude"], server.VERIFIER_RANK["gemini"])
+        self.assertLess(server.VERIFIER_RANK["gemini"], server.VERIFIER_RANK["mops"])
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("mops", item)
+        for weak in ("claude", "tbd"):
+            c = self.store.verify(weak, item)
+            self.assertEqual(c["kept"], 1, weak)
+            self.assertEqual(self._row(1)["verified"], "mops", weak)
+
+    def test_claude_upgrades_tbd_but_not_the_reverse(self):
+        # 讀過一次判「存疑」，之後補到證據改判高信心 → 升得上去。
+        # 反向（claude → tbd）擋掉是排序規則的必然，真要降級就改資料庫或加旗標。
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("tbd", item)
+        self.store.verify("claude", item)
+        self.assertEqual(self._row(1)["verified"], "claude")
+        self.store.verify("tbd", item)
+        self.assertEqual(self._row(1)["verified"], "claude")
+
     def test_weak_verifier_never_downgrades_a_strong_stamp(self):
         """
         ⚠️ README 教的跑法就是先 mops 後 gemini，而一列只有一個 verified 欄。若後蓋的
