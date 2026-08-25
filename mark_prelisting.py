@@ -195,6 +195,8 @@ def main():
                     cur = conn.execute(
                         "UPDATE tasks SET state='prelisting', announce_date=NULL,"
                         " source=NULL, raw_title=NULL, revenue=NULL, yoy=NULL,"
+                        # url/verified 同理：日期都清掉了，出處與章更沒有對象。
+                        " url=NULL, verified=NULL,"
                         " dispatched_at=NULL, worker_id=NULL, updated_at=?"
                         " WHERE stock_id=? AND (roc_year*100+roc_month)<?"
                         " AND state='success'", (now, sid, dkey))

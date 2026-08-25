@@ -451,3 +451,58 @@ class TestVerify(unittest.TestCase):
         c = self.store.verify("mops", item)
         self.assertEqual(c["verified"], 1)
         self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_weak_verifier_never_downgrades_a_strong_stamp(self):
+        """
+        ⚠️ README 教的跑法就是先 mops 後 gemini，而一列只有一個 verified 欄。若後蓋的
+        無條件覆寫，使用者照著文件跑就會把 MOPS 官方文件蓋的章默默換成 gemini
+        ——最硬的證據被弱來源弄丟，而且沒有任何跡象。
+        """
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("mops", item)
+        c = self.store.verify("gemini", item)
+        self.assertEqual(c["kept"], 1)
+        self.assertEqual(c["verified"], 0)
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_strong_verifier_upgrades_a_weak_stamp(self):
+        # 反方向要通：gemini 蓋過的列，mops 來了要升級。
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("gemini", item)
+        c = self.store.verify("mops", item)
+        self.assertEqual(c["verified"], 1)
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_malformed_items_never_abort_the_batch(self):
+        """
+        ⚠️ 整批是一個交易，而 handler 只接 sqlite3.OperationalError。任何一個元素
+        丟出 AttributeError 都會 rollback 掉其餘 499 筆，並回 500 加一段 traceback。
+        （validate_date 對非字串做 .strip()、item.get 對非 dict——兩種都會炸。）
+        """
+        good = {"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                "date": "2022-11-08"}
+        c = self.store.verify("mops", [
+            "我不是 dict",
+            None,
+            {"stock_id": "1301", "roc_year": 111, "roc_month": 10, "date": 20221108},
+            {"stock_id": None, "roc_year": 111, "roc_month": 10, "date": "2022-11-08"},
+            good,
+        ])
+        self.assertEqual(c["unknown"], 4)
+        self.assertEqual(c["verified"], 1)          # 好的那筆照樣蓋成
+        self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_report_clears_a_stale_stamp_when_the_date_changes(self):
+        # 舊的章是對「上一個日期」蓋的；新抓到日期還留著它，就成了替沒人驗過的值背書。
+        self.store.conn.execute(
+            "UPDATE tasks SET state='dispatched', verified='mops' WHERE id=1")
+        self.store.conn.commit()
+        self.store.report("w", [{"id": 1, "status": "success",
+                                 "date": "2022-11-09", "source": "q_roc",
+                                 "title": "台塑"}])
+        row = self.store.conn.execute(
+            "SELECT announce_date, verified FROM tasks WHERE id=1").fetchone()
+        self.assertEqual(row["announce_date"], "2022-11-09")
+        self.assertIsNone(row["verified"])

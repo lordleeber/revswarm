@@ -41,9 +41,17 @@ LEASE_TTL = 600          # 秒；dispatched 超過此值未回覆即可被重派
 MAX_LEASE = 200          # 單次 lease 上限，避免一隻 worker 掃光佇列
 ENGINES = ("yahoo", "google", "gemini")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
 DEFAULT_ENGINE = "yahoo"
-# verified 欄位的合法值白名單。刻意用白名單而不是自由字串：這一欄的全部價值就在於
-# 「看到它就知道有第二個獨立來源核對過」，放任何人寫任何字進去就等於沒有這個保證。
-VERIFIERS = ("mops", "gemini")
+# verified 欄位的合法值白名單與**強弱排序**。刻意用白名單而不是自由字串：這一欄的
+# 全部價值就在於「看到它就知道有第二個獨立來源核對過」，放任何人寫任何字進去就等於
+# 沒有這個保證。
+#
+# ⚠️ 排序不是裝飾，是必要的：一列只有一個 verified 欄，裝不下「兩個來源都同意」。
+# 而 README 教的跑法就是先 mops 後 gemini，若後蓋的無條件覆寫，那些 MOPS 官方文件
+# 蓋過的章會被 gemini 這個弱來源默默降級——使用者照著文件跑就會把最硬的證據弄丟。
+# 數字大 = 強。mops 是官方申報文件；gemini 是模型 grounding（實測 m_src 為 0，全靠
+# 模型合成文字，見 README「對照實驗」）。
+VERIFIER_RANK = {"mops": 2, "gemini": 1}
+VERIFIERS = tuple(VERIFIER_RANK)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks(
@@ -415,8 +423,11 @@ class Store:
                             # 不合格就存 NULL，不要讓垃圾字串混進 provenance 欄位。
                             url = revlib.clean_url(item.get("url"))
                             conn.execute(
+                                # verified=NULL：這是一個新抓到的日期，舊的章是對
+                                # 「上一個日期」蓋的，留著就會替一個沒人驗過的值背書。
                                 "UPDATE tasks SET state='success', announce_date=?,"
-                                " source=?, raw_title=?, url=?, revenue=?, yoy=?, worker_id=?,"
+                                " source=?, raw_title=?, url=?, revenue=?, yoy=?,"
+                                " verified=NULL, worker_id=?,"
                                 " dispatched_at=NULL, updated_at=? WHERE id=?",
                                 (valid, item.get("source"), title, url, revenue, yoy,
                                  worker_id, now, tid),
@@ -443,15 +454,31 @@ class Store:
         不是「有人證實過這一筆」——那就一文不值了。
         日期不一致本身是有價值的訊號（代表兩個來源打架），留給呼叫端去看，這裡不改資料。
 
+        ⚠️ 弱來源不會蓋掉強來源（見 VERIFIER_RANK）：已經是 mops 的列再被 gemini
+        打到會記成 kept、原樣不動。
+
         回傳各類計數。重複蓋同一個 by 是冪等的。
         """
-        counts = {"verified": 0, "mismatch": 0, "not_success": 0, "unknown": 0}
+        rank = VERIFIER_RANK[by]
+        counts = {"verified": 0, "kept": 0, "mismatch": 0,
+                  "not_success": 0, "unknown": 0}
         conn = self.conn
         with self._lock:
             conn.execute("BEGIN IMMEDIATE;")
             try:
                 for item in items:
+                    # ⚠️ 整批是一個交易：任何一個元素丟出例外都會 rollback 掉其餘
+                    # 499 筆，而 handler 只接 sqlite3.OperationalError，會變成 500
+                    # 加一段 traceback。所以型別一律在這裡擋掉、記成 unknown。
+                    if not isinstance(item, dict):
+                        counts["unknown"] += 1
+                        continue
                     sid = item.get("stock_id")
+                    date = item.get("date")
+                    if not isinstance(sid, (str, int)) or not isinstance(date, str):
+                        # validate_date 會對非字串做 .strip() → AttributeError。
+                        counts["unknown"] += 1
+                        continue
                     try:
                         ry = int(item.get("roc_year"))
                         rm = int(item.get("roc_month"))
@@ -459,7 +486,7 @@ class Store:
                         counts["unknown"] += 1
                         continue
                     row = conn.execute(
-                        "SELECT id, state, announce_date FROM tasks"
+                        "SELECT id, state, announce_date, verified FROM tasks"
                         " WHERE stock_id=? AND roc_year=? AND roc_month=?",
                         (str(sid), ry, rm)).fetchone()
                     if row is None:
@@ -469,9 +496,13 @@ class Store:
                         # 還沒定案的列沒有 announce_date 可以核對，蓋章沒有意義。
                         counts["not_success"] += 1
                         continue
-                    claimed = revlib.validate_date(item.get("date"), ry, rm)
+                    claimed = revlib.validate_date(date, ry, rm)
                     if claimed is None or claimed != row["announce_date"]:
                         counts["mismatch"] += 1
+                        continue
+                    if VERIFIER_RANK.get(row["verified"], 0) > rank:
+                        # 已經有更強的章了，別降級（見 VERIFIER_RANK）。
+                        counts["kept"] += 1
                         continue
                     # ⚠️ 只動 verified，不碰 updated_at：updated_at 是「這筆資料何時被
                     # 抓到/改過」，/stats 的近 5 分計數與最近成功排序都吃它。蓋章不是

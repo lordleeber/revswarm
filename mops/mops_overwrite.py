@@ -98,8 +98,13 @@ def main():
     conn.execute("BEGIN IMMEDIATE;")
     try:
         cur = conn.executemany(
+            # ⚠️ url/verified 一起清：url 指的是「舊日期」出自哪一篇，verified 是對
+            # 「舊日期」蓋的章。留著就變成一個看起來有出處、有人驗過的新日期。
+            # （這裡也不該順手蓋 verified='mops'——source 已經記了日期來自 MOPS，
+            #   同一個來源不能拿來驗證自己。）
             "UPDATE tasks SET announce_date=?, source='mops',"
-            " raw_title=NULL, revenue=NULL, yoy=NULL, updated_at=?"
+            " raw_title=NULL, revenue=NULL, yoy=NULL,"
+            " url=NULL, verified=NULL, updated_at=?"
             " WHERE id=? AND state='success' AND announce_date=?",
             overwrite)
         n = cur.rowcount

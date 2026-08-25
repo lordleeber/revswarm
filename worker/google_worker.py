@@ -342,7 +342,7 @@ def crawl_task(task, per_query_sleep):
       - source 標 g_* 而非 q_*：讓 /status 與匯出資料看得出這筆是 Google 補搜來的
       - ⚠️ url 的可信度比 yahoo 低一階：這條路解析的是 inner_text（整頁純文字，見模組
         開頭 3.），日期的字元位置對不到 DOM 裡的連結，沒辦法像 yahoo 那樣靠位置鄰近
-        綁定，只能用「標題含公司名」去挑（見 revlib.pick_url_by_name）。當線索用，
+        綁定，只能用「標題錨點命中」去挑（見 revlib.pick_url_by_name）。當線索用，
         不要當成已驗證的出處。
       - ⚠️ 多回一個 stop_batch（yahoo_worker.py 只回 dict）：Google 的驗證要人工解，
         撞到就必須「立刻停止導覽」，否則那個 goto 會把使用者正在解的驗證頁蓋掉。
@@ -382,7 +382,8 @@ def crawl_task(task, per_query_sleep):
             date, title = hit
             return {"id": task["id"], "status": "success",
                     "date": date, "source": variant, "title": title,
-                    "url": revlib.pick_url_by_name(google_links(), name)}, False
+                    "url": revlib.pick_url_by_name(
+                        google_links(), name, ry, rm)}, False
     # 走到這：兩種查詢都沒中窗內日期。
     if saw_rate_limited or not tried_ok:
         # 有任一查詢被擋（可能正好漏掉命中）→ 保守放回重試，不判 failed。

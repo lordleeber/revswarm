@@ -782,15 +782,33 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 | worker | 怎麼拿到的 | 可信度 |
 | --- | --- | --- |
 | yahoo | 從 SERP 的 `<a href>` 讀出來，用日期的字元位置往回綁最近的那個連結（`revlib.nearest_url`）| **最硬**。頁面上客觀存在的連結，位置綁定 |
-| google | 解析的是 `inner_text`（整頁純文字），日期位置對不到 DOM 連結，只能用「標題含公司名」去挑（`revlib.pick_url_by_name`）| **弱一階**。只是線索，不保證就是那個日期的出處；挑不到寧可回 NULL 也不亂挑 |
+| google | 解析的是 `inner_text`（整頁純文字），日期位置對不到 DOM 連結，只能用**標題錨點命中**去挑（`revlib.pick_url_by_name`，與 `_anchor_offsets` 同一套：公司名＋這個任務的年月）| **弱一階**。只是線索，不保證就是那個日期的出處；挑不到寧可回 NULL 也不亂挑 |
 | gemini | 模型自報的 `URL:` 那行 | **弱一階**，而且是另一種弱：模型可能生一個不存在的網址。格式擋得掉、幻覺擋不掉 |
 
 ⚠️ Yahoo 的結果連結全部包一層轉址（`r.search.yahoo.com/…/RU=<百分比編碼的原網址>/RK=…`），
 存轉址網址等於沒存：`_ylt` 是有時效的簽章、過期就 404，網址本身也看不出是哪一家媒體。
 `revlib.unwrap_url` 一律解回 `RU=` 裡那個真正的網址。
 
+⚠️ **往回找連結要從「錨點」開始，不是從「日期」開始**（`parse_detail` 回的 offset 就是
+錨點位置）。窗內日期可能出現在錨點【前面】——上一筆結果的摘要裡就有一個窗內日期、而它
+離錨點最近——這時從日期位置往回找會抓到上一筆結果的連結，看起來像有效出處卻指錯篇。
+
+⚠️ **URL 過長一律拒收，不截斷**。截一半的網址是「看起來合法、點下去 404」，比 NULL 更糟
+——NULL 誠實地說沒有出處，截斷的則謊稱有。
+
+⚠️ **gemini 的 `m_src` 那層 url 一律是 NULL**。那層的日期來自 `groundingChunks`（真實檢索
+文字），而模型的 `URL:` 行是它自己寫的、不保證就是那個 chunk 的出處；掛上去等於讓高信任
+標記替低信任的網址背書。`groundingChunks` 自己給的則是 Google 的快取轉址，有時效、過期
+就打不開。所以 `URL:` 跟 `TITLE:` 走同一條規則：**只在 `m_txt` 這層取**。
+
 ⚠️ **既有 ~12 萬筆 success 這兩欄都是 NULL，補不回來**——當初沒存。查詢時
 「NULL = 不知道」，不要把它當成「沒有出處」或「未通過驗證」的結論。
+
+⚠️ **凡是改寫 `announce_date` 的敘述，都必須把 `url` / `verified` 一起清成 NULL**。
+`url` 記的是「舊日期」出自哪一篇、`verified` 是對「舊日期」蓋的章；改了日期卻留著它們，
+就變成一個看起來有出處、有人驗過的新日期——那是這兩欄最糟的失效方式（有值、且是錯的，
+比 NULL 難發現得多）。目前五個寫入點都做了：`server.py` 的 `report`、`mops/mops_fill.py`、
+`mops/mops_overwrite.py`、`apply_date_overrides.py`、`mark_prelisting.py --demote-success`。
 
 ### 為什麼 `verified` 不是信心分數
 
@@ -809,6 +827,10 @@ python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000
 # gemini 那條要先跑完對照實驗；只收「gemini 與 MOPS 都同意」的列
 python3 -m mops.stamp_verified --from gemini --server http://127.0.0.1:8000
 ```
+
+⚠️ 一列只有一個 `verified` 欄，**裝不下「兩個來源都同意」**。所以 server 端有強弱排序
+（`VERIFIER_RANK`：`mops` > `gemini`），弱的不會覆寫強的，會記成 `kept`。兩支的先後順序
+因此不影響最終結果——但這是靠排序守住的，不是靠使用者記得順序。
 
 跑完最值得看的數字是 **`mismatch`**，不是蓋章數。蓋章多但 `mismatch` 一堆，代表資料
 有系統性問題，不是「大部分都驗過了」。

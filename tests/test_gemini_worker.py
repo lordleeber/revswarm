@@ -601,14 +601,18 @@ class TestExtractUrl(unittest.TestCase):
         p = self._p(_titled() + "\nURL: javascript:alert(1)")
         self.assertIsNone(gw.extract(p, "台積電", 109, 1)[3])
 
-    def test_chunk_path_also_reads_url_from_model_text(self):
-        # ⚠️ 走 m_src 那條時 url 一樣從模型文字取：groundingChunks 給的是 Google 的
-        # 快取轉址，有時效、過期就打不開，存了也追不回原文。
+    def test_chunk_path_refuses_the_model_url(self):
+        """
+        ⚠️ m_src 那層一定要 url=None。日期來自 groundingChunks（真實檢索文字），而
+        模型的 URL: 那行是它自己寫的、不保證就是那個 chunk 的出處。掛上去等於讓
+        「date 來自檢索原文」這個高信任標記，替一個低信任的網址背書。
+        TITLE: 那行在這條路上已經被拒收了，URL: 沒有理由破例。
+        """
         p = _payload(text=_titled() + "\nURL: https://cna.com.tw/a",
                      chunks=[_titled()])
         hit = gw.extract(p, "台積電", 109, 1)
         self.assertEqual(hit[1], gw.SRC_CHUNK)
-        self.assertEqual(hit[3], "https://cna.com.tw/a")
+        self.assertIsNone(hit[3])
 
     def test_crawl_task_carries_url_into_result(self):
         p = self._p(_titled() + "\nURL: https://cna.com.tw/a")

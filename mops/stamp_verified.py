@@ -18,6 +18,10 @@
    那是兩個來源打架的訊號，值得人去看，不該被一個章掩蓋掉。判斷在 server 端做
    （見 Store.verify），這支只負責把候選送過去。
 
+⚠️ 一列只有一個 verified 欄，裝不下「兩個來源都同意」。所以 server 端有強弱排序
+   （VERIFIER_RANK：mops > gemini），弱的不會覆寫強的，會記成 kept。兩支的先後順序
+   因此不影響最終結果。
+
 為什麼走 server 而不直接開 DB：server 是這個 DB 的唯一寫入者，全靠它的 lock 串行化。
 多開一個寫入者就得自己處理鎖競爭，而且 mops/ 底下的工具一向是唯讀的，不該破例。
 
@@ -109,7 +113,8 @@ def main():
         print("[dry-run] 未送出。")
         return
 
-    total = {"verified": 0, "mismatch": 0, "not_success": 0, "unknown": 0}
+    total = {"verified": 0, "kept": 0, "mismatch": 0,
+             "not_success": 0, "unknown": 0}
     for i in range(0, len(items), CHUNK):
         try:
             applied = post(args.server, args.token, args.src, items[i:i + CHUNK])
@@ -125,6 +130,10 @@ def main():
     # ⚠️ mismatch 才是這支跑完最值得看的數字：那是兩個來源對同一個月份給出不同日期。
     # 蓋章數漂亮但 mismatch 一堆，代表資料有系統性問題，不是「大部分都驗過了」。
     print(f"日期不一致 {total['mismatch']} 筆 ← 兩個來源打架，值得逐筆看")
+    if total["kept"]:
+        # 一列只有一個 verified 欄，裝不下「兩個來源都同意」。弱來源不覆寫強來源
+        # （見 server.VERIFIER_RANK），所以這個數字是「本來就有更硬的章」。
+        print(f"保留原有更強的章 {total['kept']} 筆（沒有降級）")
     print(f"尚未定案 {total['not_success']} 筆／DB 裡沒有 {total['unknown']} 筆")
 
 

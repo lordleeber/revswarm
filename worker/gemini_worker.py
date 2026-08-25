@@ -367,6 +367,7 @@ def extract(payload, name, roc_year, roc_month):
         if not hit:
             continue
         date, title = hit
+        url = None
         if src == SRC_TEXT:
             # 模型回的 TITLE: 那行就是文章標題原文，比 parse 的後備截字好得多
             # （見 _MODEL_TITLE 的說明）。⚠️ 只換 provenance 字串，日期仍然是
@@ -374,13 +375,17 @@ def extract(payload, name, roc_year, roc_month):
             m = _MODEL_TITLE.search(payload["text"])
             if m:
                 title = m.group(1)[:80]
+            # URL 跟 TITLE 走同一條規則：⚠️ **只在 m_txt 這層取**。
+            # 走 m_src 時日期來自 groundingChunks（真實檢索文字），而模型的 URL: 那行
+            # 是它自己寫的、不保證就是那個 chunk 的出處；把它掛到高信任層那一列，等於
+            # 讓「date 來自檢索原文」這個標記替一個低信任的網址背書。
+            # groundingChunks 自己那條路也給不出可用的網址：它回的是 Google 的快取轉址
+            # （vertexaisearch.cloud.google.com/grounding-api-redirect/...），有時效、
+            # 過期就打不開。所以 m_src 那層寧可 url=None，誠實說「沒有出處」。
+            m = _MODEL_URL.search(payload["text"])
+            url = revlib.clean_url(m.group(1)) if m else None
         if revlib.title_year_conflict(title, roc_year, roc_month):
             continue
-        # URL 兩條路都從模型的回覆文字取——groundingChunks 那條給的是 Google 的
-        # 快取轉址（vertexaisearch.cloud.google.com/grounding-api-redirect/...），
-        # 有時效、過期就打不開，存了也追不回原文。
-        m = _MODEL_URL.search(payload["text"])
-        url = revlib.clean_url(m.group(1)) if m else None
         return date, src, title, url
     return None
 

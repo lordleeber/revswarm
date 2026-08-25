@@ -684,6 +684,21 @@ class TestCrawlTaskUrl(unittest.TestCase):
         r, _ = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
         self.assertEqual(r["url"], "https://moneydj.com/a")
 
+    def test_prefix_collision_does_not_pick_another_company(self):
+        # ⚠️ 「台積電」不可以吃到更長的公司名。google 這條路本來就弱一階，
+        # 禁不起再多一個已知的錯法——url 指到別家公司比沒有 url 更糟。
+        google_worker.google_links = lambda: [
+            ("台積電子 109年1月營收", "https://wrong.tw/other"),
+            ("台積電 109年1月營收", "https://right.tw/tsmc")]
+        r, _ = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertEqual(r["url"], "https://right.tw/tsmc")
+
+    def test_wrong_year_link_is_not_picked(self):
+        google_worker.google_links = lambda: [
+            ("台積電 108年1月營收", "https://wrong.tw/last-year")]
+        r, _ = google_worker.crawl_task(self._task(), per_query_sleep=6.0)
+        self.assertIsNone(r["url"])
+
     def test_no_matching_title_gives_none_rather_than_the_first_link(self):
         google_worker.google_links = lambda: [
             ("Yahoo奇摩股市", "https://tw.stock.yahoo.com/")]

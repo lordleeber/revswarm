@@ -229,8 +229,11 @@ def apply_updates(conn, updates, now):
     try:
         for u in updates:
             conn.execute(
+                # ⚠️ url/verified 一起清：兩者都是對「舊日期」講的話，人工改了日期
+                # 之後留著，就成了替新日期背書的假出處/假章。
                 "UPDATE tasks SET state='success', announce_date=?, source=?,"
-                " raw_title=?, revenue=?, yoy=?, worker_id='manual',"
+                " raw_title=?, revenue=?, yoy=?, url=NULL, verified=NULL,"
+                " worker_id='manual',"
                 " dispatched_at=NULL, updated_at=? WHERE id=?",
                 (u["announce_date"], u["source"], u["raw_title"],
                  u["revenue"], u["yoy"], now, u["id"]))
