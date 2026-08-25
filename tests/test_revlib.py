@@ -275,3 +275,64 @@ class TestUrlProvenance(unittest.TestCase):
     def test_pick_url_by_name_skips_bad_scheme(self):
         links = [("台塑 111年10月", "javascript:void(0)")]
         self.assertIsNone(R.pick_url_by_name(links, "台塑", 111, 10))
+
+
+class TestLongerNameInText(unittest.TestCase):
+    """
+    「title 裡是不是提到一家名字更長、以本公司名開頭的別家公司」。
+
+    ⚠️ 這正是 _anchor_offsets 的 lookahead 在擋的那個坑，但**後備路徑完全繞過它**
+    ——沒有錨點就沒有那道保護，於是 4113 聯上 的任務吃到 聯上發(2537) 的公告日。
+    實測全庫 12 筆，全部出自 google worker（見 data/title_review.csv）。
+    """
+
+    NAMES = {"聯上": "4113", "聯上發": "2537", "統一": "1216", "統一超": "2912",
+             "台塑": "1301", "台塑化": "6505"}
+
+    def test_detects_longer_company(self):
+        self.assertEqual(
+            R.longer_name_in_text("公告-聯上發-2020… 聯上發. 253", "聯上", "4113",
+                                  self.NAMES), "聯上發")
+
+    def test_own_name_alone_is_not_a_collision(self):
+        self.assertIsNone(
+            R.longer_name_in_text("聯上 109年4月營收", "聯上", "4113", self.NAMES))
+
+    def test_same_stock_under_a_longer_alias_is_not_a_collision(self):
+        # 名單裡若同一檔有更長的別名，不算撞名——比對的是股號不是字串。
+        names = {"聯上": "4113", "聯上開發": "4113"}
+        self.assertIsNone(
+            R.longer_name_in_text("聯上開發 109年4月", "聯上", "4113", names))
+
+    def test_returns_the_longest_match(self):
+        names = {"統一": "1216", "統一超": "2912", "統一超商": "9999"}
+        self.assertEqual(
+            R.longer_name_in_text("統一超商 109年1月", "統一", "1216", names), "統一超商")
+
+    def test_name_absent_entirely(self):
+        self.assertIsNone(
+            R.longer_name_in_text("完全沒提到", "聯上", "4113", self.NAMES))
+
+    def test_own_anchor_present_beats_a_trailing_mention(self):
+        """
+        ⚠️ 本檔自己的錨點命中時，後面出現更長的公司名不算撞名。
+
+        實測誤報：1216 統一 110/6 的 raw_title 是
+          「【公告】統一2021年6月合併營收392.53億元年增1.65%. 上一則 … 統一超表現備」
+        開頭就是本檔正確的公告，「統一超」只是尾巴「相關文章」的碎片。把這種判成
+        抓錯公司會害一筆正確的資料被打回重爬——降級 success 是不可逆的。
+        """
+        t = "【公告】統一2021年6月合併營收392.53億元年增1.65%. 上一則 … 統一超表現備"
+        self.assertIsNone(
+            R.longer_name_in_text(t, "統一", "1216", self.NAMES,
+                                  roc_year=110, roc_month=6))
+        # 沒有年月參數時維持原本的純字串行為（呼叫端自己負責過濾）
+        self.assertEqual(
+            R.longer_name_in_text(t, "統一", "1216", self.NAMES), "統一超")
+
+    def test_anchor_for_a_different_month_does_not_protect(self):
+        # 錨點要是「這個任務的年月」才算數，別月的公告救不了這一筆。
+        t = "【公告】統一2021年5月合併營收… 統一超表現備"
+        self.assertEqual(
+            R.longer_name_in_text(t, "統一", "1216", self.NAMES,
+                                  roc_year=110, roc_month=6), "統一超")

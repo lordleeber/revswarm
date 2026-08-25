@@ -370,6 +370,86 @@ class TestUrlColumn(unittest.TestCase):
         os.remove(old)
 
 
+class TestRequeue(unittest.TestCase):
+    """
+    把「已經 success 但確定抓錯」的列打回 undone 重爬。
+
+    ⚠️ 這是全 repo 唯一會把 success 降級的線上操作，破壞力比什麼都大——寫錯一個
+    條件就是幾萬筆好資料變成待爬。所以沿用 /verify 的樂觀鎖：呼叫端必須說出它看到的
+    announce_date，對不上就不動。你只能 requeue 一筆你真的看過的列。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,announce_date,"
+            "source,raw_title,revenue,yoy,url,verified,engine,fail_count,updated_at)"
+            " VALUES(1,'4113','聯上',109,4,'success','2020-05-08','g_ad','聯上發…',"
+            "100,1.5,'https://x.tw/a','tbd','google',2,111)")
+        self.store.conn.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _row(self):
+        return self.store.conn.execute("SELECT * FROM tasks WHERE id=1").fetchone()
+
+    def _item(self, date="2020-05-08"):
+        return [{"stock_id": "4113", "roc_year": 109, "roc_month": 4, "date": date}]
+
+    def test_resets_state_and_clears_everything_derived(self):
+        c = self.store.requeue(self._item(), engine=None)
+        self.assertEqual(c["requeued"], 1)
+        r = self._row()
+        self.assertEqual(r["state"], "undone")
+        # ⚠️ 全部清掉：留任何一個都會變成「undone 卻帶著上一次抓錯的證據」，
+        # 而 url/verified 留著更糟——那是替一個已經被判定錯誤的日期背書。
+        for col in ("announce_date", "source", "raw_title", "revenue", "yoy",
+                    "url", "verified", "dispatched_at", "worker_id"):
+            self.assertIsNone(r[col], col)
+
+    def test_keeps_the_crawl_history(self):
+        # fail_count/attempts 是「這筆被爬過幾次」的歷史，不是抓到的內容。
+        # 清掉就查不出「這筆一直出問題」，那正是之後要優先看的線索。
+        self.store.requeue(self._item(), engine=None)
+        self.assertEqual(self._row()["fail_count"], 2)
+
+    def test_can_reroute_engine(self):
+        # google 抓錯的就別再給 google——換 yahoo 那條錨點路徑。
+        self.store.requeue(self._item(), engine="yahoo")
+        self.assertEqual(self._row()["engine"], "yahoo")
+
+    def test_engine_none_keeps_current_queue(self):
+        self.store.requeue(self._item(), engine=None)
+        self.assertEqual(self._row()["engine"], "google")
+
+    def test_date_mismatch_refuses_to_touch_the_row(self):
+        # 呼叫端看到的日期跟現在不一樣 = 這列在我看過之後被改過，我的判斷不再適用。
+        c = self.store.requeue(self._item(date="2020-05-09"), engine=None)
+        self.assertEqual(c["mismatch"], 1)
+        self.assertEqual(self._row()["state"], "success")
+        self.assertEqual(self._row()["announce_date"], "2020-05-08")
+
+    def test_non_success_and_unknown_rows(self):
+        c = self.store.requeue([
+            {"stock_id": "9999", "roc_year": 109, "roc_month": 4, "date": "2020-05-08"},
+            "我不是 dict",
+        ], engine=None)
+        self.assertEqual(c["unknown"], 2)
+
+    def test_lease_can_pick_it_up_again(self):
+        self.store.requeue(self._item(), engine="yahoo")
+        batch = self.store.lease(5, "w", engine="yahoo")
+        self.assertEqual([t["stock_id"] for t in batch], ["4113"])
+
+
 class TestVerify(unittest.TestCase):
     """
     verified 蓋章：**只有日期真的一致才蓋**。

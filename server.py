@@ -16,6 +16,9 @@ endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可�
                                      第二來源同意才蓋 verified（見 Store.verify）
   GET  /stats                        進度、各 state 計數、近況
   GET  /healthz                      存活探針（免 token）
+  POST /admin/requeue   {engine?, items:[{stock_id,roc_year,roc_month,date}, ...]}
+                                     指名把「確定抓錯」的 success 打回 undone 重爬
+                                     （⚠️ 唯一會降級 success 的操作，date 當樂觀鎖）
   POST /admin/requeue-failed?engine=google   把 failed 轉去指定 engine 的佇列重掃
 
 用法：
@@ -522,6 +525,78 @@ class Store:
                 raise
         return counts
 
+    # --- 把確定抓錯的 success 打回 undone 重爬 ------------------------------
+    def requeue(self, items, engine=None):
+        """
+        指名把幾筆 success 降級成 undone 重爬。
+
+        ⚠️ 這是全 repo 唯一會把 success 降級的線上操作。requeue-failed 只動 failed、
+        worker 的 report 看到 success 一律 ignored——就這支能砍掉已經定案的資料。
+        所以樂觀鎖是必要的而不是裝飾：呼叫端要說出它看到的 announce_date，對不上就
+        不動。你只能 requeue 一筆你真的看過的列。
+
+        用途是「已經確定抓錯」的個案，例如 google 的後備路徑抓到別家公司的公告日
+        （4113 聯上 吃到 聯上發(2537)，見 data/title_review.csv）。
+
+        engine 給值就順便改佇列——google 抓錯的別再給 google。給 None 則沿用原佇列。
+
+        清掉所有「抓來的內容」，但**保留 attempts/fail_count**：那是這筆被爬過幾次的
+        歷史，清掉就查不出「這筆一直出問題」，而那正是之後該優先看的線索。
+        """
+        now = int(time.time())
+        counts = {"requeued": 0, "mismatch": 0, "not_success": 0, "unknown": 0}
+        conn = self.conn
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                for item in items:
+                    if not isinstance(item, dict):
+                        counts["unknown"] += 1
+                        continue
+                    sid = item.get("stock_id")
+                    date = item.get("date")
+                    if not isinstance(sid, (str, int)) or not isinstance(date, str):
+                        counts["unknown"] += 1
+                        continue
+                    try:
+                        ry = int(item.get("roc_year"))
+                        rm = int(item.get("roc_month"))
+                    except (TypeError, ValueError):
+                        counts["unknown"] += 1
+                        continue
+                    row = conn.execute(
+                        "SELECT id, state, announce_date FROM tasks"
+                        " WHERE stock_id=? AND roc_year=? AND roc_month=?",
+                        (str(sid), ry, rm)).fetchone()
+                    if row is None:
+                        counts["unknown"] += 1
+                        continue
+                    if row["state"] != "success":
+                        counts["not_success"] += 1
+                        continue
+                    if date.strip() != (row["announce_date"] or ""):
+                        counts["mismatch"] += 1
+                        continue
+                    # url/verified 一起清（見 report 的同一條戒律）：留著就是替一個
+                    # 已經被判定錯誤的日期背書。
+                    sql = ("UPDATE tasks SET state='undone', announce_date=NULL,"
+                           " source=NULL, raw_title=NULL, revenue=NULL, yoy=NULL,"
+                           " url=NULL, verified=NULL, dispatched_at=NULL,"
+                           " worker_id=NULL, updated_at=?")
+                    args = [now]
+                    if engine is not None:
+                        sql += ", engine=?"
+                        args.append(engine)
+                    sql += " WHERE id=?"
+                    args.append(row["id"])
+                    conn.execute(sql, args)
+                    counts["requeued"] += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return counts
+
     def stats(self):
         conn = self.conn
         with self._lock:
@@ -688,6 +763,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "items must be a list"})
             try:
                 counts = self.store.verify(by, items)
+            except sqlite3.OperationalError as e:
+                return self._send(503, {"error": f"db busy: {e}"})
+            return self._send(200, {"applied": counts})
+
+        if u.path == "/admin/requeue":
+            body = self._read_json()
+            if body is None:
+                return self._send(400, {"error": "bad json"})
+            items = body.get("items", [])
+            if not isinstance(items, list):
+                return self._send(400, {"error": "items must be a list"})
+            raw = body.get("engine")
+            if raw is None:
+                engine = None
+            else:
+                engine, ok = parse_engine(raw, None)
+                if not ok:
+                    return self._send(400, {"error": f"unknown engine; 可用: {list(ENGINES)}"})
+            try:
+                counts = self.store.requeue(items, engine)
             except sqlite3.OperationalError as e:
                 return self._send(503, {"error": f"db busy: {e}"})
             return self._send(200, {"applied": counts})
