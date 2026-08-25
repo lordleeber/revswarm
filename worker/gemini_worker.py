@@ -92,7 +92,10 @@ DEFAULT_MAX_CALLS = 200
 # （2.5/2.0 系列對新專案已 404 下架，"no longer available to new users"，退不回去）。
 DEFAULT_MODEL = "gemini-3.7-flash"
 HTTP_TIMEOUT = 90          # grounding 要真的去搜，比純生成慢；實測一次會發 4~11 個查詢
-URL_CHECK_TIMEOUT = 12     # 驗證模型自報的 URL；附屬動作，不值得等太久
+URL_CHECK_TIMEOUT = 8      # 驗證模型自報的 URL；附屬動作，不值得等太久
+# 讀多少 body 來確認「這篇是不是本檔的報導」。標題與導言都在最前面，實測 160KB 的
+# 新聞頁只要前 64KB 就夠；讀全文只是白花頻寬與時間。
+URL_CHECK_BYTES = 65536
 # 驗證時裝成瀏覽器：實測用預設 UA 打 chinatimes 直接吃 403（擋機器人），
 # 換成瀏覽器 UA 才拿得到真正的狀態碼（那次是 404）。不裝的話每個網址都「確認不了」。
 URL_CHECK_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -396,9 +399,9 @@ def extract(payload, name, roc_year, roc_month):
 
 
 # --- 模型自報 URL 的驗證 ----------------------------------------------------
-def verify_url(url, timeout=URL_CHECK_TIMEOUT):
+def verify_url(url, name=None, timeout=URL_CHECK_TIMEOUT):
     """
-    確認模型回的 URL 真的打得開。打不開或確認不了一律 False。
+    確認模型回的 URL 真的打得開、而且真的是**這一檔**的報導。打不開或確認不了一律 False。
 
     ⚠️ 為什麼非驗不可：實測 1216 統一 109/2 那筆，模型回的
     chinatimes.com/newspapers/20200311000404-260204 格式完全正確（日期碼、版面碼
@@ -412,9 +415,15 @@ def verify_url(url, timeout=URL_CHECK_TIMEOUT):
 
     用 GET 不用 HEAD：實測不少新聞站對 HEAD 直接回 403。只讀狀態碼、不讀 body。
 
-    ⚠️ 這道檢查只驗「網址活著」，驗不了「這是一篇關於這家公司這個月的報導」。
-    沒有路徑的首頁擋得掉，但一個活著的無關文章擋不掉——所以 gemini 的 url 就算
-    通過驗證，可信度仍然低於 yahoo 從 SERP 的 <a href> 讀出來的那種。
+    ⚠️ 200 不等於「這是本檔的報導」。實測：模型給 4113 聯上 110/5 的網址
+    news.cnyes.com/news/id/4659779 是真的（HTTP 200、16 萬字元），但那篇的標題是
+    「新復興5月營收0.47億元年減23.47% | 鉅亨網」——真實存在、屬於別家公司。只看
+    狀態碼會放行，而 url 這一欄的全部用途就是點開回到**這一筆**的原文。
+    所以給了 name 就順便讀 body 找公司名（請求都已經發出去了，多讀幾 KB 很便宜）。
+
+    ⚠️ 仍然驗不了「是不是**這個月份**的報導」：新聞標題不一定寫年月，硬比會把好的
+    也擋掉。所以 gemini 的 url 就算通過驗證，可信度仍然低於 yahoo 從 SERP 的
+    <a href> 讀出來的那種。
     """
     if not url:
         return False
@@ -430,7 +439,17 @@ def verify_url(url, timeout=URL_CHECK_TIMEOUT):
             headers={"User-Agent": URL_CHECK_UA,
                      "Accept": "text/html", "Accept-Language": "zh-TW,zh;q=0.9"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= getattr(resp, "status", 0) < 400
+            if not 200 <= getattr(resp, "status", 0) < 400:
+                return False
+            if not name:
+                return True
+            try:
+                body = resp.read(URL_CHECK_BYTES).decode("utf-8", "replace")
+            except Exception:
+                # body 讀不到是「確認不了名字」，不是「這頁不存在」——狀態碼那關已經
+                # 過了，不該因此把一個好網址判死。
+                return True
+            return name in body
     except Exception:
         # ⚠️ 一律吞掉。驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉。
         return False
@@ -464,7 +483,7 @@ def crawl_task(task, backend, model, budget):
     hit = extract(payload, name, ry, rm)
     if hit:
         date, src, title, url = hit
-        if url and not verify_url(url):
+        if url and not verify_url(url, name=name):
             # 模型編出來的網址：丟掉，但日期照算——日期是 revlib.parse 通過窗過濾
             # 與名稱錨點抽出來的，跟這個網址真不真沒有關係。
             print(f"  ⚠️ 模型給的 URL 打不開，不存：{url}", file=sys.stderr)

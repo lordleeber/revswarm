@@ -639,9 +639,10 @@ class TestVerifyUrl(unittest.TestCase):
     （就是 NULL，跟加這欄之前一樣）。所以**確認不了就丟掉**。
     """
 
-    def _resp(self, code):
+    def _resp(self, code, body=b""):
         class _R:
             status = code
+            def read(self_, n=None): return body
             def __enter__(self_): return self_
             def __exit__(self_, *a): return False
         return _R()
@@ -692,9 +693,37 @@ class TestVerifyUrl(unittest.TestCase):
         self.assertEqual(called, [], "首頁不該發出任何請求")
 
     def test_a_real_article_path_still_goes_through(self):
-        gw.urllib.request.urlopen = lambda *a, **k: self._resp(200)
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(200, "…聯上 110年5月營收…".encode("utf-8"))
         self.assertTrue(gw.verify_url(
-            "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc"))
+            "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc", name="聯上"))
+
+    def test_a_live_url_about_another_company_is_refused(self):
+        """
+        ⚠️ 200 不等於「這是本檔的報導」。實測：模型給 4113 聯上 110/5 的網址
+        news.cnyes.com/news/id/4659779 是真的（HTTP 200、16 萬字元），但那篇的標題是
+        「新復興5月營收0.47億元年減23.47% | 鉅亨網」——真實存在、屬於別家公司。
+        只看狀態碼會放行，而 url 這一欄的全部用途就是點開回到**這一筆**的原文。
+        """
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(
+            200, "新復興5月營收0.47億元年減23.47% | 鉅亨網".encode("utf-8"))
+        self.assertFalse(gw.verify_url("https://news.cnyes.com/news/id/4659779",
+                                       name="聯上"))
+
+    def test_without_a_name_it_falls_back_to_status_only(self):
+        # 沒給名字就只能驗「活著」——維持舊行為，不要讓漏傳參數變成全部拒收。
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(200, b"whatever")
+        self.assertTrue(gw.verify_url("https://a.tw/x"))
+
+    def test_unreadable_body_does_not_reject_a_200(self):
+        # body 讀不到（連線中斷、編碼壞掉）不該把一個 200 判死——那是「確認不了名字」，
+        # 而狀態碼這一關已經過了。
+        class _R:
+            status = 200
+            def read(self_, n=None): raise OSError("boom")
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+        gw.urllib.request.urlopen = lambda *a, **k: _R()
+        self.assertTrue(gw.verify_url("https://a.tw/x", name="聯上"))
 
 
 class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
