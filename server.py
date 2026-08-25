@@ -16,6 +16,9 @@ endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可�
                                      第二來源同意才蓋 verified（見 Store.verify）
   GET  /stats                        進度、各 state 計數、近況
   GET  /healthz                      存活探針（免 token）
+  POST /admin/requeue   {engine?, items:[{stock_id,roc_year,roc_month,date}, ...]}
+                                     指名把「確定抓錯」的 success 打回 undone 重爬
+                                     （⚠️ 唯一會降級 success 的操作，date 當樂觀鎖）
   POST /admin/requeue-failed?engine=google   把 failed 轉去指定 engine 的佇列重掃
 
 用法：
@@ -48,9 +51,16 @@ DEFAULT_ENGINE = "yahoo"
 # ⚠️ 排序不是裝飾，是必要的：一列只有一個 verified 欄，裝不下「兩個來源都同意」。
 # 而 README 教的跑法就是先 mops 後 gemini，若後蓋的無條件覆寫，那些 MOPS 官方文件
 # 蓋過的章會被 gemini 這個弱來源默默降級——使用者照著文件跑就會把最硬的證據弄丟。
-# 數字大 = 強。mops 是官方申報文件；gemini 是模型 grounding（實測 m_src 為 0，全靠
-# 模型合成文字，見 README「對照實驗」）。
-VERIFIER_RANK = {"mops": 2, "gemini": 1}
+# 數字大 = 強：
+#   mops    官方申報文件（公開資訊觀測站 t05st01）——最硬
+#   gemini  模型 grounding 獨立查出同一個日期（實測 m_src 為 0，全靠模型合成文字，
+#           見 README「對照實驗」）
+#   claude  ⚠️ **人工讀 raw_title 的判斷，不是第二個獨立來源**。title 正是產生
+#           announce_date 的那段文字（revlib.parse 從它附近抽日期），再讀一次同一段
+#           字沒有引入新證據——這是循環。它只回答「這段佐證文字撐不撐得起這個日期」，
+#           例如標題其實是股東會通知、或只是一段 JSON 碎片。當篩選線索用，不是驗證。
+#   tbd     看過了、但不是高信心。與 NULL 的差別是「已經有人看過」，避免重複讀。
+VERIFIER_RANK = {"mops": 4, "gemini": 3, "claude": 2, "tbd": 1}
 VERIFIERS = tuple(VERIFIER_RANK)
 
 SCHEMA = """
@@ -305,6 +315,7 @@ class Store:
         self.db_path = db_path
         self.conn = connect(db_path)
         self._lock = threading.Lock()
+        self._name_cache = None    # _names() 的快取
 
     # --- 派工：原子鎖定 + 惰性回收 ---------------------------------------
     def lease(self, n, worker_id, engine=DEFAULT_ENGINE):
@@ -361,6 +372,21 @@ class Store:
                 raise
         return [dict(r) for r in batch]
 
+    def _names(self):
+        """
+        {公司名: 股號}，用來擋「raw_title 講的是別家公司」。
+
+        ⚠️ 這份對照只有 server 拿得到：worker 只知道自己這一筆的公司名，不知道
+        「聯上發」是另一檔股票，所以它擋不了（見 report 的說明）。
+        建一次就快取——tasks 的公司名在 init_tasks 之後就不會變，而 report 是熱路徑。
+        """
+        if self._name_cache is None:
+            self._name_cache = {
+                r["name"]: r["stock_id"]
+                for r in self.conn.execute(
+                    "SELECT DISTINCT name, stock_id FROM tasks")}
+        return self._name_cache
+
     # --- 回報：success 需窗再驗證；rate_limited 放回；failed 記數 --------
     def report(self, worker_id, results):
         now = int(time.time())
@@ -377,7 +403,8 @@ class Store:
                         counts["unknown"] += 1
                         continue
                     row = conn.execute(
-                        "SELECT state, roc_year, roc_month FROM tasks WHERE id=?", (tid,)
+                        "SELECT state, roc_year, roc_month, name, stock_id"
+                        " FROM tasks WHERE id=?", (tid,)
                     ).fetchone()
                     if row is None:
                         counts["unknown"] += 1
@@ -407,6 +434,16 @@ class Store:
                     else:  # success：server 端用同一套窗再驗一次（README「踩過的雷 → 窗過濾」）
                         valid = revlib.validate_date(
                             item.get("date"), row["roc_year"], row["roc_month"])
+                        # ⚠️ 再多擋一條：raw_title 講的若是「名字更長的另一家公司」，
+                        # 不收。revlib.parse 的後備路徑（錨點沒中 → 取第一個窗內日期）
+                        # 沒有任何公司名保護，實測 12 筆因此吃到別家的公告日
+                        # （4113 聯上 → 聯上發(2537)…），全部出自 google worker。
+                        # 帶 roc_year/roc_month：本檔自己的錨點命中就不算撞名，否則
+                        # 會誤擋「開頭是正確公告、尾巴提到相關公司」那種正確的列。
+                        if valid is not None and revlib.longer_name_in_text(
+                                item.get("title") or "", row["name"], row["stock_id"],
+                                self._names(), row["roc_year"], row["roc_month"]):
+                            valid = None
                         if valid is None:
                             # 日期不在窗內 → 不信任，退回 undone 重做（不當 success）。
                             conn.execute(
@@ -450,7 +487,8 @@ class Store:
           可以在 server 跑著的時候執行」。走 endpoint 兩邊都保住。
 
         ⚠️ 蓋章的前提是**日期真的一致**：呼叫端送上它那邊看到的 date，跟 DB 裡的
-        announce_date 對不上就記成 mismatch、不蓋。不然 verified 只是「有人跑過這一筆」，
+        announce_date 逐字對不上就記成 mismatch、不蓋（純字串比對，不套窗驗證
+        ——見下方註解）。不然 verified 只是「有人跑過這一筆」，
         不是「有人證實過這一筆」——那就一文不值了。
         日期不一致本身是有價值的訊號（代表兩個來源打架），留給呼叫端去看，這裡不改資料。
 
@@ -496,8 +534,13 @@ class Store:
                         # 還沒定案的列沒有 announce_date 可以核對，蓋章沒有意義。
                         counts["not_success"] += 1
                         continue
-                    claimed = revlib.validate_date(date, ry, rm)
-                    if claimed is None or claimed != row["announce_date"]:
+                    # ⚠️ 樂觀鎖只比對字串，**不可以借用 validate_date**：全庫唯一
+                    # 合法的窗外 success 是 date_overrides.csv 收的遲交個案
+                    # （3494 誠研 109/1 = 2020-02-17），窗驗證會讓它永遠 mismatch、
+                    # 永遠蓋不了章，逐批掃描時還會卡在隊首無限重複出現。
+                    # 窗驗證是 report 那條路的職責（worker 送新日期進來時）；這裡收的
+                    # 是「呼叫端剛才看到的值」，只需要確認那列還沒被改過。
+                    if date.strip() != (row["announce_date"] or ""):
                         counts["mismatch"] += 1
                         continue
                     if VERIFIER_RANK.get(row["verified"], 0) > rank:
@@ -509,6 +552,88 @@ class Store:
                     # 重新抓到，混進去會讓進度看板憑空多出一批「剛完成」的任務。
                     conn.execute("UPDATE tasks SET verified=? WHERE id=?", (by, row["id"]))
                     counts["verified"] += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return counts
+
+    # --- 把確定抓錯的 success 打回 undone 重爬 ------------------------------
+    def requeue(self, items, engine=None):
+        """
+        指名把幾筆 success 降級成 undone 重爬。
+
+        ⚠️ 這是全 repo 唯一會把 success 降級的線上操作。requeue-failed 只動 failed、
+        worker 的 report 看到 success 一律 ignored——就這支能砍掉已經定案的資料。
+        所以樂觀鎖是必要的而不是裝飾：呼叫端要說出它看到的 announce_date，對不上就
+        不動。你只能 requeue 一筆你真的看過的列。
+
+        用途是「已經確定抓錯」的個案，例如 google 的後備路徑抓到別家公司的公告日
+        （4113 聯上 吃到 聯上發(2537)，見 data/title_review.csv）。
+
+        也吃 failed 的列——那種沒有 announce_date，樂觀鎖傳空字串。這是為了「只挑
+        幾筆換一條路試」：requeue-failed 會把**全部** failed（實測 5,624 筆）一起
+        丟進指定佇列，想只動 11 筆就得有指名的方式。
+
+        engine 給值就順便改佇列——google 抓錯的別再給 google。給 None 則沿用原佇列。
+
+        清掉所有「抓來的內容」，但**保留 attempts/fail_count**：那是這筆被爬過幾次的
+        歷史，清掉就查不出「這筆一直出問題」，而那正是之後該優先看的線索。
+        """
+        now = int(time.time())
+        counts = {"requeued": 0, "mismatch": 0, "not_requeueable": 0, "unknown": 0}
+        conn = self.conn
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                for item in items:
+                    if not isinstance(item, dict):
+                        counts["unknown"] += 1
+                        continue
+                    sid = item.get("stock_id")
+                    date = item.get("date")
+                    if not isinstance(sid, (str, int)) or not isinstance(date, str):
+                        counts["unknown"] += 1
+                        continue
+                    try:
+                        ry = int(item.get("roc_year"))
+                        rm = int(item.get("roc_month"))
+                    except (TypeError, ValueError):
+                        counts["unknown"] += 1
+                        continue
+                    row = conn.execute(
+                        "SELECT id, state, announce_date FROM tasks"
+                        " WHERE stock_id=? AND roc_year=? AND roc_month=?",
+                        (str(sid), ry, rm)).fetchone()
+                    if row is None:
+                        counts["unknown"] += 1
+                        continue
+                    if row["state"] not in ("success", "failed", "undone"):
+                        # dispatched 正在被某隻 worker 爬，改了會跟它的回報打架；
+                        # prelisting 是「公司當時還沒公開發行」的刻意標記，不是待辦。
+                        # ⚠️ undone 刻意**放行**：它沒有 announce_date/raw_title，沒有
+                        # 任何東西可以損失，重排唯一的效果就是換 engine——而「這條路
+                        # 試過了不行，換一條」正是這支存在的理由。
+                        counts["not_requeueable"] += 1
+                        continue
+                    # 樂觀鎖：failed 的列沒有 announce_date，呼叫端傳空字串即可。
+                    if date.strip() != (row["announce_date"] or ""):
+                        counts["mismatch"] += 1
+                        continue
+                    # url/verified 一起清（見 report 的同一條戒律）：留著就是替一個
+                    # 已經被判定錯誤的日期背書。
+                    sql = ("UPDATE tasks SET state='undone', announce_date=NULL,"
+                           " source=NULL, raw_title=NULL, revenue=NULL, yoy=NULL,"
+                           " url=NULL, verified=NULL, dispatched_at=NULL,"
+                           " worker_id=NULL, updated_at=?")
+                    args = [now]
+                    if engine is not None:
+                        sql += ", engine=?"
+                        args.append(engine)
+                    sql += " WHERE id=?"
+                    args.append(row["id"])
+                    conn.execute(sql, args)
+                    counts["requeued"] += 1
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -681,6 +806,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "items must be a list"})
             try:
                 counts = self.store.verify(by, items)
+            except sqlite3.OperationalError as e:
+                return self._send(503, {"error": f"db busy: {e}"})
+            return self._send(200, {"applied": counts})
+
+        if u.path == "/admin/requeue":
+            body = self._read_json()
+            if body is None:
+                return self._send(400, {"error": "bad json"})
+            items = body.get("items", [])
+            if not isinstance(items, list):
+                return self._send(400, {"error": "items must be a list"})
+            raw = body.get("engine")
+            if raw is None:
+                engine = None
+            else:
+                engine, ok = parse_engine(raw, None)
+                if not ok:
+                    return self._send(400, {"error": f"unknown engine; 可用: {list(ENGINES)}"})
+            try:
+                counts = self.store.requeue(items, engine)
             except sqlite3.OperationalError as e:
                 return self._send(503, {"error": f"db busy: {e}"})
             return self._send(200, {"applied": counts})

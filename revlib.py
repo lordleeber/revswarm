@@ -258,6 +258,43 @@ def nearest_url(html, offset):
     return clean_url(unwrap_url(last))
 
 
+def longer_name_in_text(text, name, stock_id, names,
+                        roc_year=None, roc_month=None):
+    """
+    text 裡有沒有「以 name 開頭、但更長」的別家公司名？有就回那個名字，否則 None。
+
+    ⚠️ 這是 _anchor_offsets 那個 lookahead 擋的同一個坑（「統一」不可以吃到「統一超」），
+    但**parse 的後備路徑完全繞過它**——沒錨點就沒有名稱保護，直接取頁面上第一個窗內
+    日期。實測全庫 12 筆因此吃到別家公司的公告日（4113 聯上 → 聯上發(2537)、
+    2906 高林 → 高林股(1531)…），全部出自 google worker：它解析的是 inner_text，
+    公司名被塞進網址 slug 用連字號連著（「公告-聯上發-2020…」），錨點對不上。
+
+    names 是 {公司名: 股號}。比對的是**股號**不是字串：同一檔在名單裡若有更長的別名
+    （「聯上」/「聯上開發」都是 4113），那不是撞名。
+    回最長的那個，讓訊息指得準（「統一超商」比「統一超」有用）。
+
+    ⚠️ 給了 roc_year/roc_month 且**本檔自己的錨點在 text 裡命中**時一律回 None。
+    實測誤報：1216 統一 110/6 的 raw_title 是「【公告】統一2021年6月合併營收392.53
+    億元…上一則 … 統一超表現備」——開頭就是本檔正確的公告，「統一超」只是尾巴
+    「相關文章」的碎片。把這種判成抓錯公司，會害一筆正確的資料被打回重爬，而降級
+    success 是不可逆的。錨點要是「這個任務的年月」才算數，別月的公告救不了這一筆。
+    """
+    if not text or not name:
+        return None
+    if name not in text:
+        return None
+    if roc_year is not None and roc_month is not None \
+            and _anchor_offsets(text, name, roc_year, roc_month):
+        return None
+    hit = None
+    for other, code in names.items():
+        if (len(other) > len(name) and other.startswith(name)
+                and other in text and str(code) != str(stock_id)):
+            if hit is None or len(other) > len(hit):
+                hit = other
+    return hit
+
+
 def pick_url_by_name(links, name, roc_year, roc_month):
     """
     從 (連結文字, 網址) 清單裡挑出「標題錨點命中」的第一個。google_worker 用。

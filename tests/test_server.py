@@ -370,6 +370,215 @@ class TestUrlColumn(unittest.TestCase):
         os.remove(old)
 
 
+class TestReportRejectsWrongCompany(unittest.TestCase):
+    """
+    第三道防污染再加一條：worker 回報的 raw_title 若講的是**別家公司**，不收。
+
+    ⚠️ 為什麼擋在 server：revlib.parse 找不到錨點時退回「取第一個窗內日期」，那條
+    後備路徑沒有任何公司名保護（_anchor_offsets 的 lookahead 只在錨點命中時起作用）。
+    實測 12 筆因此吃到別家公司的公告日：4113 聯上 → 聯上發(2537)、2906 高林 →
+    高林股(1531)…全部出自 google worker。
+    worker 擋不了——它只知道自己這一筆的公司名，不知道「聯上發」是另一檔股票。
+    server 有整個 tasks 表，name→stock_id 的對照本來就在手上，這裡才擋得住。
+
+    擋掉的處理與日期不過窗一致：退回 undone 重做，不當 success 也不當 failed
+    ——那不是「查不到」，是「查到了但查錯對象」。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,updated_at)"
+            " VALUES(1,'4113','聯上',109,4,'dispatched',0),"
+            "       (2,'2537','聯上發',109,4,'undone',0),"
+            "       (3,'1216','統一',110,6,'dispatched',0),"
+            "       (4,'2912','統一超',110,6,'undone',0)")
+        self.store.conn.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _report(self, tid, date, title):
+        return self.store.report("w", [{"id": tid, "status": "success",
+                                        "date": date, "source": "g_ad",
+                                        "title": title}])
+
+    def _state(self, tid):
+        return self.store.conn.execute(
+            "SELECT state, announce_date FROM tasks WHERE id=?", (tid,)).fetchone()
+
+    def test_rejects_a_title_about_a_longer_named_company(self):
+        c = self._report(1, "2020-05-08",
+                         "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253")
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["success"], 0)
+        r = self._state(1)
+        # 退回 undone 重做：這不是「查不到」，是「查錯對象」。
+        self.assertEqual(r["state"], "undone")
+        self.assertIsNone(r["announce_date"])
+
+    def test_accepts_when_our_own_anchor_matches(self):
+        # 實測誤報：1216 統一 110/6 的 title 開頭就是本檔正確的公告，
+        # 「統一超」只在尾巴的相關文章碎片裡。擋掉它會害正確資料被退。
+        c = self._report(3, "2021-07-12",
+                         "【公告】統一2021年6月合併營收392.53億元年增1.65%. 上一則 … 統一超表現備")
+        self.assertEqual(c["success"], 1)
+        self.assertEqual(self._state(3)["state"], "success")
+
+    def test_accepts_a_clean_title(self):
+        c = self._report(1, "2020-05-08", "聯上 109年4月營收1.41億")
+        self.assertEqual(c["success"], 1)
+
+    def test_missing_title_does_not_block(self):
+        # title 是選填的佐證，沒有就沒得檢查，不可以因此拒收。
+        c = self.store.report("w", [{"id": 1, "status": "success",
+                                     "date": "2020-05-08", "source": "g_ad"}])
+        self.assertEqual(c["success"], 1)
+
+
+class TestRequeue(unittest.TestCase):
+    """
+    把「已經 success 但確定抓錯」的列打回 undone 重爬。
+
+    ⚠️ 這是全 repo 唯一會把 success 降級的線上操作，破壞力比什麼都大——寫錯一個
+    條件就是幾萬筆好資料變成待爬。所以沿用 /verify 的樂觀鎖：呼叫端必須說出它看到的
+    announce_date，對不上就不動。你只能 requeue 一筆你真的看過的列。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,announce_date,"
+            "source,raw_title,revenue,yoy,url,verified,engine,fail_count,updated_at)"
+            " VALUES(1,'4113','聯上',109,4,'success','2020-05-08','g_ad','聯上發…',"
+            "100,1.5,'https://x.tw/a','tbd','google',2,111)")
+        self.store.conn.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _row(self):
+        return self.store.conn.execute("SELECT * FROM tasks WHERE id=1").fetchone()
+
+    def _item(self, date="2020-05-08"):
+        return [{"stock_id": "4113", "roc_year": 109, "roc_month": 4, "date": date}]
+
+    def test_resets_state_and_clears_everything_derived(self):
+        c = self.store.requeue(self._item(), engine=None)
+        self.assertEqual(c["requeued"], 1)
+        r = self._row()
+        self.assertEqual(r["state"], "undone")
+        # ⚠️ 全部清掉：留任何一個都會變成「undone 卻帶著上一次抓錯的證據」，
+        # 而 url/verified 留著更糟——那是替一個已經被判定錯誤的日期背書。
+        for col in ("announce_date", "source", "raw_title", "revenue", "yoy",
+                    "url", "verified", "dispatched_at", "worker_id"):
+            self.assertIsNone(r[col], col)
+
+    def test_keeps_the_crawl_history(self):
+        # fail_count/attempts 是「這筆被爬過幾次」的歷史，不是抓到的內容。
+        # 清掉就查不出「這筆一直出問題」，那正是之後要優先看的線索。
+        self.store.requeue(self._item(), engine=None)
+        self.assertEqual(self._row()["fail_count"], 2)
+
+    def test_can_reroute_engine(self):
+        # google 抓錯的就別再給 google——換 yahoo 那條錨點路徑。
+        self.store.requeue(self._item(), engine="yahoo")
+        self.assertEqual(self._row()["engine"], "yahoo")
+
+    def test_engine_none_keeps_current_queue(self):
+        self.store.requeue(self._item(), engine=None)
+        self.assertEqual(self._row()["engine"], "google")
+
+    def test_date_mismatch_refuses_to_touch_the_row(self):
+        # 呼叫端看到的日期跟現在不一樣 = 這列在我看過之後被改過，我的判斷不再適用。
+        c = self.store.requeue(self._item(date="2020-05-09"), engine=None)
+        self.assertEqual(c["mismatch"], 1)
+        self.assertEqual(self._row()["state"], "success")
+        self.assertEqual(self._row()["announce_date"], "2020-05-08")
+
+    def test_failed_rows_can_be_requeued_with_an_empty_date(self):
+        """
+        failed 的列也要能指名重排——它沒有 announce_date，所以樂觀鎖傳空字串。
+
+        為什麼不用 requeue-failed：那支會把**全部** failed（實測 5,624 筆）一起丟進
+        指定佇列。想只挑幾筆換一條路試（例如 yahoo 沒抓到、改叫 google 試）就得有
+        指名的方式。
+        """
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "fail_count,updated_at) VALUES(2,'4113','聯上',109,8,'failed','yahoo',3,0)")
+        self.store.conn.commit()
+        c = self.store.requeue(
+            [{"stock_id": "4113", "roc_year": 109, "roc_month": 8, "date": ""}],
+            engine="google")
+        self.assertEqual(c["requeued"], 1)
+        r = self.store.conn.execute("SELECT * FROM tasks WHERE id=2").fetchone()
+        self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
+        self.assertEqual(r["fail_count"], 3)      # 爬取歷史留著
+
+    def test_undone_can_be_rerouted_to_another_engine(self):
+        """
+        already-undone 的列也要能改佇列——「這條路試過了不行，換一條」是正當操作。
+
+        ⚠️ 早期版本連 undone 一起擋，理由是「已經在排隊了」。那道防呆擋錯對象：
+        undone 沒有 announce_date/raw_title，沒有任何東西可以損失，重排是無害的；
+        它唯一的效果就是換 engine，而那正是呼叫端要的。真正該擋的是 dispatched
+        （正在被爬，改了會跟回報打架）與 prelisting（刻意標的，不是待辦）。
+        """
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,updated_at)"
+            " VALUES(2,'9001','甲',109,8,'undone','google',0)")
+        self.store.conn.commit()
+        c = self.store.requeue(
+            [{"stock_id": "9001", "roc_year": 109, "roc_month": 8, "date": ""}],
+            engine="gemini")
+        self.assertEqual(c["requeued"], 1)
+        r = self.store.conn.execute("SELECT state,engine FROM tasks WHERE id=2").fetchone()
+        self.assertEqual((r["state"], r["engine"]), ("undone", "gemini"))
+
+    def test_dispatched_and_prelisting_are_left_alone(self):
+        # dispatched 正在被某隻 worker 爬，改了會跟它的回報打架；
+        # prelisting 是「公司當時還沒公開發行」的刻意標記，不是待辦。
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,updated_at)"
+            " VALUES(2,'9001','甲',109,8,'dispatched',0),"
+            "       (3,'9002','乙',109,8,'prelisting',0)")
+        self.store.conn.commit()
+        c = self.store.requeue([
+            {"stock_id": "9001", "roc_year": 109, "roc_month": 8, "date": ""},
+            {"stock_id": "9002", "roc_year": 109, "roc_month": 8, "date": ""},
+        ], engine="google")
+        self.assertEqual(c["not_requeueable"], 2)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT state FROM tasks WHERE id=3").fetchone()[0], "prelisting")
+
+    def test_non_success_and_unknown_rows(self):
+        c = self.store.requeue([
+            {"stock_id": "9999", "roc_year": 109, "roc_month": 4, "date": "2020-05-08"},
+            "我不是 dict",
+        ], engine=None)
+        self.assertEqual(c["unknown"], 2)
+
+    def test_lease_can_pick_it_up_again(self):
+        self.store.requeue(self._item(), engine="yahoo")
+        batch = self.store.lease(5, "w", engine="yahoo")
+        self.assertEqual([t["stock_id"] for t in batch], ["4113"])
+
+
 class TestVerify(unittest.TestCase):
     """
     verified 蓋章：**只有日期真的一致才蓋**。
@@ -416,12 +625,33 @@ class TestVerify(unittest.TestCase):
         self.assertEqual(self.store.conn.execute(
             "SELECT announce_date FROM tasks WHERE id=1").fetchone()[0], "2022-11-08")
 
-    def test_out_of_window_date_is_mismatch_not_stamp(self):
-        # 送上來的日期先過 validate_date：窗外的日期連比對都不該進行。
+    def test_a_date_that_differs_is_mismatch(self):
         c = self.store.verify("mops", [{"stock_id": "1301", "roc_year": 111,
                                         "roc_month": 10, "date": "2023-05-01"}])
         self.assertEqual(c["mismatch"], 1)
         self.assertIsNone(self._row(1)["verified"])
+
+    def test_a_legitimately_out_of_window_row_can_still_be_stamped(self):
+        """
+        ⚠️ 樂觀鎖只能比對字串，**不可以借用窗驗證**。
+
+        全庫唯一合法的窗外 success 是 data/date_overrides.csv 收的遲交個案
+        （3494 誠研 109/1 = 2020-02-17，17 > 15）。早期版本讓送上來的日期先過
+        validate_date，於是那一筆永遠 mismatch、永遠蓋不了章——title_audit 逐批
+        掃描時它會卡在隊首無限重複出現。
+        窗驗證是 report 那條路的職責（worker 送新日期進來時），verify 收的是
+        「我剛才看到的值」，只需要確認那列還沒被改過。
+        """
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,announce_date,"
+            "source,updated_at) VALUES(9,'3494','誠研',109,1,'success','2020-02-17',"
+            "'g_roc_manual',0)")
+        self.store.conn.commit()
+        c = self.store.verify("claude", [{"stock_id": "3494", "roc_year": 109,
+                                          "roc_month": 1, "date": "2020-02-17"}])
+        self.assertEqual(c["verified"], 1)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT verified FROM tasks WHERE id=9").fetchone()[0], "claude")
 
     def test_non_success_row_is_skipped(self):
         c = self.store.verify("mops", [{"stock_id": "2330", "roc_year": 109,
@@ -451,6 +681,37 @@ class TestVerify(unittest.TestCase):
         c = self.store.verify("mops", item)
         self.assertEqual(c["verified"], 1)
         self.assertEqual(self._row(1)["verified"], "mops")
+
+    def test_claude_and_tbd_are_the_weakest_verifiers(self):
+        """
+        ⚠️ claude/tbd 是**人工讀 raw_title 的判斷**，不是第二個獨立來源。
+
+        title 正是產生 announce_date 的那段文字（revlib.parse 從它附近抽日期），
+        再讀一次同一段字沒有引入任何新證據——這是循環，跟 mops/gemini 那種
+        「另一個來源獨立查出同一個日期」不是同一件事。
+        所以排序上一定要墊底：它們永遠不可以覆蓋 mops 或 gemini 的章。
+        """
+        self.assertLess(server.VERIFIER_RANK["tbd"], server.VERIFIER_RANK["claude"])
+        self.assertLess(server.VERIFIER_RANK["claude"], server.VERIFIER_RANK["gemini"])
+        self.assertLess(server.VERIFIER_RANK["gemini"], server.VERIFIER_RANK["mops"])
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("mops", item)
+        for weak in ("claude", "tbd"):
+            c = self.store.verify(weak, item)
+            self.assertEqual(c["kept"], 1, weak)
+            self.assertEqual(self._row(1)["verified"], "mops", weak)
+
+    def test_claude_upgrades_tbd_but_not_the_reverse(self):
+        # 讀過一次判「存疑」，之後補到證據改判高信心 → 升得上去。
+        # 反向（claude → tbd）擋掉是排序規則的必然，真要降級就改資料庫或加旗標。
+        item = [{"stock_id": "1301", "roc_year": 111, "roc_month": 10,
+                 "date": "2022-11-08"}]
+        self.store.verify("tbd", item)
+        self.store.verify("claude", item)
+        self.assertEqual(self._row(1)["verified"], "claude")
+        self.store.verify("tbd", item)
+        self.assertEqual(self._row(1)["verified"], "claude")
 
     def test_weak_verifier_never_downgrades_a_strong_stamp(self):
         """

@@ -769,7 +769,7 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 | 欄位 | 意義 |
 | --- | --- |
 | `url` | 這個 `announce_date` 是從哪一篇讀到的。worker 回報 success 時附上，server 端再驗一次格式（非 `http`/`https` 一律存 NULL）|
-| `verified` | 第二個獨立來源核對過並且**日期一致**才蓋章：`mops` \| `gemini`。NULL = 沒驗過（**不是**「驗過但錯」）|
+| `verified` | 誰核對過這個日期、且**日期一致**才蓋章：`mops` \| `gemini` \| `claude` \| `tbd`。NULL = 沒人看過（**不是**「驗過但錯」）|
 
 ### 為什麼需要 `url`
 
@@ -815,6 +815,41 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 蓋章的判準一律是**日期真的一致**，不是「有跑過這一筆」。少了這個條件，`verified`
 就退化成「有人碰過」——欄位裡照樣有值，只是不再代表任何事。日期不一致的會被回報成
 `mismatch` 但**不蓋章也不改資料**：那是兩個來源打架的訊號，值得人逐筆去看。
+
+### 四個值的強弱不同，別混著算
+
+```
+mops    官方申報文件（公開資訊觀測站 t05st01）——最硬
+gemini  模型 grounding 獨立查出同一個日期
+claude  ⚠️ 人工讀 raw_title 的判斷，不是第二個獨立來源
+tbd     看過了，但不是高信心
+```
+
+⚠️ **`claude` 不是驗證，是篩選。** `raw_title` 正是產生 `announce_date` 的那段文字
+（`revlib.parse` 從它附近抽日期），再讀一次同一段字沒有引入任何新證據——這是循環。
+它能回答的只有一件事：**這段佐證文字撐不撐得起這個日期**。實際抓到的問題長這樣：
+
+```
+8176 智捷 110/5 → 2021-06-09
+  title：「智捷110年5月27日股東常會延後召開…紀念品延期發放」
+  錨點命中的是「110年5月」後面接的「27日」，這根本不是營收公告
+3630 新鉅科 113/5
+  title：「新鉅科 2024年5月","yptydevice":"desktop"…」← Yahoo 頁面的內嵌 JSON
+```
+
+所以排序上 `claude`/`tbd` 墊底（`tbd < claude < gemini < mops`），永遠不會覆蓋
+`mops` 或 `gemini` 的章。算「被獨立驗證的量」時**一律排除**它們。
+
+判斷寫在版控的 `data/title_review.csv`，不直接寫 DB：`mops`/`gemini` 那兩條路隨時可以
+重跑重現，這條不行——留檔才有得稽核「當初為什麼判高信心」，DB 重建後也補得回來。
+每一列都必須有 `note`，沒寫理由的直接拒收。CSV 裡的 `announce_date` 是讀的當下看到的
+值，送進 `/verify` 當樂觀鎖：之後日期若被 `mops_overwrite` 之類改掉，比對不上就記成
+`mismatch` 不蓋章——判斷是對著舊日期做的，不該套到新日期上。
+
+```bash
+python3 -m mops.stamp_verified --from claude --server http://127.0.0.1:8000
+python3 -m mops.stamp_verified --from tbd    --server http://127.0.0.1:8000
+```
 
 ### ⚠️ `verified='mops'` 不全是「兩個獨立來源同意」
 

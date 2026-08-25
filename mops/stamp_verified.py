@@ -44,6 +44,7 @@ from mops.mops_validate import load_baseline
 
 DEFAULT_BASELINE = "mops_baseline.csv"
 DEFAULT_BENCH = "gemini_benchmark.csv"
+DEFAULT_REVIEW = "data/title_review.csv"
 CHUNK = 500          # 一次送幾筆；分批只是別讓單一請求太肥，server 端本來就是一個交易
 
 
@@ -82,6 +83,58 @@ def items_from_gemini(path):
     return out
 
 
+REVIEW_FIELDS = ("stock_id", "roc_year", "roc_month", "announce_date",
+                 "verdict", "note")
+REVIEW_VERDICTS = ("claude", "tbd")
+
+
+def items_from_review(path, verdict):
+    """
+    人工讀 raw_title 的判斷 → 候選清單（只取 verdict 這一種）。
+
+    ⚠️ claude 不是「第二個獨立來源」。title 正是產生 announce_date 的那段文字
+    （revlib.parse 從它附近抽日期），再讀一次同一段字沒有引入新證據——這是循環。
+    它能回答的是「這段佐證文字撐不撐得起這個日期」：例如錨點命中的其實是
+    「智捷110年5月27日股東常會延後召開」裡的年月、或整段 title 只是 Yahoo 頁面的
+    JSON 碎片。當篩選線索用，不要當驗證。tbd = 看過了但不是高信心（與 NULL 的差別
+    是「已經有人看過」，避免重複讀）。
+
+    判斷存版控的 CSV 而不是直接寫 DB：mops/gemini 那兩條路隨時可以重跑重現，這條
+    不行。留檔才有得稽核「當初為什麼判高信心」，DB 重建後也補得回來。
+    CSV 的 announce_date 是讀的當下看到的值，送進 /verify 當樂觀鎖（見模組 docstring）。
+    """
+    if not os.path.exists(path):
+        sys.exit(f"⚠️ 讀不到 {path}。")
+    with open(path, encoding="utf-8-sig") as f:
+        rd = csv.DictReader(f)
+        if tuple(rd.fieldnames or ()) != REVIEW_FIELDS:
+            sys.exit(f"⚠️ {path} 表頭應為 {','.join(REVIEW_FIELDS)}，"
+                     f"實得 {','.join(rd.fieldnames or ())}")
+        rows = list(rd)
+
+    out, seen = [], set()
+    for i, r in enumerate(rows, start=2):
+        v = (r.get("verdict") or "").strip()
+        if v not in REVIEW_VERDICTS:
+            # ⚠️ 打錯字不可以靜默變成「這個 verdict 沒有任何列」——那會讓整批無聲跳過，
+            # 而且看起來跟「真的沒有這種判斷」一模一樣。
+            sys.exit(f"⚠️ 第 {i} 行 verdict='{v}' 不合法；可用：{list(REVIEW_VERDICTS)}")
+        if not (r.get("note") or "").strip():
+            # 判斷是主觀的，沒有理由就沒有稽核價值。
+            sys.exit(f"⚠️ 第 {i} 行缺 note。判斷是主觀的，一定要寫下理由。")
+        try:
+            key = (r["stock_id"], int(r["roc_year"]), int(r["roc_month"]))
+        except (TypeError, ValueError, KeyError):
+            sys.exit(f"⚠️ 第 {i} 行的 stock_id/roc_year/roc_month 有問題。")
+        if key in seen:
+            sys.exit(f"⚠️ 第 {i} 行重複：{key} 已經出現過。")
+        seen.add(key)
+        if v == verdict:
+            out.append({"stock_id": key[0], "roc_year": key[1],
+                        "roc_month": key[2], "date": r["announce_date"].strip()})
+    return out
+
+
 def post(server, token, by, items, timeout=60):
     req = urllib.request.Request(
         server.rstrip("/") + "/verify",
@@ -96,16 +149,23 @@ def post(server, token, by, items, timeout=60):
 def main():
     revlib.load_env()
     ap = argparse.ArgumentParser(description="蓋 tasks.verified")
-    ap.add_argument("--from", dest="src", required=True, choices=("mops", "gemini"))
+    ap.add_argument("--from", dest="src", required=True,
+                    choices=("mops", "gemini") + REVIEW_VERDICTS)
     ap.add_argument("--server", required=True, help="server base URL")
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"))
     ap.add_argument("--baseline", default=DEFAULT_BASELINE)
     ap.add_argument("--bench", default=DEFAULT_BENCH)
+    ap.add_argument("--review", default=DEFAULT_REVIEW,
+                    help="人工讀 title 的判斷 CSV（--from claude/tbd 用）")
     ap.add_argument("--dry-run", action="store_true", help="只印候選數，不送出")
     args = ap.parse_args()
 
-    items = (items_from_mops(args.baseline) if args.src == "mops"
-             else items_from_gemini(args.bench))
+    if args.src == "mops":
+        items = items_from_mops(args.baseline)
+    elif args.src == "gemini":
+        items = items_from_gemini(args.bench)
+    else:
+        items = items_from_review(args.review, args.src)
     print(f"來源 {args.src}：候選 {len(items)} 筆")
     if args.dry_run:
         for it in items[:5]:

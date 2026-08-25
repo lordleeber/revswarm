@@ -92,6 +92,14 @@ DEFAULT_MAX_CALLS = 200
 # （2.5/2.0 系列對新專案已 404 下架，"no longer available to new users"，退不回去）。
 DEFAULT_MODEL = "gemini-3.7-flash"
 HTTP_TIMEOUT = 90          # grounding 要真的去搜，比純生成慢；實測一次會發 4~11 個查詢
+URL_CHECK_TIMEOUT = 8      # 驗證模型自報的 URL；附屬動作，不值得等太久
+# 讀多少 body 來確認「這篇是不是本檔的報導」。標題與導言都在最前面，實測 160KB 的
+# 新聞頁只要前 64KB 就夠；讀全文只是白花頻寬與時間。
+URL_CHECK_BYTES = 65536
+# 驗證時裝成瀏覽器：實測用預設 UA 打 chinatimes 直接吃 403（擋機器人），
+# 換成瀏覽器 UA 才拿得到真正的狀態碼（那次是 404）。不裝的話每個網址都「確認不了」。
+URL_CHECK_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 # ADC token 的實際壽命是 1 小時；提早 10 分鐘換掉，免得剛好在請求途中過期。
 TOKEN_TTL = 3000
 
@@ -390,6 +398,63 @@ def extract(payload, name, roc_year, roc_month):
     return None
 
 
+# --- 模型自報 URL 的驗證 ----------------------------------------------------
+def verify_url(url, name=None, timeout=URL_CHECK_TIMEOUT):
+    """
+    確認模型回的 URL 真的打得開、而且真的是**這一檔**的報導。打不開或確認不了一律 False。
+
+    ⚠️ 為什麼非驗不可：實測 1216 統一 109/2 那筆，模型回的
+    chinatimes.com/newspapers/20200311000404-260204 格式完全正確（日期碼、版面碼
+    都對得上新聞網的規則），實際抓回來卻是「404錯誤 - 中時新聞網」。日期本身另有
+    旁證是對的，但出處是編的——一個 404 的網址看起來像有憑有據，比沒有出處更危險，
+    而 revlib.clean_url 只擋格式、擋不了幻覺。
+
+    取捨刻意不對稱：**確認不了就丟掉**。存到假網址的代價高（正是要防的失效模式），
+    漏掉真網址的代價低（就是 NULL，跟沒有這欄之前一樣）。所以只有 2xx/3xx 才留，
+    403（擋機器人）、429、5xx、逾時、連不上全部當作沒有。
+
+    用 GET 不用 HEAD：實測不少新聞站對 HEAD 直接回 403。只讀狀態碼、不讀 body。
+
+    ⚠️ 200 不等於「這是本檔的報導」。實測：模型給 4113 聯上 110/5 的網址
+    news.cnyes.com/news/id/4659779 是真的（HTTP 200、16 萬字元），但那篇的標題是
+    「新復興5月營收0.47億元年減23.47% | 鉅亨網」——真實存在、屬於別家公司。只看
+    狀態碼會放行，而 url 這一欄的全部用途就是點開回到**這一筆**的原文。
+    所以給了 name 就順便讀 body 找公司名（請求都已經發出去了，多讀幾 KB 很便宜）。
+
+    ⚠️ 仍然驗不了「是不是**這個月份**的報導」：新聞標題不一定寫年月，硬比會把好的
+    也擋掉。所以 gemini 的 url 就算通過驗證，可信度仍然低於 yahoo 從 SERP 的
+    <a href> 讀出來的那種。
+    """
+    if not url:
+        return False
+    # ⚠️ 光禿禿的首頁不可能是「某公司某月的公告」，當出處毫無用處，先擋掉再說。
+    # 實測 2906 高林 111/9 那筆模型給的是 https://www.masterlink.com.tw/（元富證券
+    # 首頁）——它當然打得開，於是通過了「網址活著」這道檢查，卻證明不了任何事。
+    # 擋在發請求之前：省一次 HTTP，也省得被自己的檢查騙過。
+    if urllib.parse.urlparse(url).path.strip("/") == "":
+        return False
+    try:
+        req = urllib.request.Request(
+            url, method="GET",
+            headers={"User-Agent": URL_CHECK_UA,
+                     "Accept": "text/html", "Accept-Language": "zh-TW,zh;q=0.9"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if not 200 <= getattr(resp, "status", 0) < 400:
+                return False
+            if not name:
+                return True
+            try:
+                body = resp.read(URL_CHECK_BYTES).decode("utf-8", "replace")
+            except Exception:
+                # body 讀不到是「確認不了名字」，不是「這頁不存在」——狀態碼那關已經
+                # 過了，不該因此把一個好網址判死。
+                return True
+            return name in body
+    except Exception:
+        # ⚠️ 一律吞掉。驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉。
+        return False
+
+
 # --- 單筆任務 ---------------------------------------------------------------
 def crawl_task(task, backend, model, budget):
     """
@@ -418,6 +483,11 @@ def crawl_task(task, backend, model, budget):
     hit = extract(payload, name, ry, rm)
     if hit:
         date, src, title, url = hit
+        if url and not verify_url(url, name=name):
+            # 模型編出來的網址：丟掉，但日期照算——日期是 revlib.parse 通過窗過濾
+            # 與名稱錨點抽出來的，跟這個網址真不真沒有關係。
+            print(f"  ⚠️ 模型給的 URL 打不開，不存：{url}", file=sys.stderr)
+            url = None
         return {"id": task["id"], "status": "success",
                 "date": date, "source": src, "title": title, "url": url}, False
     # 模型確實搜了、正常回話了、仍無窗內日期 → 這才是真的 failed。
