@@ -191,6 +191,50 @@ class TestUrlProvenance(unittest.TestCase):
         edge = "https://a.tw/" + "x" * (R.MAX_URL - len("https://a.tw/"))
         self.assertEqual(R.clean_url(edge), edge)          # 剛好等於上限：收
 
+    def test_is_ad_sponsor_url_matches_known_ad_url(self):
+        # 實測案例：yahoo SERP 頁固定嵌一段廣告贊助 iframe，_anchor_offsets 的
+        # 「公司名+年+月」正則會誤咬到頁面裡的 JSON 追蹤片段（如
+        # `"yptydevice":"desktop","yPropertySection":"yahoo`），往回找到的
+        # <a href> 剛好都是這顆固定廣告連結——跟真正搜尋結果無關。
+        self.assertTrue(R.is_ad_sponsor_url(
+            "https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp=ad_sponsor"))
+
+    def test_is_ad_sponsor_url_ignores_query_string_variance(self):
+        self.assertTrue(R.is_ad_sponsor_url(
+            "https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp=other&x=1"))
+
+    def test_is_ad_sponsor_url_false_for_real_article(self):
+        self.assertFalse(R.is_ad_sponsor_url("https://moneydj.com/right"))
+        self.assertFalse(R.is_ad_sponsor_url("https://tw.stock.yahoo.com/news/x"))
+
+    def test_is_ad_sponsor_url_false_for_none(self):
+        self.assertFalse(R.is_ad_sponsor_url(None))
+
+    def test_nearest_href_is_visible_before_clean_url_drops_it(self):
+        # ⚠️ 廣告護欄不可以綁在「洗乾淨之後的 URL」上：廣告連結的追蹤參數一長就會
+        # 被 clean_url 判超長丟成 None，護欄看到 None 就不開火，那筆假命中反而以
+        # success + url=NULL 落地——污染了資料，還連個可追的出處都沒有。
+        ad = ("https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp="
+              + "x" * R.MAX_URL)
+        html = '<a href="%s">廣告</a>' % ad
+        off = len(html)
+        self.assertIsNone(R.nearest_url(html, off))          # 太長 → 存不進 DB
+        self.assertEqual(R.nearest_href(html, off), ad)      # 但護欄看得見它
+        self.assertTrue(R.is_ad_sponsor_url(R.nearest_href(html, off)))
+
+    def test_nearest_href_unwraps_yahoo_redirect_like_nearest_url(self):
+        # 廣告連結也可能包在 yahoo 轉址裡；護欄比對的是解開之後的網址。
+        wrapped = ("https://r.search.yahoo.com/x/RU="
+                   + "https%3A%2F%2Ftw.emarketing.yahoo.com%2Fysmacq%2Fi.html"
+                   + "/RK=2/RS=abc")
+        html = '<a href="%s">廣告</a>' % wrapped
+        self.assertEqual(R.nearest_href(html, len(html)),
+                         "https://tw.emarketing.yahoo.com/ysmacq/i.html")
+
+    def test_nearest_href_none_when_no_anchor_before_offset(self):
+        self.assertIsNone(R.nearest_href("台塑 111年10月", 5))
+        self.assertIsNone(R.nearest_href("<a href=\'x\'>y</a>", None))
+
     def test_nearest_url_looks_backward_not_forward(self):
         # ⚠️ 這條是整個機制的關鍵：連結在日期【前面】。往前找會抓到下一筆結果的
         # 連結，看起來像有效出處但完全指錯篇——比沒有 URL 更糟。

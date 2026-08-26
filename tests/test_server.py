@@ -25,6 +25,14 @@ class TestDeriveStats(unittest.TestCase):
         self.assertEqual(d["throughput_per_min"], 5.0)
         self.assertEqual(d["eta_min"], round(110 / 5.0, 1))  # remaining 110 / 5
 
+    def test_queue_by_engine_defaults_to_empty(self):
+        # derive_stats 是 stats/dashboard 共用的形狀函式：沒給就給空的，
+        # 呼叫端不必再判 key 在不在。
+        self.assertEqual(server.derive_stats({}, 0)["queue_by_engine"], {})
+        self.assertEqual(
+            server.derive_stats({}, 0, {"yahoo": {"undone": 3}})["queue_by_engine"],
+            {"yahoo": {"undone": 3}})
+
     def test_empty_and_zero_rate(self):
         d = server.derive_stats({}, 0)
         self.assertEqual(d["total"], 0)
@@ -44,6 +52,52 @@ class TestDeriveStats(unittest.TestCase):
         self.assertEqual(d["eta_min"], round(50 / 5.0, 1))  # remaining=workable-done=50
 
 
+class TestQueueByEngine(unittest.TestCase):
+    """
+    ⚠️ 自動升級會把任務搬到別的 engine 佇列，而 by_state 只 GROUP BY state：
+    升級出去的列在 /status 上看起來就是普通的 undone。只開 yahoo worker 時，
+    這批會永遠卡在 google/gemini 佇列——undone 一直漲、ETA 照算，畫面上卻沒有
+    任何線索說「這要換一支 worker 才吃得動」。所以要分 engine 攤開。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+        c = self.store.conn
+        c.executemany(
+            "INSERT INTO tasks(stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES (?,?,?,?,?,?,0)",
+            [("2330", "台積電", 109, 1, "undone", "yahoo"),
+             ("2330", "台積電", 109, 2, "undone", "google"),
+             ("2330", "台積電", 109, 3, "undone", "google"),
+             ("2330", "台積電", 109, 4, "dispatched", "google"),
+             ("2330", "台積電", 109, 5, "undone", "gemini"),
+             ("2330", "台積電", 109, 6, "success", "yahoo"),
+             ("2330", "台積電", 109, 7, "failed", "gemini")])
+        c.commit()
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _expected(self):
+        # 只算「還沒完成」的：success/failed 已經有歸宿，不是佇列深度。
+        return {"yahoo": {"undone": 1},
+                "google": {"undone": 2, "dispatched": 1},
+                "gemini": {"undone": 1}}
+
+    def test_stats_reports_queue_depth_per_engine(self):
+        self.assertEqual(self.store.stats()["queue_by_engine"], self._expected())
+
+    def test_dashboard_reports_queue_depth_per_engine(self):
+        self.assertEqual(self.store.dashboard()["queue_by_engine"], self._expected())
+
+
 class TestRenderStatus(unittest.TestCase):
     def _d(self, **over):
         d = {
@@ -54,6 +108,8 @@ class TestRenderStatus(unittest.TestCase):
             "success_rate_pct": 88.89, "recent_success_5min": 12,
             "throughput_per_min": 2.4, "eta_min": 22.9,
             "source_counts": {"q_roc": 30, "q_ad": 10},
+            "queue_by_engine": {"yahoo": {"undone": 40, "dispatched": 5},
+                                "google": {"undone": 10}},
             "recent": [{"stock_id": "2330", "name": "台積電", "roc_year": 109,
                         "roc_month": 1, "announce_date": "2020-02-10",
                         "source": "q_roc", "raw_title": "台積電 109年1月營收 - MoneyDJ",
@@ -69,6 +125,18 @@ class TestRenderStatus(unittest.TestCase):
                        "revswarm 爬取進度", "45.0%", "q_roc", "q_ad",
                        "台積電", "MoneyDJ", "預估剩餘"]:
             self.assertIn(needle, h, needle)
+
+    def test_shows_per_engine_queue(self):
+        """升級到 google/gemini 的那批得在頁面上看得見，否則沒人會發現佇列卡住。"""
+        h = server.render_status_html(self._d())
+        self.assertIn("佇列", h)
+        for needle in ["yahoo", "google", "40", "10"]:
+            self.assertIn(needle, h, needle)
+
+    def test_render_survives_dashboard_without_queue_key(self):
+        d = self._d()
+        del d["queue_by_engine"]
+        self.assertIn("revswarm 爬取進度", server.render_status_html(d))
 
     def test_html_escaped(self):
         """名稱/標題含惡意字元時必須被跳脫，不能破頁。"""
@@ -441,6 +509,149 @@ class TestReportRejectsWrongCompany(unittest.TestCase):
         c = self.store.report("w", [{"id": 1, "status": "success",
                                      "date": "2020-05-08", "source": "g_ad"}])
         self.assertEqual(c["success"], 1)
+
+
+class TestEngineEscalationOnFailure(unittest.TestCase):
+    """
+    yahoo 這一關沒查到／查錯 → 自動轉去 google 佇列重掃；google 沒查到／查錯 →
+    自動轉去 gemini；gemini 還是沒查到／查錯 → 沒有下一棒了，才真的標記 state='failed'。
+
+    ⚠️ 這條擋的是「同一個引擎的系統性偏誤重爬也沒用」：worker 找不到窗內日期
+    （status='failed'）或 server 驗窗/撞名沒過（'rejected'）都算「這個引擎這次
+    沒交出可信結果」，都要升級，不是只有其中一種才升級——退回同一個引擎重爬，
+    大機率複製同一個偏誤。rate_limited 是暫時性訊號，不算，維持原邏輯放回同佇列。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _ins(self, tid, engine, state="dispatched"):
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(?,?,?,?,?,?,?,0)",
+            (tid, "2330", "台積電", 109, 1, state, engine))
+        self.store.conn.commit()
+
+    def _row(self, tid):
+        return self.store.conn.execute(
+            "SELECT state, engine, fail_count FROM tasks WHERE id=?", (tid,)).fetchone()
+
+    def test_failed_on_yahoo_escalates_to_google(self):
+        self._ins(1, "yahoo")
+        c = self.store.report("w", [{"id": 1, "status": "failed"}])
+        self.assertEqual(c["failed"], 1)
+        self.assertEqual(c["escalated"], 1)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
+        self.assertEqual(r["fail_count"], 1)
+
+    def test_failed_on_google_escalates_to_gemini(self):
+        self._ins(1, "google")
+        self.store.report("w", [{"id": 1, "status": "failed"}])
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "gemini"))
+
+    def test_failed_on_gemini_has_no_next_hop_and_terminates(self):
+        self._ins(1, "gemini")
+        c = self.store.report("w", [{"id": 1, "status": "failed"}])
+        self.assertEqual(c["failed"], 1)
+        self.assertEqual(c["escalated"], 0)
+        r = self._row(1)
+        # engine 欄位留著爬取歷史，不用改回去；只有 state 要變成真正的終點。
+        self.assertEqual(r["state"], "failed")
+
+    def test_rejected_on_yahoo_escalates_to_google(self):
+        # 撞名（見 TestReportRejectsWrongCompany）：查到了但查錯對象，同樣算這個
+        # 引擎這次沒交出可信結果，一樣要升級，不是只退回同引擎重爬。
+        self._ins(1, "yahoo")
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(2,'2537','聯上發',109,4,'undone','yahoo',0)")
+        self.store.conn.execute(
+            "UPDATE tasks SET stock_id='4113', name='聯上' WHERE id=1")
+        self.store.conn.commit()
+        c = self.store.report("w", [{"id": 1, "status": "success", "date": "2020-05-08",
+                                     "source": "g_ad",
+                                     "title": "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253"}])
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["escalated"], 1)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
+        # fail_count 是「這筆被爬過幾次」的歷史。rejected 與 failed 明文同等看待，
+        # 歷史就要一致地記——否則一路被 reject 到底的列會停在 fail_count=0，
+        # 跟從沒被派過的列長得一模一樣，事後查不出它其實被三個引擎都試過。
+        self.assertEqual(r["fail_count"], 1)
+
+    def test_rejected_on_gemini_has_no_next_hop_and_terminates(self):
+        self._ins(1, "gemini")
+        self.store.conn.execute(
+            "UPDATE tasks SET stock_id='4113', name='聯上' WHERE id=1")
+        self.store.conn.commit()
+        c = self.store.report("w", [{"id": 1, "status": "success", "date": "2020-05-08",
+                                     "source": "g_ad",
+                                     "title": "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253"}])
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["escalated"], 0)
+        self.assertEqual(self._row(1)["state"], "failed")
+        self.assertEqual(self._row(1)["fail_count"], 1)
+
+    def test_counts_terminal_separates_escalation_from_real_dead_end(self):
+        """
+        ⚠️ counts["failed"] 是「worker 回報了幾筆 failed」，不是「幾筆落到終點」。
+        自動升級上線後這兩個數字會差很多：只跑 yahoo worker 時整批都是升級、
+        一筆終點也沒有，log 卻印 failed=N，讀 log 的人會以為 N 筆已經沒救了。
+        terminal 明講「真的變成 state='failed' 的筆數」。
+        """
+        self._ins(1, "yahoo")            # 有下一棒 → 升級
+        # _ins 的 (stock_id, 年, 月) 是唯一鍵，第二筆換個營收月避開 UNIQUE。
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(2,'2330','台積電',109,2,'dispatched','gemini',0)")
+        self.store.conn.commit()         # 最後一棒 → 終點
+        c = self.store.report("w", [{"id": 1, "status": "failed"},
+                                    {"id": 2, "status": "failed"}])
+        self.assertEqual(c["failed"], 2)         # 回報進來的 failed 筆數
+        self.assertEqual(c["escalated"], 1)      # 換下一棒的
+        self.assertEqual(c["terminal"], 1)       # 真的落 state='failed' 的
+        self.assertEqual(self._row(1)["state"], "undone")
+        self.assertEqual(self._row(2)["state"], "failed")
+
+    def test_counts_terminal_covers_rejected_dead_end_too(self):
+        self._ins(1, "gemini")
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(2,'2537','聯上發',109,4,'undone','yahoo',0)")
+        self.store.conn.execute(
+            "UPDATE tasks SET stock_id='4113', name='聯上' WHERE id=1")
+        self.store.conn.commit()
+        c = self.store.report("w", [{"id": 1, "status": "success", "date": "2020-05-08",
+                                     "source": "g_ad",
+                                     "title": "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253"}])
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["terminal"], 1)
+
+    def test_counts_terminal_is_zero_when_everything_escalates(self):
+        self._ins(1, "yahoo")
+        c = self.store.report("w", [{"id": 1, "status": "failed"}])
+        self.assertEqual(c["terminal"], 0)
+
+    def test_rate_limited_stays_on_same_engine_regardless_of_tier(self):
+        self._ins(1, "gemini")
+        c = self.store.report("w", [{"id": 1, "status": "rate_limited"}])
+        self.assertEqual(c["rate_limited"], 1)
+        self.assertEqual(c.get("escalated", 0), 0)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "gemini"))
 
 
 class TestRequeue(unittest.TestCase):

@@ -207,6 +207,17 @@ _YAHOO_RU = re.compile(r'/RU=(.*?)/RK=')
 _HREF = re.compile(r'<a\s[^>]*?href="(https?://[^"]+)"', re.I)
 MAX_URL = 500          # 存進 DB 前的長度上限（Yahoo 轉址網址本身就近 200 字元）
 
+# Yahoo SERP 頁固定嵌一段廣告贊助 iframe。_anchor_offsets 的「公司名+年+月」正則
+# 純比對文字、不管出現位置，於是這段廣告 iframe 附近若剛好嵌了回顯查詢字串的 JSON
+# 追蹤片段（`"泓格 2022年10月","yptydevice":"desktop"...`），也會被當成合法錨點，
+# nearest_url 往回找到的固定就是這顆廣告連結——跟真正的搜尋結果無關（見 README）。
+_AD_SPONSOR_URL = re.compile(r'^https?://[^/]*emarketing\.yahoo\.com/ysmacq/', re.I)
+
+
+def is_ad_sponsor_url(u):
+    """u 是不是那顆固定的 yahoo 廣告贊助連結——命中的話代表 hit 不是真正的搜尋結果。"""
+    return bool(u) and bool(_AD_SPONSOR_URL.match(u))
+
 
 def unwrap_url(u):
     """Yahoo 轉址 → 原始網址；不是轉址的原樣回傳。"""
@@ -238,6 +249,25 @@ def clean_url(u):
     return u
 
 
+def nearest_href(html, offset):
+    """
+    取 offset 之前「最近的一個 <a href="http...">」，解開 yahoo 轉址後原樣回傳
+    —— 不做 clean_url。
+
+    ⚠️ 存進 DB 前一律走 nearest_url；這支只給「判斷這顆連結是什麼」的人用
+    （目前是 is_ad_sponsor_url 的廣告護欄）。護欄不能綁在洗乾淨之後的 URL 上：
+    廣告連結的追蹤參數一長就超過 MAX_URL，clean_url 會丟成 None，護欄看到 None
+    就不開火，那筆假命中反而以 success + url=NULL 落地——污染了資料，還連個
+    可追的出處都沒有（見 yahoo_worker.crawl_task）。
+    """
+    if not html or offset is None:
+        return None
+    last = None
+    for m in _HREF.finditer(html, 0, offset):
+        last = m.group(1)
+    return unwrap_url(last)
+
+
 def nearest_url(html, offset):
     """
     取 offset 之前「最近的一個 <a href="http...">」，當作這個日期的出處。
@@ -250,12 +280,7 @@ def nearest_url(html, offset):
     純文字（google_worker 的 inner_text、gemini 的模型回覆）沒有任何標籤，這裡會回
     None。那是預期行為不是失敗，那兩支各有自己的取法。
     """
-    if not html or offset is None:
-        return None
-    last = None
-    for m in _HREF.finditer(html, 0, offset):
-        last = m.group(1)
-    return clean_url(unwrap_url(last))
+    return clean_url(nearest_href(html, offset))
 
 
 def longer_name_in_text(text, name, stock_id, names,

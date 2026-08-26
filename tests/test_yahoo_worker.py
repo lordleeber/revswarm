@@ -16,6 +16,7 @@ import io
 import types
 import unittest
 
+import revlib
 from worker import yahoo_worker
 
 
@@ -99,6 +100,77 @@ class TestCrawlTask(unittest.TestCase):
         yahoo_worker.fetch = fetch
         r = yahoo_worker.crawl_task(self._task(), per_query_sleep=1.5)
         self.assertEqual(r["status"], "rate_limited")
+
+
+def _ad_sponsor_page(name, roc_year, roc_month, url=None):
+    """
+    模擬 yahoo SERP 頁固定嵌的廣告贊助 iframe：一顆 <a href> 指到廣告連結，緊接著是
+    命中 _anchor_offsets 的 JSON 追蹤片段（含公司名+年月字樣）與一個窗內日期——
+    跟真正的搜尋結果無關，但 parse_detail 目前分不出來。
+    """
+    wy = roc_year + 1911 if roc_month <= 11 else roc_year + 1912
+    wm = roc_month + 1 if roc_month <= 11 else 1
+    ad = url or "https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp=ad_sponsor"
+    body = (
+        '<a href="%s">廣告</a>' % ad
+        + f'"{name} {roc_year}年{roc_month}月","yptydevice":"desktop"'
+        f'{wy}年{wm}月10日'
+    )
+    return body + ("x" * 3000)
+
+
+class TestCrawlTaskSkipsAdSponsorHit(unittest.TestCase):
+    """
+    出處若解回廣告贊助頁（tw.emarketing.yahoo.com/ysmacq），視為沒找到真正的來源，
+    不能當 success：那不是搜尋結果，是頁面固定嵌的追蹤腳本，跟公司/月份無關。
+    """
+
+    def setUp(self):
+        self._time, self._random, self._fetch = (
+            yahoo_worker.time, yahoo_worker.random, yahoo_worker.fetch)
+        yahoo_worker.time = _FakeTime()
+        yahoo_worker.random = _FakeRandom()
+
+    def tearDown(self):
+        (yahoo_worker.time, yahoo_worker.random, yahoo_worker.fetch) = (
+            self._time, self._random, self._fetch)
+
+    def _task(self):
+        return {"id": 1, "stock_id": "2330", "name": "台積電",
+                "roc_year": 109, "roc_month": 1}
+
+    def test_falls_through_to_ad_query_when_roc_query_only_hits_ad_sponsor(self):
+        """民國年查詢只中廣告片段 → 不能當 success，改試西元年查詢；西元年是真命中。"""
+        def fetch(q, timeout=25):
+            if "2020年" in q:                      # 西元年查詢：真的搜尋結果
+                return (_page("台積電", 109, 1), True)
+            return (_ad_sponsor_page("台積電", 109, 1), True)   # 民國年：只有廣告片段
+        yahoo_worker.fetch = fetch
+        r = yahoo_worker.crawl_task(self._task(), per_query_sleep=1.5)
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["source"], "q_ad")
+        self.assertNotEqual(r["url"],
+                             "https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp=ad_sponsor")
+
+    def test_overlong_ad_url_still_skipped_not_success_with_null_url(self):
+        """
+        ⚠️ 廣告連結的追蹤參數一長就超過 MAX_URL，clean_url 會把它丟成 None。
+        護欄若綁在洗過的 URL 上就會看到 None、不開火，這筆假命中就以
+        success + url=NULL 落地——比判 failed 更糟，因為它連出處都查不回去。
+        """
+        long_ad = ("https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp="
+                   + "x" * revlib.MAX_URL)
+        yahoo_worker.fetch = lambda q, timeout=25: (
+            _ad_sponsor_page("台積電", 109, 1, url=long_ad), True)
+        r = yahoo_worker.crawl_task(self._task(), per_query_sleep=1.5)
+        self.assertEqual(r["status"], "failed")
+
+    def test_failed_when_both_queries_only_hit_ad_sponsor(self):
+        """兩種年份都只中廣告片段（頁面正常、非限流）→ 真的找不到，判 failed 不是 success。"""
+        yahoo_worker.fetch = lambda q, timeout=25: (
+            _ad_sponsor_page("台積電", 109, 1), True)
+        r = yahoo_worker.crawl_task(self._task(), per_query_sleep=1.5)
+        self.assertEqual(r["status"], "failed")
 
 
 class TestBackoffAndBlock(unittest.TestCase):
