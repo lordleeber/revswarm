@@ -5,8 +5,10 @@ revswarm server：分散式工作佇列（FastAPI 概念，但用標準庫 http.
 
 state machine:  undone → dispatched → (success | failed)
   - dispatched 逾 LEASE_TTL 秒沒回覆 → 派工時「惰性回收」自動視為 undone
-  - failed = 真的找不到（worker 民國+西元兩種年份都試過）；不再重試
-  - rate_limited ≠ failed：立刻放回 undone，不計失敗
+  - failed（worker 兩種年份都試過仍找不到）或 rejected（server 驗窗/撞名沒過）
+    都會依 NEXT_ENGINE 自動升級：退回 undone、engine 換下一棒（yahoo→google→gemini）
+    重掃；已經是 gemini、沒有下一棒才真的落 state='failed'，不再重試（見 Store.report）
+  - rate_limited ≠ failed：立刻放回 undone、engine 不變，不計失敗、不升級
 
 endpoints（都需 header  Authorization: Bearer <token>，除 /stats 之外可設）：
   POST /lease?n=30&worker=<id>&engine=yahoo   原子租一批任務
@@ -44,6 +46,11 @@ LEASE_TTL = 600          # 秒；dispatched 超過此值未回覆即可被重派
 MAX_LEASE = 200          # 單次 lease 上限，避免一隻 worker 掃光佇列
 ENGINES = ("yahoo", "google", "gemini")   # 佇列分流白名單；未列入的一律 400（見 parse_engine）
 DEFAULT_ENGINE = "yahoo"
+# 自動升級鏈：這一關沒交出可信結果（worker 回報 failed，或 server 驗窗/撞名沒過的
+# rejected）就換下一棒重掃，而不是傻傻退回同一個引擎——同一個引擎的系統性偏誤
+# （anchor 咬到廣告片段、SERP 排序偏舊…）重爬大機率複製同一個錯。gemini 沒有下一棒，
+# 見 Store.report 的 elif status == "failed" 與 valid is None 兩處。
+NEXT_ENGINE = {"yahoo": "google", "google": "gemini"}
 # verified 欄位的合法值白名單與**強弱排序**。刻意用白名單而不是自由字串：這一欄的
 # 全部價值就在於「看到它就知道有第二個獨立來源核對過」，放任何人寫任何字進去就等於
 # 沒有這個保證。
@@ -391,7 +398,7 @@ class Store:
     def report(self, worker_id, results):
         now = int(time.time())
         counts = {"success": 0, "failed": 0, "rate_limited": 0,
-                  "rejected": 0, "ignored": 0, "unknown": 0}
+                  "rejected": 0, "ignored": 0, "unknown": 0, "escalated": 0}
         conn = self.conn
         with self._lock:
             conn.execute("BEGIN IMMEDIATE;")
@@ -403,7 +410,7 @@ class Store:
                         counts["unknown"] += 1
                         continue
                     row = conn.execute(
-                        "SELECT state, roc_year, roc_month, name, stock_id"
+                        "SELECT state, roc_year, roc_month, name, stock_id, engine"
                         " FROM tasks WHERE id=?", (tid,)
                     ).fetchone()
                     if row is None:
@@ -424,11 +431,23 @@ class Store:
                         counts["rate_limited"] += 1
 
                     elif status == "failed":
-                        conn.execute(
-                            "UPDATE tasks SET state='failed', fail_count=fail_count+1,"
-                            " worker_id=?, dispatched_at=NULL, updated_at=? WHERE id=?",
-                            (worker_id, now, tid),
-                        )
+                        next_engine = NEXT_ENGINE.get(row["engine"])
+                        if next_engine:
+                            # 這個引擎兩種年份都試過仍找不到 → 換下一棒，不當終點。
+                            conn.execute(
+                                "UPDATE tasks SET state='undone', engine=?,"
+                                " fail_count=fail_count+1, worker_id=NULL,"
+                                " dispatched_at=NULL, updated_at=? WHERE id=?",
+                                (next_engine, now, tid),
+                            )
+                            counts["escalated"] += 1
+                        else:
+                            # 已經是最後一棒（gemini）沒有下一個可換，才是真的終點。
+                            conn.execute(
+                                "UPDATE tasks SET state='failed', fail_count=fail_count+1,"
+                                " worker_id=?, dispatched_at=NULL, updated_at=? WHERE id=?",
+                                (worker_id, now, tid),
+                            )
                         counts["failed"] += 1
 
                     else:  # success：server 端用同一套窗再驗一次（README「踩過的雷 → 窗過濾」）
@@ -445,12 +464,24 @@ class Store:
                                 self._names(), row["roc_year"], row["roc_month"]):
                             valid = None
                         if valid is None:
-                            # 日期不在窗內 → 不信任，退回 undone 重做（不當 success）。
-                            conn.execute(
-                                "UPDATE tasks SET state='undone', dispatched_at=NULL,"
-                                " worker_id=NULL, updated_at=? WHERE id=?",
-                                (now, tid),
-                            )
+                            # 日期不在窗內／撞到別家公司 → 不信任，這個引擎這次
+                            # 沒交出可信結果，跟 status='failed' 同等看待：換下一棒。
+                            next_engine = NEXT_ENGINE.get(row["engine"])
+                            if next_engine:
+                                conn.execute(
+                                    "UPDATE tasks SET state='undone', engine=?,"
+                                    " dispatched_at=NULL, worker_id=NULL,"
+                                    " updated_at=? WHERE id=?",
+                                    (next_engine, now, tid),
+                                )
+                                counts["escalated"] += 1
+                            else:
+                                # 已經是最後一棒（gemini），沒有下一個可換 → 終點。
+                                conn.execute(
+                                    "UPDATE tasks SET state='failed', dispatched_at=NULL,"
+                                    " worker_id=NULL, updated_at=? WHERE id=?",
+                                    (now, tid),
+                                )
                             counts["rejected"] += 1
                         else:
                             title = item.get("title")

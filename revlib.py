@@ -207,6 +207,17 @@ _YAHOO_RU = re.compile(r'/RU=(.*?)/RK=')
 _HREF = re.compile(r'<a\s[^>]*?href="(https?://[^"]+)"', re.I)
 MAX_URL = 500          # 存進 DB 前的長度上限（Yahoo 轉址網址本身就近 200 字元）
 
+# Yahoo SERP 頁固定嵌一段廣告贊助 iframe。_anchor_offsets 的「公司名+年+月」正則
+# 純比對文字、不管出現位置，於是這段廣告 iframe 附近若剛好嵌了回顯查詢字串的 JSON
+# 追蹤片段（`"泓格 2022年10月","yptydevice":"desktop"...`），也會被當成合法錨點，
+# nearest_url 往回找到的固定就是這顆廣告連結——跟真正的搜尋結果無關（見 README）。
+_AD_SPONSOR_URL = re.compile(r'^https?://[^/]*emarketing\.yahoo\.com/ysmacq/', re.I)
+
+
+def is_ad_sponsor_url(u):
+    """u 是不是那顆固定的 yahoo 廣告贊助連結——命中的話代表 hit 不是真正的搜尋結果。"""
+    return bool(u) and bool(_AD_SPONSOR_URL.match(u))
+
 
 def unwrap_url(u):
     """Yahoo 轉址 → 原始網址；不是轉址的原樣回傳。"""

@@ -191,6 +191,25 @@ class TestUrlProvenance(unittest.TestCase):
         edge = "https://a.tw/" + "x" * (R.MAX_URL - len("https://a.tw/"))
         self.assertEqual(R.clean_url(edge), edge)          # 剛好等於上限：收
 
+    def test_is_ad_sponsor_url_matches_known_ad_url(self):
+        # 實測案例：yahoo SERP 頁固定嵌一段廣告贊助 iframe，_anchor_offsets 的
+        # 「公司名+年+月」正則會誤咬到頁面裡的 JSON 追蹤片段（如
+        # `"yptydevice":"desktop","yPropertySection":"yahoo`），往回找到的
+        # <a href> 剛好都是這顆固定廣告連結——跟真正搜尋結果無關。
+        self.assertTrue(R.is_ad_sponsor_url(
+            "https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp=ad_sponsor"))
+
+    def test_is_ad_sponsor_url_ignores_query_string_variance(self):
+        self.assertTrue(R.is_ad_sponsor_url(
+            "https://tw.emarketing.yahoo.com/ysmacq/index.html?_ycmp=other&x=1"))
+
+    def test_is_ad_sponsor_url_false_for_real_article(self):
+        self.assertFalse(R.is_ad_sponsor_url("https://moneydj.com/right"))
+        self.assertFalse(R.is_ad_sponsor_url("https://tw.stock.yahoo.com/news/x"))
+
+    def test_is_ad_sponsor_url_false_for_none(self):
+        self.assertFalse(R.is_ad_sponsor_url(None))
+
     def test_nearest_url_looks_backward_not_forward(self):
         # ⚠️ 這條是整個機制的關鍵：連結在日期【前面】。往前找會抓到下一筆結果的
         # 連結，看起來像有效出處但完全指錯篇——比沒有 URL 更糟。

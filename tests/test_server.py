@@ -443,6 +443,104 @@ class TestReportRejectsWrongCompany(unittest.TestCase):
         self.assertEqual(c["success"], 1)
 
 
+class TestEngineEscalationOnFailure(unittest.TestCase):
+    """
+    yahoo 這一關沒查到／查錯 → 自動轉去 google 佇列重掃；google 沒查到／查錯 →
+    自動轉去 gemini；gemini 還是沒查到／查錯 → 沒有下一棒了，才真的標記 state='failed'。
+
+    ⚠️ 這條擋的是「同一個引擎的系統性偏誤重爬也沒用」：worker 找不到窗內日期
+    （status='failed'）或 server 驗窗/撞名沒過（'rejected'）都算「這個引擎這次
+    沒交出可信結果」，都要升級，不是只有其中一種才升級——退回同一個引擎重爬，
+    大機率複製同一個偏誤。rate_limited 是暫時性訊號，不算，維持原邏輯放回同佇列。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, "t.db")
+        self.store = server.Store(self.db)
+
+    def tearDown(self):
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.db + suf)
+            except OSError:
+                pass
+        os.rmdir(self.dir)
+
+    def _ins(self, tid, engine, state="dispatched"):
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(?,?,?,?,?,?,?,0)",
+            (tid, "2330", "台積電", 109, 1, state, engine))
+        self.store.conn.commit()
+
+    def _row(self, tid):
+        return self.store.conn.execute(
+            "SELECT state, engine, fail_count FROM tasks WHERE id=?", (tid,)).fetchone()
+
+    def test_failed_on_yahoo_escalates_to_google(self):
+        self._ins(1, "yahoo")
+        c = self.store.report("w", [{"id": 1, "status": "failed"}])
+        self.assertEqual(c["failed"], 1)
+        self.assertEqual(c["escalated"], 1)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
+        self.assertEqual(r["fail_count"], 1)
+
+    def test_failed_on_google_escalates_to_gemini(self):
+        self._ins(1, "google")
+        self.store.report("w", [{"id": 1, "status": "failed"}])
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "gemini"))
+
+    def test_failed_on_gemini_has_no_next_hop_and_terminates(self):
+        self._ins(1, "gemini")
+        c = self.store.report("w", [{"id": 1, "status": "failed"}])
+        self.assertEqual(c["failed"], 1)
+        self.assertEqual(c["escalated"], 0)
+        r = self._row(1)
+        # engine 欄位留著爬取歷史，不用改回去；只有 state 要變成真正的終點。
+        self.assertEqual(r["state"], "failed")
+
+    def test_rejected_on_yahoo_escalates_to_google(self):
+        # 撞名（見 TestReportRejectsWrongCompany）：查到了但查錯對象，同樣算這個
+        # 引擎這次沒交出可信結果，一樣要升級，不是只退回同引擎重爬。
+        self._ins(1, "yahoo")
+        self.store.conn.execute(
+            "INSERT INTO tasks(id,stock_id,name,roc_year,roc_month,state,engine,"
+            "updated_at) VALUES(2,'2537','聯上發',109,4,'undone','yahoo',0)")
+        self.store.conn.execute(
+            "UPDATE tasks SET stock_id='4113', name='聯上' WHERE id=1")
+        self.store.conn.commit()
+        c = self.store.report("w", [{"id": 1, "status": "success", "date": "2020-05-08",
+                                     "source": "g_ad",
+                                     "title": "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253"}])
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["escalated"], 1)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "google"))
+
+    def test_rejected_on_gemini_has_no_next_hop_and_terminates(self):
+        self._ins(1, "gemini")
+        self.store.conn.execute(
+            "UPDATE tasks SET stock_id='4113', name='聯上' WHERE id=1")
+        self.store.conn.commit()
+        c = self.store.report("w", [{"id": 1, "status": "success", "date": "2020-05-08",
+                                     "source": "g_ad",
+                                     "title": "公告-聯上發-2020… 2020年5月8日 — 聯上發. 253"}])
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["escalated"], 0)
+        self.assertEqual(self._row(1)["state"], "failed")
+
+    def test_rate_limited_stays_on_same_engine_regardless_of_tier(self):
+        self._ins(1, "gemini")
+        c = self.store.report("w", [{"id": 1, "status": "rate_limited"}])
+        self.assertEqual(c["rate_limited"], 1)
+        self.assertEqual(c.get("escalated", 0), 0)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"]), ("undone", "gemini"))
+
+
 class TestRequeue(unittest.TestCase):
     """
     把「已經 success 但確定抓錯」的列打回 undone 重爬。

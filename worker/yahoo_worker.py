@@ -141,10 +141,14 @@ def crawl_task(task, per_query_sleep):
         hit = revlib.parse_detail(html, name, ry, rm)
         if hit:
             date, title, off = hit
+            url = revlib.nearest_url(html, off)
+            if revlib.is_ad_sponsor_url(url):
+                # 錨到的是頁面固定嵌的廣告贊助片段，不是真正的搜尋結果——當作沒
+                # 命中，繼續試下一個查詢字串（見 revlib.is_ad_sponsor_url）。
+                continue
             return {"id": task["id"], "status": "success",
-                    "date": date, "source": variant, "title": title,
-                    "url": revlib.nearest_url(html, off)}
-    # 走到這：兩種查詢都沒中窗內日期。
+                    "date": date, "source": variant, "title": title, "url": url}
+    # 走到這：兩種查詢都沒中窗內日期（或只中了廣告贊助片段）。
     if saw_rate_limited or not tried_ok:
         # 有任一查詢被限流（可能正好漏掉命中）→ 保守放回重試，不判 failed。
         return {"id": task["id"], "status": "rate_limited"}
