@@ -283,6 +283,39 @@ def nearest_url(html, offset):
     return clean_url(nearest_href(html, offset))
 
 
+# 「這篇根本不是月營收公告」的標的。⚠️ 只列**實測抓到過**的頁型，不要憑想像加：
+# 每加一條就多一分誤殺好資料的風險，而打回的代價是丟掉那個日期、重爬又常救不回。
+_NOT_REVENUE = re.compile(
+    r"董事、監察人|內部關係人持股|持股明細|股東常會|股東臨時會|"
+    r"股利政策及除權息|历史天气|歷史天氣|雑誌|抽籤日期")
+# 有這些字就代表標題講的是營收/自結數（含被截斷的「…109年1月份自結合<p」）。
+_REVENUE_WORD = re.compile(r"營收|營業收入|營業額|合併收入|自結|盈餘|損益|revenue", re.I)
+# 「前段」= 公司名+年月 之後緊接著的位置。最長的公司名加「2022年10月份」約 20 字，
+# 留一點餘裕取 30；再往後就可能是 SERP 拼上來的尾巴，不能當作這篇的主題。
+_HEAD = 30
+
+
+def is_non_revenue_title(title):
+    """
+    標題【前段】就講明這不是營收公告、而且【全文】找不到任何營收字樣 → True。
+
+    實測漏網案例：`久裕 2022年10月份 董事、監察人及內部關係人持股明細…`
+    （goodinfo 董監持股頁）。公司名對、年月對、日期也在窗內，窗驗證與撞名檢查
+    全部放行，就以 success 落地——那個日期是從一張不是營收公告的頁面撿的。
+
+    ⚠️ 兩個更寬的寫法都量過整個 DB，都會殺好資料，不要改回去：
+      - 「標題必須含營收字樣」：擋掉 549 筆 MOPS 已獨立驗證正確的列（raw_title
+        被截斷成「台塑2020年1月合併<p」這種，沒有營收兩字）。
+      - 「整段比對黑名單」：命中的絕大多數是「開頭是正確的中央社公告、尾巴才被
+        SERP 拼上董監持股/除權息/法說會」，那些是好資料。
+    這條窄規則掃過 109,452 筆 success 只命中 2 筆，且都是同一張 goodinfo 頁。
+    """
+    if not title:
+        return False
+    m = _NOT_REVENUE.search(title)
+    return bool(m) and m.start() <= _HEAD and not _REVENUE_WORD.search(title)
+
+
 def longer_name_in_text(text, name, stock_id, names,
                         roc_year=None, roc_month=None):
     """

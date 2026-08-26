@@ -645,6 +645,35 @@ class TestEngineEscalationOnFailure(unittest.TestCase):
         c = self.store.report("w", [{"id": 1, "status": "failed"}])
         self.assertEqual(c["terminal"], 0)
 
+    def test_non_revenue_page_is_rejected_and_escalated(self):
+        """
+        ⚠️ 實測漏網：4173 久裕 111/10 抓到 goodinfo 的董監持股明細頁。公司名對、
+        年月對、日期也在窗內，server 原有的兩道（窗、撞名）全部放行，就以 success
+        落地了——那個日期是從一張根本不是營收公告的頁面撿的。
+        跟撞名同等看待：不收、換下一棒。
+        """
+        self._ins(1, "yahoo")
+        c = self.store.report("w", [{
+            "id": 1, "status": "success", "date": "2020-02-10", "source": "q_ad",
+            "title": "台積電 2020年1月份 董事、監察人及內部關係人持股明細,"
+                     "包含獨立/非獨立/全體董監之持股張數、持股比例、持股",
+            "url": "https://goodinfo.tw/tw/StockDirectorShareholdDetail.asp?STOCK_ID=2330"}])
+        self.assertEqual(c["rejected"], 1)
+        self.assertEqual(c["escalated"], 1)
+        self.assertEqual(c["terminal"], 0)
+        r = self._row(1)
+        self.assertEqual((r["state"], r["engine"], r["fail_count"]), ("undone", "google", 1))
+
+    def test_real_announcement_with_director_tail_still_accepted(self):
+        """開頭是正確公告、尾巴才被 SERP 拼上董監持股——這種不可以擋（會殺好資料）。"""
+        self._ins(1, "yahoo")
+        c = self.store.report("w", [{
+            "id": 1, "status": "success", "date": "2020-02-10", "source": "q_ad",
+            "title": "【公告】台積電2020年1月合併營收1.56億元年增39.2%. 中央社. "
+                     "2330 台積電董監持股明細 Goo"}])
+        self.assertEqual(c["success"], 1)
+        self.assertEqual(self._row(1)["state"], "success")
+
     def test_rate_limited_stays_on_same_engine_regardless_of_tier(self):
         self._ins(1, "gemini")
         c = self.store.report("w", [{"id": 1, "status": "rate_limited"}])

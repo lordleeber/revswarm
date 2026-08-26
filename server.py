@@ -492,6 +492,13 @@ class Store:
                                 item.get("title") or "", row["name"], row["stock_id"],
                                 self._names(), row["roc_year"], row["roc_month"]):
                             valid = None
+                        # ⚠️ 第三條：標題前段就講明這不是營收公告（實測 4173 久裕
+                        # 111/10 抓到 goodinfo 董監持股明細頁，窗與撞名都攔不住）。
+                        # 只擋「前段命中且全文無營收字樣」，尾巴被 SERP 拼上董監
+                        # 持股的正確公告不受影響（見 revlib.is_non_revenue_title）。
+                        if valid is not None and revlib.is_non_revenue_title(
+                                item.get("title") or ""):
+                            valid = None
                         if valid is None:
                             # 日期不在窗內／撞到別家公司 → 不信任，這個引擎這次
                             # 沒交出可信結果，跟 status='failed' 同等看待：換下一棒。

@@ -321,6 +321,55 @@ class TestUrlProvenance(unittest.TestCase):
         self.assertIsNone(R.pick_url_by_name(links, "台塑", 111, 10))
 
 
+class TestNonRevenueTitle(unittest.TestCase):
+    """
+    ⚠️ 這條護欄只擋「標題前段就講明這不是營收公告、而且全文找不到任何營收字樣」。
+    實測案例：4173 久裕 111/10 抓到 goodinfo 的董監持股明細頁——公司名+年月都對、
+    日期也在窗內，server 兩道驗證（窗、撞名）都攔不住，就以 success 落地了。
+
+    ⚠️ 為什麼不能用更寬的規則（兩種都量過整個 DB，都會殺好資料）：
+      - 「標題必須含營收字樣」：會擋掉 549 筆 MOPS 已獨立驗證正確的列，
+        它們的 raw_title 是被截斷的（如「台塑2020年1月合併<p」）。
+      - 「整段比對黑名單」：命中的絕大多數是「開頭是正確的中央社公告、尾巴才被
+        SERP 拼上董監持股/除權息/法說會」，擋了就是誤殺。
+    """
+
+    def test_true_for_goodinfo_director_shareholding_page(self):
+        self.assertTrue(R.is_non_revenue_title(
+            "久裕 2022年10月份 董事、監察人及內部關係人持股明細,包含獨立/非獨立/全體董監之持股張數"))
+
+    def test_true_for_the_other_two_observed_cases(self):
+        self.assertTrue(R.is_non_revenue_title(
+            "京城 2020年11月份 董事、監察人及內部關係人持股明細,包含獨立/非獨立/全體董監之持股張數"))
+        self.assertTrue(R.is_non_revenue_title(
+            "宇隆 2022年10月份 董事、監察人及內部關係人持股明細,包含獨立/非獨立/全體董監之持股張數"))
+
+    def test_false_when_marker_is_only_in_the_serp_tail(self):
+        # ⚠️ 最重要的一條：開頭是正確的營收公告，尾巴才被 SERP 拼上董監持股。
+        # 這種擋掉就是誤殺——實測 DB 裡這類佔了「整段比對」命中的絕大多數。
+        self.assertFalse(R.is_non_revenue_title(
+            "【公告】元創精密2021年11月合併營收1.56億元年增39.2%. 中央社. "
+            "3685 元創精密董監持股明細 Goo"))
+        self.assertFalse(R.is_non_revenue_title(
+            "【公告】亞崴2021年3月合併營收4.13億元年增68.85%. 中央社. "
+            "2021年4 ... 歷年股利政策及除權息一覽表"))
+
+    def test_false_for_truncated_but_verified_titles(self):
+        # 這些是 MOPS 獨立驗證過的正確列，只是 raw_title 被截斷；沒有任何
+        # 「明確不是營收」的標的，就不該碰它們。
+        for t in ("台塑2020年1月合併<p", "偉訓109年1月份自結合<p",
+                  "晶技109年1月自結損益<p"):
+            self.assertFalse(R.is_non_revenue_title(t), t)
+
+    def test_false_when_revenue_words_also_present_in_head(self):
+        self.assertFalse(R.is_non_revenue_title(
+            "久裕 2022年10月營收1.2億 董事、監察人及內部關係人持股明細"))
+
+    def test_false_for_empty_or_none(self):
+        self.assertFalse(R.is_non_revenue_title(None))
+        self.assertFalse(R.is_non_revenue_title(""))
+
+
 class TestLongerNameInText(unittest.TestCase):
     """
     「title 裡是不是提到一家名字更長、以本公司名開頭的別家公司」。
