@@ -186,8 +186,13 @@ def parse_engine(raw, default=None):
     return None, False
 
 
-def derive_stats(by_state, recent_success):
+def derive_stats(by_state, recent_success, queue_by_engine=None):
     """由各 state 計數 + 近 5 分鐘成功數，導出進度/成功率/吞吐/ETA。stats 與 dashboard 共用。
+
+    queue_by_engine（{engine: {state: n}}，只含未完成的 undone/dispatched）是
+    「哪個佇列還有多少活」：by_state 只 GROUP BY state，自動升級搬到 google/gemini
+    的列在畫面上就是普通的 undone，只開 yahoo worker 時它們會永遠卡著——undone
+    一直漲、ETA 照算，卻沒有任何線索說「這要換一支 worker 才吃得動」。
 
     prelisting（公司首次公開前、不可能有月營收，見 mark_prelisting.py）不會被 lease，
     故排除在「應做總數(workable)」之外——進度與 ETA 以 workable 為分母，數字才誠實。
@@ -204,6 +209,7 @@ def derive_stats(by_state, recent_success):
         "prelisting": excluded,
         "workable": workable,
         "by_state": by_state,
+        "queue_by_engine": queue_by_engine or {},
         "done": done,
         "progress_pct": round(100.0 * done / workable, 2) if workable else 0.0,
         "success": by_state.get("success", 0),
@@ -277,6 +283,21 @@ def render_status_html(d, refresh_sec=10):
         f'<div class="v {cls}">{esc(str(v))}</div></div>'
         for k, v, cls in cards)
 
+    # 依 ENGINES 的接棒順序排，其餘（理論上不該有）排在後面，才讀得出升級方向。
+    queue = d.get("queue_by_engine", {})
+    order = {e: i for i, e in enumerate(ENGINES)}
+    q_html = " &nbsp;·&nbsp; ".join(
+        f"{esc(str(eng))}: <b>{q.get('undone', 0)}</b>"
+        + (f"（+{q['dispatched']} 派工中）" if q.get("dispatched") else "")
+        for eng, q in sorted(queue.items(), key=lambda kv: (order.get(kv[0], 99), kv[0]))
+    ) or "—"
+    # 非 yahoo 的佇列要各自的 worker 才吃得動（google 需 Playwright、gemini 需
+    # 付費金鑰，都得手動開）；沒開就會一直卡著，這裡直說免得被當成普通 undone。
+    stalled = [e for e, q in queue.items() if e != DEFAULT_ENGINE and q.get("undone")]
+    if stalled:
+        q_html += ("　⚠️ " + "/".join(sorted(stalled))
+                   + " 佇列要各自的 worker 才吃得動")
+
     src = d.get("source_counts", {})
     src_html = " &nbsp;·&nbsp; ".join(
         f"{esc(str(k))}: <b>{v}</b>" for k, v in sorted(src.items())) or "—"
@@ -301,6 +322,7 @@ def render_status_html(d, refresh_sec=10):
 <div class="sub">每 {int(refresh_sec)} 秒自動更新 · JSON 版見 <code>/stats</code></div>
 <div class="bar"><span style="width:{max(pct, 3)}%">{pct}%</span></div>
 <div class="grid">{cards_html}</div>
+<h2>待做佇列（依 engine）</h2><div class="sub">{q_html}</div>
 <h2>來源分佈（success）</h2><div class="sub">{src_html}</div>
 <h2>最近成功</h2>
 <table><thead><tr><th>代號</th><th>名稱</th><th>營收月</th><th>公布日</th>
@@ -397,8 +419,14 @@ class Store:
     # --- 回報：success 需窗再驗證；rate_limited 放回；failed 記數 --------
     def report(self, worker_id, results):
         now = int(time.time())
+        # failed/rejected/success/rate_limited 數的是「回報進來的是什麼」，
+        # escalated/terminal 數的是「這批回報造成了什麼」：自動升級上線後兩者會差
+        # 很多（只開 yahoo worker 時整批都是升級、一筆終點也沒有），只印 failed=N
+        # 會讓讀 log 的人以為 N 筆已經沒救了。terminal 明講真的落 state='failed'
+        # 的筆數。
         counts = {"success": 0, "failed": 0, "rate_limited": 0,
-                  "rejected": 0, "ignored": 0, "unknown": 0, "escalated": 0}
+                  "rejected": 0, "ignored": 0, "unknown": 0,
+                  "escalated": 0, "terminal": 0}
         conn = self.conn
         with self._lock:
             conn.execute("BEGIN IMMEDIATE;")
@@ -448,6 +476,7 @@ class Store:
                                 " worker_id=?, dispatched_at=NULL, updated_at=? WHERE id=?",
                                 (worker_id, now, tid),
                             )
+                            counts["terminal"] += 1
                         counts["failed"] += 1
 
                     else:  # success：server 端用同一套窗再驗一次（README「踩過的雷 → 窗過濾」）
@@ -467,9 +496,14 @@ class Store:
                             # 日期不在窗內／撞到別家公司 → 不信任，這個引擎這次
                             # 沒交出可信結果，跟 status='failed' 同等看待：換下一棒。
                             next_engine = NEXT_ENGINE.get(row["engine"])
+                            # fail_count 跟 status='failed' 那條路一樣要加：它是
+                            # 「這筆被爬過幾次」的歷史，rejected 既然與 failed 同等
+                            # 看待，歷史就不能只記一半——否則一路被 reject 到底的列
+                            # 會停在 fail_count=0，跟從沒被派過的列長得一模一樣。
                             if next_engine:
                                 conn.execute(
                                     "UPDATE tasks SET state='undone', engine=?,"
+                                    " fail_count=fail_count+1,"
                                     " dispatched_at=NULL, worker_id=NULL,"
                                     " updated_at=? WHERE id=?",
                                     (next_engine, now, tid),
@@ -478,10 +512,12 @@ class Store:
                             else:
                                 # 已經是最後一棒（gemini），沒有下一個可換 → 終點。
                                 conn.execute(
-                                    "UPDATE tasks SET state='failed', dispatched_at=NULL,"
+                                    "UPDATE tasks SET state='failed',"
+                                    " fail_count=fail_count+1, dispatched_at=NULL,"
                                     " worker_id=NULL, updated_at=? WHERE id=?",
                                     (now, tid),
                                 )
+                                counts["terminal"] += 1
                             counts["rejected"] += 1
                         else:
                             title = item.get("title")
@@ -671,6 +707,18 @@ class Store:
                 raise
         return counts
 
+    def _queue_by_engine(self):
+        """{engine: {state: n}}，只算未完成的 undone/dispatched（呼叫端須已持有鎖）。
+
+        success/failed 已經有歸宿，不是佇列深度，算進去只會讓數字看起來很忙。
+        """
+        out = {}
+        for r in self.conn.execute(
+                "SELECT engine, state, COUNT(*) c FROM tasks"
+                " WHERE state IN ('undone','dispatched') GROUP BY engine, state"):
+            out.setdefault(r["engine"], {})[r["state"]] = r["c"]
+        return out
+
     def stats(self):
         conn = self.conn
         with self._lock:
@@ -679,10 +727,11 @@ class Store:
             recent_success = conn.execute(
                 "SELECT COUNT(*) c FROM tasks WHERE state='success' AND updated_at>=?",
                 (int(time.time()) - 300,)).fetchone()["c"]
-        return derive_stats(by_state, recent_success)
+            queue_by_engine = self._queue_by_engine()
+        return derive_stats(by_state, recent_success, queue_by_engine)
 
     def dashboard(self):
-        """/status 用：stats + 來源分佈(q_roc/q_ad) + 最近成功樣本。"""
+        """/status 用：stats + 各 engine 佇列深度 + 來源分佈(q_roc/q_ad) + 最近成功樣本。"""
         conn = self.conn
         with self._lock:
             by_state = {r["state"]: r["c"] for r in conn.execute(
@@ -697,7 +746,8 @@ class Store:
                 "SELECT stock_id, name, roc_year, roc_month, announce_date, source,"
                 " raw_title, updated_at FROM tasks WHERE state='success'"
                 " ORDER BY updated_at DESC LIMIT 15")]
-        d = derive_stats(by_state, recent_success)
+            queue_by_engine = self._queue_by_engine()
+        d = derive_stats(by_state, recent_success, queue_by_engine)
         d["source_counts"] = source_counts
         d["recent"] = recent
         return d

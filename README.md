@@ -29,6 +29,8 @@
   換下一個，不用再手動 `/admin/requeue-failed`。已經是 `gemini`、沒有下一棒可換，
   才真的落 `failed`（見 `server.py` 的 `NEXT_ENGINE`）。
 - `rate_limited` ≠ `failed`：立刻放回 `undone`（engine 不變），worker 退避重試，不計失敗、不升級。
+- 升級與落終點都會 `fail_count+1`（`failed` 與 `rejected` 兩條路一致）——那是「這筆被爬過幾次」
+  的歷史，少記一半就會讓一路被 reject 到底的列看起來像從沒派過。
 
 三道防污染（保證 0 髒資料）：
 1. worker 端「窗過濾」：只信落在**營收次月 1~15 號**的日期。
@@ -101,10 +103,10 @@ curl -s -H "Authorization: Bearer $REVSWARM_TOKEN" http://<SERVER_IP>:8000/stats
 | method | path | 說明 |
 |---|---|---|
 | POST | `/lease?n=30&worker=<id>&engine=yahoo` | 原子租一批任務（`n` 上限 200）。**越舊營收月越優先**（跨所有股票齊步：全部 109/1 → 109/2 → …），並順便惰性回收逾時租約。`engine` 分流佇列（預設 `yahoo`），三支 worker 不會搶同一批；只收 `yahoo`\|`google`\|`gemini`，其餘回 400（打錯字若靜默放行會讓 worker 一直看到空佇列）|
-| POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?,url?}]}`；status ∈ success/failed/rate_limited。`url` 是這個日期的出處，server 端會再驗一次格式（非 http/https 一律存 NULL）。`failed` 或 server 驗窗/撞名沒過的 `rejected` 會**自動升級到下一棒引擎**（見上方狀態機）|
+| POST | `/result` | 批次回報 `{worker, results:[{id,status,date?,source?,title?,url?}]}`；status ∈ success/failed/rate_limited。`url` 是這個日期的出處，server 端會再驗一次格式（非 http/https 一律存 NULL）。`failed` 或 server 驗窗/撞名沒過的 `rejected` 會**自動升級到下一棒引擎**（見上方狀態機）。回應的 `applied` 裡，`failed`/`rejected`/`success`/`rate_limited` 數的是**回報進來的是什麼**，`escalated`/`terminal` 數的是**造成了什麼**（換下一棒 / 真的落 `state='failed'`）——自動升級後兩者會差很多，別把 `failed=N` 讀成「N 筆沒救了」|
 | POST | `/verify` | `{by:"mops"\|"gemini", items:[{stock_id,roc_year,roc_month,date}]}`；**只有送上來的 date 與 DB 的 `announce_date` 一致才蓋 `verified`**，不一致回報成 `mismatch` 但不改資料。`by` 走白名單，其餘回 400（見「出處與驗證」）|
-| GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率（JSON）|
-| GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新）。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
+| GET | `/stats` | 各 state 計數、進度%、近 5 分吞吐、ETA、成功率，以及 `queue_by_engine`＝各 engine 還有多少未完成（JSON）|
+| GET | `/status` | 人類可讀的**狀態頁**（HTML 儀表板，自動更新），含「待做佇列（依 engine）」——升級到 `google`/`gemini` 的那批在 `by_state` 裡只是普通的 `undone`，沒開對應 worker 就會一直卡著，這一列直說。瀏覽器可用 `?token=<token>`；`?refresh=<秒>` 調更新頻率 |
 | GET | `/healthz` | 存活探針（免 token）|
 | POST | `/admin/requeue-failed` | 把所有 `failed` 重開成 `undone`。**新產生的 `failed`/`rejected` 現在會自動升級到下一棒引擎，平常不需要呼叫這支**；留著是為了一次性回填「自動升級上線前」就已經卡在 `failed` 的歷史列（改西元年常能救回）。加 `?engine=google`（或 `gemini`）則連 engine 一併轉過去，交給該 worker 專門處理，不影響其餘 yahoo 佇列；未知 engine 回 400（否則 3 萬筆會被丟進沒有 worker 會租的佇列）|
 

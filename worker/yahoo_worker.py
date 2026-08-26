@@ -141,11 +141,15 @@ def crawl_task(task, per_query_sleep):
         hit = revlib.parse_detail(html, name, ry, rm)
         if hit:
             date, title, off = hit
-            url = revlib.nearest_url(html, off)
-            if revlib.is_ad_sponsor_url(url):
+            # ⚠️ 先看【還沒洗過】的 href 再洗：廣告連結超過 MAX_URL 時 clean_url
+            # 會把它丟成 None，護欄若看 None 就不開火，假命中會以 url=NULL 的
+            # success 落地（見 revlib.nearest_href）。
+            href = revlib.nearest_href(html, off)
+            if revlib.is_ad_sponsor_url(href):
                 # 錨到的是頁面固定嵌的廣告贊助片段，不是真正的搜尋結果——當作沒
                 # 命中，繼續試下一個查詢字串（見 revlib.is_ad_sponsor_url）。
                 continue
+            url = revlib.clean_url(href)
             return {"id": task["id"], "status": "success",
                     "date": date, "source": variant, "title": title, "url": url}
     # 走到這：兩種查詢都沒中窗內日期（或只中了廣告贊助片段）。
