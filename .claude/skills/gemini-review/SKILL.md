@@ -35,8 +35,8 @@ description: 一次審一筆 gemini_worker 的結果：跑 --review-one 拿到�
 test -f .gemini_review_pending.json && echo "有未完成的：先審它，不要再租新的" || echo "乾淨"
 ```
 
-有的話**跳到第 2 步**審那一筆（再跑 `--review-one` 會覆蓋掉它的證據，而那筆租約
-已經付過錢了）。
+有的話**跳到第 2 步**審那一筆。⚠️ 程式也會擋：交接檔還在時 `--review-one` 直接
+exit 2、不打 API（覆蓋掉的是一份已經付過錢的證據）。真的要丟掉才加 `--force`。
 
 ## 1. 取件（租 1 筆 + 打一次 Gemini，不回報）
 
@@ -49,7 +49,8 @@ python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --review-one
 | exit | 意思 | 怎麼做 |
 |---|---|---|
 | 0 + `recommend: review` | 有東西可審 | 往下走 |
-| 0 + `recommend: retry` | 模型**沒去搜**／連線失敗，這一筆根本沒查過 | 直接 `--review-verdict retry`，不要判 reject，**這一輪結束** |
+| 2 | 上一筆的判斷還沒落地（交接檔還在） | 回第 0 步，先把那一筆審完 |
+| 0 + `recommend: retry` | 模型**沒去搜**／連線失敗，這一筆根本沒查過 | 直接 `--review-verdict retry`；判 reject 會被程式拒收（沒查過不是「查過但沒有」），**這一輪結束** |
 | 3 | gemini 佇列空的 | 回報「佇列空」並**結束整個 loop**；要補件請先 `POST /admin/requeue-failed?engine=gemini` |
 | 4 | 金鑰／權限／API 未啟用 | **停掉 loop**，照 README 檢查 Console，別再叫我 |
 
@@ -106,9 +107,9 @@ dump 裡真正要看的欄位：
 | `worker_verdict` | 批次模式**會**怎麼判（`success`／`failed`）。你的工作是同意或否決它，不是重算 |
 | `extracted` | `revlib.parse` 通過窗過濾＋名稱錨點抽出來的 date/source/title/url。⚠️ `worker_verdict=failed` 時這裡照樣有值——那正是要看的（模型講了什麼、給了什麼假網址）|
 | `text` | 模型的原始回答（`DATE:／TITLE:／URL:` 三行）。`TITLE:` 那行是它自稱逐字複製的原標題 |
-| `chunks` | ⚠️ **模型實際讀過的來源**。常常只有網域名（`moneydj.com`）不是文章標題——那是 Gemini API 的限制，不是 bug |
+| `chunks` | ⚠️ **模型實際讀過的來源**。常常只有網域名（`moneydj.com`）不是文章標題——那是 Gemini API 的限制，不是 bug。稽核檔裡這一欄存的是 JSON 陣列（標題裡真的會有分號）|
 | `searches` | 它發出的查詢字串。有沒有真的搜「這家公司這個月」？搜錯關鍵字卻給出肯定答案是強烈的幻覺訊號 |
-| `url_check` | `true`=網址活著且頁面有公司名（加分）／`null`=模型誠實回 NONE（可接受）／`false`=編了個死網址（worker 已判 failed）|
+| `url_check` | `"ok"`=網址活著且頁面有公司名（加分）／`null`=模型誠實回 NONE（可接受）／`"dead"`=編了個死網址（404/410 或根本是首頁，worker 已判 failed）／`"unknown"`=**我們自己確認不了**（對方擋機器人／逾時／頁面裡沒寫公司名）。⚠️ `unknown` 不是模型的錯，worker 只清掉 url、日期照留——這種要靠你看 `chunks` 與側查來判 |
 
 **approve 要同時滿足**（跟 title-review 同一套判準，多一條 chunks）：
 
@@ -152,9 +153,13 @@ python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --review-verdict 
 - `approve`/`reject` 會把這一筆追加進版控的 `data/gemini_review.csv`（含 `chunks`）。
   `retry` **不寫**——沒查過的那一筆不算審過。
 - ⚠️ `worker_verdict=failed` 的那一筆**不能 approve**，程式會拒收：沒有可核准的內容
-  （URL 驗證沒過／根本沒抽到窗內日期）。要放行請去改判準，不要在單筆繞過。
+  （URL 確認為不存在／根本沒抽到窗內日期）。要放行請去改判準，不要在單筆繞過。
+- ⚠️ dump 帶 `error`（`nosearch`／`retry`／`fatal`）的那一筆**只能 retry**，approve/reject
+  都會被程式拒收：那份 dump 裡沒有任何證據，而空證據看起來很像「該否決」。
 - note 寫**這一筆**的理由。與上一列一字不差會被拒收（見上面的界線 ②）。
 - 回報成功才會刪 `.gemini_review_pending.json`；server 掉線就原地重跑同一道指令。
+- ⚠️ exit 5＝**判斷已經回報 server 了，但稽核列沒寫進 CSV**。它會把那一列印出來：
+  手動補進 `data/gemini_review.csv`、刪掉交接檔，**不要重跑**同一道指令（會重複回報）。
 
 ## 5. 蓋章（只有 approve 需要）
 
@@ -165,11 +170,13 @@ python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
 蓋的是 `verified='claude'`（不是 `gemini`）：你讀的是模型自己回的那段文字，沒有引入
 第二個獨立來源——那是循環，是**篩選不是驗證**（見 README「`claude` 不是驗證」）。
 它讀整份 `data/gemini_review.csv`、只送 approve 的列，已蓋過的會記成 `kept`，可以重跑。
+同一個月份被審過兩次（`requeue-failed` 把 reject 的那筆排回來重審）一律**以最後一列為準**，
+覆蓋情形它會印出來——所以重審的判斷直接往後 append 就好，不要回頭改舊列。
 
 ## 6. 這一輪的回報（保持一行到三行，loop 裡要好讀）
 
 ```
-1101 台泥 109/1 → approve  2020-02-10 [m_txt]  chunks=moneydj.com;cnyes.com
+1101 台泥 109/1 → approve  2020-02-10 [m_txt]  chunks=["moneydj.com","cnyes.com"]
   理由：<這一筆的理由>
   這一筆 7 次搜尋（約 $0.10）；累計已審 <wc -l data/gemini_review.csv 減 1> 筆
 ```

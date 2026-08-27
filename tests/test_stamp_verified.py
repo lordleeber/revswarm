@@ -128,9 +128,30 @@ class TestItemsFromReview(unittest.TestCase):
         with self.assertRaises(SystemExit):
             sv.items_from_review(self.path, "claude")
 
-    def test_duplicate_key_is_rejected(self):
-        self._write("1301,111,10,2022-11-08,claude,第一版\n"
-                    "1301,111,10,2022-11-08,tbd,第二版\n")
+    def test_the_last_row_for_a_key_wins(self):
+        """⚠️ 同一個月份出現第二列判斷是**合法的**：tbd 是「看過了但沒把握」，
+        那一筆之後可能被重讀、改判 claude（或反過來）。這種檔是 append-only 的，
+        所以後寫的就是後審的——以最後一列為準，不要整批停擺。"""
+        self._write("1301,111,10,2022-11-08,tbd,先擱著\n"
+                    "1301,111,10,2022-11-08,claude,重讀後確認三要素齊全\n")
+        self.assertEqual([i["stock_id"] for i in
+                          sv.items_from_review(self.path, "claude")], ["1301"])
+        self.assertEqual(sv.items_from_review(self.path, "tbd"), [])
+
+    def test_a_repeated_key_does_not_block_the_rest_of_the_batch(self):
+        """⚠️ 這才是舊行為真正的代價：一列重複就 sys.exit，整批（含幾萬列無關的
+        判斷）一列都蓋不到章，而檔案又是 append-only、不准刪列——等於沒有出路。"""
+        self._write("1301,111,10,2022-11-08,tbd,先擱著\n"
+                    "1301,111,10,2022-11-08,claude,重讀後確認\n"
+                    "2330,109,1,2020-02-10,claude,無關的另一筆\n")
+        self.assertEqual([i["stock_id"] for i in
+                          sv.items_from_review(self.path, "claude")],
+                         ["1301", "2330"])
+
+    def test_a_superseded_row_is_still_validated(self):
+        """被覆蓋掉不等於不必檢查：打錯字的 verdict 仍然是壞資料，要硬錯。"""
+        self._write("1301,111,10,2022-11-08,claud,打錯字\n"
+                    "1301,111,10,2022-11-08,claude,第二版\n")
         with self.assertRaises(SystemExit):
             sv.items_from_review(self.path, "claude")
 
@@ -193,9 +214,39 @@ class TestItemsFromGeminiReview(unittest.TestCase):
         with self.assertRaises(SystemExit):
             sv.items_from_gemini_review(self.path)
 
-    def test_duplicate_key_is_rejected(self):
-        self._write("1101,109,1,2020-02-10,m_txt,,x.com,approve,第一次\n"
-                    "1101,109,1,2020-02-10,m_txt,,x.com,reject,第二次\n")
+    def test_the_last_row_for_a_key_wins(self):
+        """⚠️ 同一個月份被審第二次是**這條流程保證會發生的事**：SKILL 第 1 步在佇列
+        排空時要 `POST /admin/requeue-failed?engine=gemini`，那會把先前 reject 的每
+        一筆重新排回 gemini 再審一次。檔案是 append-only（`_append_review_row` 用
+        "a" 模式、不去重）且 docstring 明文不准刪列，所以後寫的就是後審的：以最後
+        一列為準。
+
+        ⚠️ 覆寫只影響「這次送出哪些候選」；先前已經蓋上的章不會因為後來改判 reject
+        就被撤掉（撤章要另外處理）。"""
+        self._write("1101,109,1,,m_txt,,[],reject,證據不足\n"
+                    "1101,109,1,2020-02-10,m_txt,,[\"moneydj.com\"],approve,重審拿到 MoneyDJ 原文\n")
+        self.assertEqual(sv.items_from_gemini_review(self.path),
+                         [{"stock_id": "1101", "roc_year": 109,
+                           "roc_month": 1, "date": "2020-02-10"}])
+
+    def test_a_later_reject_supersedes_an_earlier_approve(self):
+        self._write("1101,109,1,2020-02-10,m_txt,,[],approve,當時看起來夠\n"
+                    "1101,109,1,,m_txt,,[],reject,對照 MOPS 後發現日期打架\n")
+        self.assertEqual(sv.items_from_gemini_review(self.path), [])
+
+    def test_a_repeated_key_does_not_block_the_rest_of_the_batch(self):
+        """⚠️ 舊行為真正的代價：重審一筆就 sys.exit，同一批裡每一個無關的 approve
+        也一起蓋不到章。"""
+        self._write("1101,109,1,,m_txt,,[],reject,證據不足\n"
+                    "1101,109,1,2020-02-10,m_txt,,[],approve,重審後確認\n"
+                    "2330,109,1,2020-02-11,m_txt,,[],approve,無關的另一筆\n")
+        self.assertEqual([i["stock_id"] for i in
+                          sv.items_from_gemini_review(self.path)],
+                         ["1101", "2330"])
+
+    def test_a_superseded_row_is_still_validated(self):
+        self._write("1101,109,1,2020-02-10,m_txt,,[],approv,打錯字\n"
+                    "1101,109,1,2020-02-10,m_txt,,[],approve,第二版\n")
         with self.assertRaises(SystemExit):
             sv.items_from_gemini_review(self.path)
 

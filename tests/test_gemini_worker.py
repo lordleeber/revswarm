@@ -581,13 +581,13 @@ class TestExtractUrl(unittest.TestCase):
     def setUp(self):
         # ⚠️ 換掉的是模組全域，測完一定要換回來：漏掉會讓後面所有測試都吃到這個假的
         # call_gemini（實測會讓 8 個錯誤分類的測試莫名其妙一起紅）。
-        self._call, self._verify = gw.call_gemini, gw.verify_url
-        # ⚠️ verify_url 會真的連外網。測試不連網是這整份檔案的前提（見模組
+        self._call, self._verify = gw.call_gemini, gw.check_url
+        # ⚠️ check_url 會真的連外網。測試不連網是這整份檔案的前提（見模組
         # docstring），漏掉這行會讓測試時間翻倍、且結果取決於對方站台活不活著。
-        gw.verify_url = lambda u, **k: True
+        gw.check_url = lambda u, **k: gw.URL_OK
 
     def tearDown(self):
-        gw.call_gemini, gw.verify_url = self._call, self._verify
+        gw.call_gemini, gw.check_url = self._call, self._verify
 
     def _p(self, text):
         return _payload(text=text, chunks=["moneydj.com"])
@@ -633,18 +633,36 @@ class TestExtractUrl(unittest.TestCase):
         self.assertEqual(r["url"], "https://cna.com.tw/a")
 
 
-class TestVerifyUrl(unittest.TestCase):
+class TestCheckUrl(unittest.TestCase):
     """
-    模型自報的 URL 存進 DB 前要先確認它真的存在。
+    模型自報的 URL 存進 DB 前要先確認它真的存在。⚠️ 回傳是**三態**，不是真假：
 
-    ⚠️ 這條是實測踩到的：1216 統一 109/2 那筆，模型回的
+      URL_OK      2xx/3xx（有給 name 就再確認頁面上真的有這家公司）
+      URL_DEAD    對方明確回答「沒有這份文件」（404/410），或那個網址本身不可能是
+                  出處（光禿禿的首頁）——「模型編的」，與網路狀況無關的確定事實
+      URL_UNKNOWN 確認不了：403（擋機器人）、429、5xx、逾時、連不上、頁面裡找不到
+                  公司名
+
+    ⚠️ DEAD 與 UNKNOWN 不可以合成一個布林，因為 judge() 只對 DEAD 把 m_txt 整筆判
+    failed，而 gemini 是升級鏈最後一棒、failed 就是終點。「對方今天擋我們的 UA」
+    跟「這篇文章不存在」混在一起，就是拿一次連線抖動去永久丟掉一個正確的日期。
+
+    ⚠️ 這條規則是實測踩到的：1216 統一 109/2 那筆，模型回的
     chinatimes.com/newspapers/20200311000404-260204 格式完全正確（日期碼、版面碼
     都對），用瀏覽器 UA 抓回來卻是「404錯誤 - 中時新聞網」。日期本身另有旁證是對的，
     但出處是編的——一個 404 的網址看起來像有憑有據，比沒有出處更危險。
 
-    取捨刻意不對稱：存到假網址的代價高（正是要防的失效），漏掉真網址的代價低
-    （就是 NULL，跟加這欄之前一樣）。所以**確認不了就丟掉**。
+    url 欄位本身的取捨仍然不對稱：**只有 URL_OK 才存**（存到假網址的代價高，
+    漏掉真網址的代價低，就是 NULL）。分三態只影響「日期」的去留。
     """
+
+    def setUp(self):
+        # ⚠️ 這個類別會換掉模組全域的 urlopen，測完一定要換回來（見 TestExtractUrl
+        # 的同一條教訓：漏掉會讓後面別的測試莫名其妙吃到這裡的假網路）。
+        self._urlopen = gw.urllib.request.urlopen
+
+    def tearDown(self):
+        gw.urllib.request.urlopen = self._urlopen
 
     def _resp(self, code, body=b""):
         class _R:
@@ -656,70 +674,92 @@ class TestVerifyUrl(unittest.TestCase):
 
     def test_keeps_a_live_url(self):
         gw.urllib.request.urlopen = lambda *a, **k: self._resp(200)
-        self.assertTrue(gw.verify_url("https://a.tw/real"))
+        self.assertEqual(gw.check_url("https://a.tw/real"), gw.URL_OK)
 
-    def test_drops_a_404(self):
-        def boom(*a, **k):
-            raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
-        gw.urllib.request.urlopen = boom
-        self.assertFalse(gw.verify_url("https://a.tw/fake"))
+    def test_a_404_is_dead(self):
+        """404/410 才是「對方明確說沒有這份文件」——就是那個 chinatimes 案例。"""
+        for code in (404, 410):
+            def boom(*a, **k):
+                raise urllib.error.HTTPError("u", code, "Not Found", {}, None)
+            gw.urllib.request.urlopen = boom
+            self.assertEqual(gw.check_url("https://a.tw/fake"), gw.URL_DEAD, code)
 
-    def test_drops_when_blocked_or_erroring(self):
-        # 403/429/5xx 都是「確認不了」，不是「確認存在」。照上面的取捨一律丟掉。
-        for code in (403, 429, 500, 503):
+    def test_blocked_or_erroring_is_unknown_not_dead(self):
+        """⚠️ 403（擋機器人——實測 chinatimes 對預設 UA 就這樣）／429／5xx／401 都是
+        「今天問不到」，不是「這篇不存在」。判成 DEAD 會讓 judge() 把一個可能正確的
+        日期永久丟掉，還把任務推到終點 failed。"""
+        for code in (401, 403, 429, 500, 503):
             def boom(*a, **k):
                 raise urllib.error.HTTPError("u", code, "x", {}, None)
             gw.urllib.request.urlopen = boom
-            self.assertFalse(gw.verify_url("https://a.tw/x"), code)
+            self.assertEqual(gw.check_url("https://a.tw/x"), gw.URL_UNKNOWN, code)
 
-    def test_network_failure_never_raises(self):
-        # 驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉。
+    def test_network_failure_never_raises_and_is_unknown(self):
+        # 驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉；連不上也不是「不存在」。
         for exc in (urllib.error.URLError("down"), TimeoutError(), OSError()):
             def boom(*a, **k):
                 raise exc
             gw.urllib.request.urlopen = boom
-            self.assertFalse(gw.verify_url("https://a.tw/x"))
+            self.assertEqual(gw.check_url("https://a.tw/x"), gw.URL_UNKNOWN)
+
+    def test_non_2xx_status_without_an_exception_is_graded_the_same_way(self):
+        # 有些路徑會直接回非 2xx 而不丟 HTTPError；分級不可以跟上面兩條不一致。
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(404)
+        self.assertEqual(gw.check_url("https://a.tw/x"), gw.URL_DEAD)
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(403)
+        self.assertEqual(gw.check_url("https://a.tw/x"), gw.URL_UNKNOWN)
 
     def test_empty_url(self):
-        self.assertFalse(gw.verify_url(None))
-        self.assertFalse(gw.verify_url(""))
+        # 沒有網址就沒有「確認過不存在」這件事（judge 那邊另有 None 這一態）。
+        self.assertEqual(gw.check_url(None), gw.URL_UNKNOWN)
+        self.assertEqual(gw.check_url(""), gw.URL_UNKNOWN)
 
-    def test_bare_homepage_is_refused_without_a_request(self):
+    def test_bare_homepage_is_dead_without_a_request(self):
         """
         ⚠️ 光禿禿的首頁不可能是「某公司某月的公告」，當出處毫無用處。
 
         實測：2906 高林 111/9 那筆，模型給的是 https://www.masterlink.com.tw/
         ——元富證券首頁。它當然打得開，於是通過了「網址活著」這道檢查，但它證明不了
         任何事。這種要在發請求之前就擋掉（省一次 HTTP，也省得被自己的檢查騙過）。
+
+        算 DEAD 不算 UNKNOWN：這裡沒有任何「對方站台今天如何」的成分，純粹從網址
+        本身就斷定「這不是一篇報導」——跟 404 一樣是確定的事實。
         """
         called = []
         gw.urllib.request.urlopen = lambda *a, **k: called.append(1) or self._resp(200)
         for u in ("https://www.masterlink.com.tw/", "https://a.tw",
                   "http://b.com.tw/", "https://c.tw/?x=1"):
-            self.assertFalse(gw.verify_url(u), u)
+            self.assertEqual(gw.check_url(u), gw.URL_DEAD, u)
         self.assertEqual(called, [], "首頁不該發出任何請求")
 
     def test_a_real_article_path_still_goes_through(self):
-        gw.urllib.request.urlopen = lambda *a, **k: self._resp(200, "…聯上 110年5月營收…".encode("utf-8"))
-        self.assertTrue(gw.verify_url(
-            "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc", name="聯上"))
+        gw.urllib.request.urlopen = lambda *a, **k: self._resp(
+            200, "…聯上 110年5月營收…".encode("utf-8"))
+        self.assertEqual(
+            gw.check_url("https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=abc",
+                         name="聯上"),
+            gw.URL_OK)
 
-    def test_a_live_url_about_another_company_is_refused(self):
+    def test_a_live_url_about_another_company_is_unknown(self):
         """
         ⚠️ 200 不等於「這是本檔的報導」。實測：模型給 4113 聯上 110/5 的網址
         news.cnyes.com/news/id/4659779 是真的（HTTP 200、16 萬字元），但那篇的標題是
         「新復興5月營收0.47億元年減23.47% | 鉅亨網」——真實存在、屬於別家公司。
         只看狀態碼會放行，而 url 這一欄的全部用途就是點開回到**這一筆**的原文。
+
+        但這是 UNKNOWN 不是 DEAD：body 裡找不到公司名也可能是 DB 存的簡稱與內文的
+        全稱不同（「台積電」vs「台灣積體電路」）、或整頁是 JS 算出來的。所以網址不存，
+        日期留著——不足以把整筆判死。
         """
         gw.urllib.request.urlopen = lambda *a, **k: self._resp(
             200, "新復興5月營收0.47億元年減23.47% | 鉅亨網".encode("utf-8"))
-        self.assertFalse(gw.verify_url("https://news.cnyes.com/news/id/4659779",
-                                       name="聯上"))
+        self.assertEqual(gw.check_url("https://news.cnyes.com/news/id/4659779",
+                                      name="聯上"), gw.URL_UNKNOWN)
 
     def test_without_a_name_it_falls_back_to_status_only(self):
         # 沒給名字就只能驗「活著」——維持舊行為，不要讓漏傳參數變成全部拒收。
         gw.urllib.request.urlopen = lambda *a, **k: self._resp(200, b"whatever")
-        self.assertTrue(gw.verify_url("https://a.tw/x"))
+        self.assertEqual(gw.check_url("https://a.tw/x"), gw.URL_OK)
 
     def test_unreadable_body_does_not_reject_a_200(self):
         # body 讀不到（連線中斷、編碼壞掉）不該把一個 200 判死——那是「確認不了名字」，
@@ -730,7 +770,7 @@ class TestVerifyUrl(unittest.TestCase):
             def __enter__(self_): return self_
             def __exit__(self_, *a): return False
         gw.urllib.request.urlopen = lambda *a, **k: _R()
-        self.assertTrue(gw.verify_url("https://a.tw/x", name="聯上"))
+        self.assertEqual(gw.check_url("https://a.tw/x", name="聯上"), gw.URL_OK)
 
 
 class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
@@ -746,14 +786,14 @@ class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
 
     m_src（groundingChunks 檢索原文）不受影響：那條路徑的 url 依 extract() 的規則
     恆為 None（見 TestExtractUrl.test_chunk_path_refuses_the_model_url），根本不會
-    走到 verify_url 這一步。
+    走到 check_url 這一步。
     """
 
     def setUp(self):
-        self._call, self._verify = gw.call_gemini, gw.verify_url
+        self._call, self._verify = gw.call_gemini, gw.check_url
 
     def tearDown(self):
-        gw.call_gemini, gw.verify_url = self._call, self._verify
+        gw.call_gemini, gw.check_url = self._call, self._verify
 
     def _run(self):
         p = _payload(text=_titled() + "\nURL: https://a.tw/x", chunks=["moneydj.com"])
@@ -761,7 +801,7 @@ class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
         return gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(10, 0))
 
     def test_dead_url_on_model_text_fails_the_whole_task(self):
-        gw.verify_url = lambda u, **k: False
+        gw.check_url = lambda u, **k: gw.URL_DEAD
         r, fatal = self._run()
         self.assertFalse(fatal)
         self.assertEqual(r["status"], "failed")
@@ -770,8 +810,25 @@ class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
         self.assertNotIn("date", r)
         self.assertNotIn("url", r)
 
+    def test_a_403_does_not_fail_the_task(self):
+        """端到端（不 stub check_url，只 stub 網路）：實測 chinatimes 對非瀏覽器 UA
+        直接回 403，Vertex 也打過隨機的 403 下一次就 200。這種「今天問不到」若跟
+        404 一樣整筆判 failed，就是拿一次擋機器人去永久丟掉一個可能正確的日期
+        ——而 gemini 是最後一棒，failed 沒有下一個引擎會再試。"""
+        self._urlopen = gw.urllib.request.urlopen
+        def boom(*a, **k):
+            raise urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
+        gw.urllib.request.urlopen = boom
+        try:
+            r, _ = self._run()
+        finally:
+            gw.urllib.request.urlopen = self._urlopen
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["date"], "2020-02-10")
+        self.assertIsNone(r["url"], "確認不了的網址不存，但日期要留")
+
     def test_live_url_is_kept(self):
-        gw.verify_url = lambda u, **k: True
+        gw.check_url = lambda u, **k: gw.URL_OK
         r, _ = self._run()
         self.assertEqual(r["status"], "success")
         self.assertEqual(r["url"], "https://a.tw/x")
@@ -783,7 +840,7 @@ class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
         「反正 m_src 的 url 恆為 None」這個巧合在保護它。"""
         self._extract = gw.extract
         gw.extract = lambda *a, **k: ("2020-02-10", gw.SRC_CHUNK, "title", "https://a.tw/x")
-        gw.verify_url = lambda u, **k: False
+        gw.check_url = lambda u, **k: gw.URL_DEAD
         try:
             gw.call_gemini = lambda *a, **k: (_payload(text="x"), None)
             r, fatal = gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(10, 0))
@@ -804,10 +861,10 @@ class TestJudgeIsSharedWithBatchMode(unittest.TestCase):
     """
 
     def setUp(self):
-        self._call, self._verify = gw.call_gemini, gw.verify_url
+        self._call, self._verify = gw.call_gemini, gw.check_url
 
     def tearDown(self):
-        gw.call_gemini, gw.verify_url = self._call, self._verify
+        gw.call_gemini, gw.check_url = self._call, self._verify
 
     def test_same_payload_gives_same_status_as_crawl_task(self):
         p = _payload(text=_titled(), chunks=["moneydj.com"])
@@ -820,17 +877,32 @@ class TestJudgeIsSharedWithBatchMode(unittest.TestCase):
         """⚠️ 審核模式的全部價值：URL 假、整筆判 failed 的那一筆，審核者仍然要
         看得到模型講了什麼日期、給了哪個假網址。judge 的 result 依規則不帶 date
         （見 TestCrawlTaskDropsHallucinatedUrl），所以那份資訊只能靠 evidence 帶出來。"""
-        gw.verify_url = lambda u, **k: False
+        gw.check_url = lambda u, **k: gw.URL_DEAD
         p = _payload(text=_titled() + "\nURL: https://a.tw/x")
         result, ev = gw.judge(TASK, p)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(ev["extracted"]["date"], "2020-02-10")
         self.assertEqual(ev["extracted"]["url"], "https://a.tw/x")
-        self.assertIs(ev["url_check"], False)
+        self.assertEqual(ev["url_check"], gw.URL_DEAD)
+
+    def test_unconfirmable_url_only_drops_the_url_and_keeps_the_date(self):
+        """⚠️ 收緊那條規則的邊界（2026-08-27）：URL 只是**確認不了**（403 擋機器人、
+        429、5xx、逾時、body 裡沒找到公司名）時不可以判 failed，只清掉 url、日期照留
+        ——也就是收緊之前的行為。理由：gemini 是升級鏈最後一棒，failed 就是終點，
+        沒有下一個引擎會再試；拿一次連線抖動換掉一個可能正確的日期是永久性的損失。
+        整筆判 failed 只留給 URL_DEAD（對方明確說沒這頁／根本是首頁）。"""
+        gw.check_url = lambda u, **k: gw.URL_UNKNOWN
+        result, ev = gw.judge(TASK, _payload(text=_titled() + "\nURL: https://a.tw/x"))
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["date"], "2020-02-10")
+        self.assertIsNone(result["url"])
+        self.assertEqual(ev["url_check"], gw.URL_UNKNOWN)
+        # 稽核仍看得到模型給了哪個網址（審核模式的全部價值）。
+        self.assertEqual(ev["extracted"]["url"], "https://a.tw/x")
 
     def test_no_url_leaves_url_check_unknown(self):
-        """沒有 url 可驗 ≠ 驗過沒通過。前者是 None，後者是 False——CSV 稽核時
-        這兩個混在一起就分不出「模型誠實回 NONE」與「模型編了一個死網址」。"""
+        """沒有 url 可驗 ≠ 驗過沒通過。前者是 None，後者是 URL_DEAD/URL_UNKNOWN
+        ——CSV 稽核時混在一起就分不出「模型誠實回 NONE」與「模型編了一個死網址」。"""
         _, ev = gw.judge(TASK, _payload(text=_titled()))
         self.assertIsNone(ev["url_check"])
 
@@ -845,10 +917,10 @@ class TestReviewOne(unittest.TestCase):
     """
 
     def setUp(self):
-        self._call, self._verify = gw.call_gemini, gw.verify_url
+        self._call, self._verify = gw.call_gemini, gw.check_url
 
     def tearDown(self):
-        gw.call_gemini, gw.verify_url = self._call, self._verify
+        gw.call_gemini, gw.check_url = self._call, self._verify
 
     def _one(self, payload_or_err, budget=None):
         gw.call_gemini = lambda *a, **k: payload_or_err
@@ -885,7 +957,7 @@ class TestReviewOne(unittest.TestCase):
                           "url": None})
 
     def test_nothing_to_approve_when_worker_says_failed(self):
-        gw.verify_url = lambda u, **k: False
+        gw.check_url = lambda u, **k: gw.URL_DEAD
         dump, _, _ = self._one(
             (_payload(text=_titled() + "\nURL: https://a.tw/x"), None))
         self.assertEqual(dump["worker_verdict"], "failed")
@@ -991,9 +1063,59 @@ class TestReviewVerdict(unittest.TestCase):
         self.assertEqual(r["stock_id"], "2330")
         self.assertEqual(r["announce_date"], "2020-02-10")
         self.assertEqual(r["source"], gw.SRC_TEXT)
-        self.assertEqual(r["chunks"], "moneydj.com;cnyes.com")
+        self.assertEqual(json.loads(r["chunks"]), ["moneydj.com", "cnyes.com"])
         self.assertEqual(r["verdict"], "approve")
         self.assertEqual(r["note"], "標題含金額且與 revenue 對得上")
+
+    def test_chunks_survive_a_semicolon_in_the_title(self):
+        """⚠️ chunks 是這張表相對 title_review.csv 多出來的那一欄，而 grounding 的
+        來源標題是自由文字、真的會有分號（新聞標題、站名都可能）。用 ";" 串接的話
+        這一欄就切不回原本的清單——一個進版控的稽核欄位「大部分時候切得回來」等於
+        不能用。存 JSON 才是無損的。"""
+        d = _dump(chunks=["台泥 109年1月營收; 年增 3%", "cnyes.com"])
+        gw.review_verdict(_FakeClient([]), d, "approve", "分號測試", self.csv)
+        self.assertEqual(json.loads(self._rows()[0]["chunks"]),
+                         ["台泥 109年1月營收; 年增 3%", "cnyes.com"])
+
+    def test_the_csv_directory_is_created_if_missing(self):
+        """全新 clone 沒有 data/、或 --review-csv 指到別的子目錄——這一步噴例外的
+        時候 server 已經套用了判斷，稽核列卻寫不進去（見下一條）。先別讓它發生。"""
+        path = os.path.join(self.dir, "nested", "deeper", "g.csv")
+        gw.review_verdict(_FakeClient([]), _dump(), "approve", "建目錄", path)
+        with io.open(path, encoding="utf-8") as f:
+            self.assertEqual(len(list(csv.DictReader(f))), 1)
+
+    def test_a_failed_csv_write_says_what_already_landed(self):
+        """⚠️ 順序是刻意的（先回報、後寫 CSV），但寫檔失敗時例外不可以就這樣穿出去：
+        那時 server【已經】套用了這個判斷，而呼叫端會以為整件事沒發生 →
+        重跑同一道指令就是重複回報，而那個 approve 對 stamp_verified 永遠隱形。
+        所以要換成帶著「已經落地了什麼」與那一列內容的例外，讓人補得回來。"""
+        c = _FakeClient([])
+        real = gw._append_review_row
+        def boom(*a, **k):
+            raise OSError("disk on fire")
+        gw._append_review_row = boom
+        try:
+            with self.assertRaises(gw.ReviewRowLost) as cm:
+                gw.review_verdict(c, _dump(), "approve", "寫檔失敗", self.csv)
+        finally:
+            gw._append_review_row = real
+        self.assertEqual(c.reported, [[_dump()["report_if_approved"]]])
+        self.assertEqual(cm.exception.applied, 1)          # server 回的 applied
+        self.assertEqual(cm.exception.row["verdict"], "approve")
+        self.assertIn("stock_id", cm.exception.csv_line())  # 可直接貼回 CSV 的一列
+        self.assertIn("approve", cm.exception.csv_line())
+
+    def test_an_unreadable_csv_refuses_before_reporting(self):
+        """⚠️ 稽核檔讀不到就不能確認 note 有沒有跟上一列一字不差（擋套版那條）。
+        這時要在【回報之前】拒絕：順序站在我們這邊，什麼都還沒發生。
+        裸奔的 OSError 會被當成「整件事沒發生」——這裡剛好是真的，但要講清楚。"""
+        c = _FakeClient([])
+        blocked = os.path.join(self.dir, "as-a-dir.csv")
+        os.mkdir(blocked)
+        with self.assertRaises(gw.ReviewError):
+            gw.review_verdict(c, _dump(), "approve", "理由", blocked)
+        self.assertEqual(c.reported, [])
 
     def test_header_matches_the_schema_stamp_verified_validates(self):
         gw.review_verdict(_FakeClient([]), _dump(), "approve", "理由甲", self.csv)
@@ -1031,6 +1153,30 @@ class TestReviewVerdict(unittest.TestCase):
         with self.assertRaises(gw.ReviewError):
             gw.review_verdict(_FakeClient([]), d2, "approve", "同一句話", self.csv)
 
+    def test_reject_is_refused_when_the_query_never_happened(self):
+        """⚠️ 模組開頭 1. 那條戒律的機制保障：ERR_NOSEARCH／ERR_RETRY 的那一筆根本
+        沒查過，dump 裡的 extracted/chunks/text 當然是空的——而「空證據」看起來非常
+        像一筆該否決的結果（「沒有任何證據支持這個日期」）。這裡若讓 reject 過去，
+        一筆從未被查詢過的任務就落 state='failed' 成為終點（gemini 是最後一棒），
+        正是「把還沒查成功寫成 failed」的那種靜默污染。只能 retry。"""
+        for err in (gw.ERR_NOSEARCH, gw.ERR_RETRY):
+            c = _FakeClient([])
+            d = _dump(status="rate_limited", error=err, recommend="retry",
+                      extracted=None, chunks=[], text="")
+            with self.assertRaises(gw.ReviewError):
+                gw.review_verdict(c, d, "reject", f"沒有證據支持（{err}）", self.csv)
+            self.assertEqual(c.reported, [], err)
+            self.assertFalse(os.path.exists(self.csv), err)
+
+    def test_approve_is_refused_on_an_aborted_dump(self):
+        """ERR_FATAL 的 dump 同理：裡面什麼證據都沒有，唯一合法的判斷是 retry。"""
+        c = _FakeClient([])
+        d = _dump(status="rate_limited", error=gw.ERR_FATAL, recommend="abort",
+                  extracted=None)
+        with self.assertRaises(gw.ReviewError):
+            gw.review_verdict(c, d, "approve", "看起來對", self.csv)
+        self.assertEqual(c.reported, [])
+
     def test_unknown_verdict_is_refused(self):
         with self.assertRaises(gw.ReviewError):
             gw.review_verdict(_FakeClient([]), _dump(), "maybe", "理由", self.csv)
@@ -1044,6 +1190,48 @@ class TestReviewVerdict(unittest.TestCase):
         with self.assertRaises(urllib.error.URLError):
             gw.review_verdict(_Boom([]), _dump(), "approve", "理由", self.csv)
         self.assertFalse(os.path.exists(self.csv))
+
+
+class TestPendingGuards(unittest.TestCase):
+    """
+    交接檔（`.gemini_review_pending.json`）的兩道守門。⚠️ 這兩條原本只寫在
+    SKILL.md 的文字裡，而它們保護的是**已經付過錢的證據**：一筆 --review-one
+    實測要發 4~11 次搜尋。靠自律的規則遲早會被一次手滑或一個 loop 繞過。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "pending.json")
+
+    def test_review_one_refuses_to_overwrite_an_unfinished_review(self):
+        """⚠️ 交接檔還在＝上一筆的判斷還沒落地（多半是 server 掉線，report 丟了
+        例外）。再跑一次 --review-one 會覆蓋掉那份證據，還把那筆租約丟在那裡等
+        600s TTL——付過的錢就這樣沒了。"""
+        io.open(self.path, "w", encoding="utf-8").write("{}")
+        with self.assertRaises(gw.ReviewError):
+            gw.check_no_pending(self.path)
+        # 明確要覆蓋（--force）才放行，且要自己知道在丟掉什麼。
+        gw.check_no_pending(self.path, force=True)
+
+    def test_a_clean_slate_passes(self):
+        gw.check_no_pending(self.path)
+
+    def test_an_aborted_run_is_not_worth_saving(self):
+        """⚠️ ERR_FATAL 的 dump 裡沒有任何證據（recommend=abort、extracted=None）。
+        存下來只會讓 SKILL 第 0 步把下一輪導去「先審它」，而那份 dump 唯一合法的
+        判斷是 retry——一次白跑的來回，還誘人在沒有證據的情況下 reject。"""
+        self.assertFalse(gw.should_save_pending(
+            {"task": dict(TASK), "recommend": "abort"}))
+
+    def test_reviewable_and_retryable_runs_are_saved(self):
+        # retry 也要存：--review-verdict retry 得靠交接檔才知道是哪一筆任務。
+        for rec in ("review", "retry"):
+            self.assertTrue(gw.should_save_pending(
+                {"task": dict(TASK), "recommend": rec}), rec)
+
+    def test_an_empty_queue_is_not_saved(self):
+        self.assertFalse(gw.should_save_pending(
+            {"task": None, "recommend": "empty"}))
 
 
 if __name__ == "__main__":

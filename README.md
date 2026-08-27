@@ -570,8 +570,11 @@ python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
 python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
 ```
 
-`--review-one` 的 exit code 就是行動指示：`0` 有東西可審／`3` gemini 佇列空的／
-`4` 設定層級錯誤（每一筆都會重演，該停下來修）。⚠️ 沒回報的租約會在 `LEASE_TTL`
+`--review-one` 的 exit code 就是行動指示：`0` 有東西可審／`2` 上一筆的判斷還沒落地
+（交接檔還在，先把它審完；要丟掉那份已付費的證據得加 `--force`）／`3` gemini 佇列空的／
+`4` 設定層級錯誤（每一筆都會重演，該停下來修）。`--review-verdict` 另有 `2`（指令不合法，
+例如對「根本沒查過」的那一筆下 reject）與 `5`（判斷已回報 server、但稽核列沒寫進 CSV
+——它會把那一列印出來讓人手動補，⚠️ 不要重跑，會重複回報）。⚠️ 沒回報的租約會在 `LEASE_TTL`
 （600s）後被 server 惰性回收放回 `undone`——**中斷是安全的**，代價是這一筆下次要再付一次錢。
 
 配 `.claude/skills/gemini-review`（`/loop /gemini-review` 一輪一筆）就是「Claude 逐筆審」
@@ -923,6 +926,10 @@ python3 -m stamp_verified --from tbd    --server http://127.0.0.1:8000
 |---|---|---|
 | `data/title_review.csv` | DB 裡已經落地的 `raw_title`（事後審）| `--from claude` |
 | `data/gemini_review.csv` | `gemini_worker --review-one` 交回的**完整證據**，含模型讀過的網域（**寫入前**審，見「gemini_worker → 審核模式」）| `--from gemini-review` |
+
+⚠️ 這兩張判斷 CSV 都是 append-only 的，同一個月份**可以**有第二列判斷（`tbd` 重讀後改判
+`claude`、reject 的那一筆被 `requeue-failed` 排回來重審…）。`stamp_verified` 一律**以最後
+一列為準**並把覆蓋情形印出來；先前已經蓋上的章不會因為後來改判 reject 就被撤掉。
 
 ⚠️ `--from gemini-review` 蓋的是 `claude` **不是 `gemini`**——判斷者是讀 gemini 證據的人，
 不是第二個獨立來源。蓋成 `gemini` 會讓它在 `VERIFIER_RANK` 裡爬到 `claude` 之上、

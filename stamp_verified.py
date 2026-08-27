@@ -118,6 +118,16 @@ def items_from_gemini_review(path):
 
     ⚠️ approve 卻沒有日期 → 直接失敗，不靜默跳過：那是自相矛盾（核准了什麼？），
     多半代表寫檔的那一步出了錯，而靜默跳過看起來跟「這批沒有 approve」一模一樣。
+
+    ⚠️ 同一個月份出現第二列判斷是**這條流程保證會發生的事**，不是資料壞掉：SKILL
+    第 1 步在佇列排空時要 `POST /admin/requeue-failed?engine=gemini`，那會把先前
+    reject 的每一筆重新排回 gemini 再審一次；而這個檔是 append-only 的
+    （gemini_worker._append_review_row 用 "a" 模式、不去重），docstring 上面那條又
+    明文不准刪列。所以【以最後一列為準】——後寫的就是後審的。舊行為（重複就
+    sys.exit）等於一筆重審就讓整批（含每一個無關的 approve）一列都蓋不到章，
+    而且沒有任何出路。
+    ⚠️ 覆寫只影響「這次送出哪些候選」；先前已經蓋上的章不會因為後來改判 reject
+    就被撤掉（撤章要另外處理）。
     """
     if not os.path.exists(path):
         sys.exit(f"⚠️ 讀不到 {path}"
@@ -129,9 +139,10 @@ def items_from_gemini_review(path):
                      f"實得 {','.join(rd.fieldnames or ())}")
         rows = list(rd)
 
-    out, seen = [], set()
+    winners = {}
     for i, r in enumerate(rows, start=2):
         v = (r.get("verdict") or "").strip()
+        # ⚠️ 每一列都驗，包含之後會被覆蓋掉的：被覆蓋不等於不必檢查，壞資料仍是壞資料。
         if v not in GEMINI_REVIEW_VERDICTS:
             sys.exit(f"⚠️ 第 {i} 行 verdict='{v}' 不合法；"
                      f"可用：{list(GEMINI_REVIEW_VERDICTS)}")
@@ -141,17 +152,40 @@ def items_from_gemini_review(path):
             key = (r["stock_id"], int(r["roc_year"]), int(r["roc_month"]))
         except (TypeError, ValueError, KeyError):
             sys.exit(f"⚠️ 第 {i} 行的 stock_id/roc_year/roc_month 有問題。")
-        if key in seen:
-            sys.exit(f"⚠️ 第 {i} 行重複：{key} 已經出現過。")
-        seen.add(key)
-        if v != "approve":
-            continue
         date = (r.get("announce_date") or "").strip()
-        if not date:
+        if v == "approve" and not date:
             sys.exit(f"⚠️ 第 {i} 行 approve 但沒有 announce_date——核准了什麼？")
-        out.append({"stock_id": key[0], "roc_year": key[1],
-                    "roc_month": key[2], "date": date})
-    return out
+        _supersede(winners, key, i, v, date)
+    _report_supersedes(winners, path)
+    return [{"stock_id": k[0], "roc_year": k[1], "roc_month": k[2],
+             "date": w["date"]}
+            for k, w in winners.items() if w["verdict"] == "approve"]
+
+
+def _supersede(winners, key, line, verdict, date):
+    """把這一列記成 key 的現任判斷，順手記下它蓋掉了第幾行（見 _report_supersedes）。"""
+    prev = winners.get(key)
+    winners[key] = {"line": line, "verdict": verdict, "date": date,
+                    "over": (prev["over"] + [prev["line"]]) if prev else []}
+
+
+def _report_supersedes(winners, path):
+    """把「這個月份有多列判斷、以最後一列為準」講出來。
+
+    ⚠️ 一定要印：靜默地只取最後一列，跟「這個檔只有一列」看起來一模一樣，而兩者
+    差很多（後者是資料，前者是有人改過判斷）。
+    """
+    dups = [(k, w) for k, w in winners.items() if w["over"]]
+    if not dups:
+        return
+    n = sum(len(w["over"]) for _, w in dups)
+    print(f"⚠️ {path}：{len(dups)} 個月份有多列判斷（共 {n} 列被覆蓋），"
+          f"一律以最後一列為準（append-only 檔，後寫的就是後審的）：")
+    for k, w in dups[:5]:
+        print(f"   {k[0]} {k[1]}/{k[2]}：第 {', '.join(str(x) for x in w['over'])} 行"
+              f" → 第 {w['line']} 行（{w['verdict']}）")
+    if len(dups) > 5:
+        print(f"   …另外 {len(dups) - 5} 個月份")
 
 
 REVIEW_FIELDS = ("stock_id", "roc_year", "roc_month", "announce_date",
@@ -173,6 +207,11 @@ def items_from_review(path, verdict):
     判斷存版控的 CSV 而不是直接寫 DB：mops/gemini 那兩條路隨時可以重跑重現，這條
     不行。留檔才有得稽核「當初為什麼判高信心」，DB 重建後也補得回來。
     CSV 的 announce_date 是讀的當下看到的值，送進 /verify 當樂觀鎖（見模組 docstring）。
+
+    ⚠️ 同一個月份出現第二列判斷是合法的（tbd 是「看過了但沒把握」，那一筆之後可能
+    被重讀改判 claude，或反過來），所以【以最後一列為準】——這個檔是 append-only 的。
+    理由與 items_from_gemini_review 同一條：舊行為（重複就 sys.exit）會讓一列重複
+    就整批停擺，而三萬列的檔案裡那一列不見得找得到。
     """
     if not os.path.exists(path):
         sys.exit(f"⚠️ 讀不到 {path}。")
@@ -183,12 +222,12 @@ def items_from_review(path, verdict):
                      f"實得 {','.join(rd.fieldnames or ())}")
         rows = list(rd)
 
-    out, seen = [], set()
+    winners = {}
     for i, r in enumerate(rows, start=2):
         v = (r.get("verdict") or "").strip()
         if v not in REVIEW_VERDICTS:
             # ⚠️ 打錯字不可以靜默變成「這個 verdict 沒有任何列」——那會讓整批無聲跳過，
-            # 而且看起來跟「真的沒有這種判斷」一模一樣。
+            # 而且看起來跟「真的沒有這種判斷」一模一樣。每一列都驗，包含被覆蓋的。
             sys.exit(f"⚠️ 第 {i} 行 verdict='{v}' 不合法；可用：{list(REVIEW_VERDICTS)}")
         if not (r.get("note") or "").strip():
             # 判斷是主觀的，沒有理由就沒有稽核價值。
@@ -197,13 +236,11 @@ def items_from_review(path, verdict):
             key = (r["stock_id"], int(r["roc_year"]), int(r["roc_month"]))
         except (TypeError, ValueError, KeyError):
             sys.exit(f"⚠️ 第 {i} 行的 stock_id/roc_year/roc_month 有問題。")
-        if key in seen:
-            sys.exit(f"⚠️ 第 {i} 行重複：{key} 已經出現過。")
-        seen.add(key)
-        if v == verdict:
-            out.append({"stock_id": key[0], "roc_year": key[1],
-                        "roc_month": key[2], "date": r["announce_date"].strip()})
-    return out
+        _supersede(winners, key, i, v, (r.get("announce_date") or "").strip())
+    _report_supersedes(winners, path)
+    return [{"stock_id": k[0], "roc_year": k[1], "roc_month": k[2],
+             "date": w["date"]}
+            for k, w in winners.items() if w["verdict"] == verdict]
 
 
 def post(server, token, by, items, timeout=60):
