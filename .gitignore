@@ -42,3 +42,6 @@ tmp/
 # Goodinfo 爬取的第三方原始頁（受其 ToS 保護，勿進版控/散布）
 # 只擋原始頁；goodinfo/ 底下的程式碼要進版控
 goodinfo/basicInfo/
+
+# gemini_worker 審核模式的交接檔（執行期產物，回報完就刪；勿進版控）
+.gemini_review_pending.json

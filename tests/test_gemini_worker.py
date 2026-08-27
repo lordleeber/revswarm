@@ -18,8 +18,11 @@ call_gemini / urlopen 為假物件。重點驗證的是「絕不可以寫錯的�
 """
 
 import contextlib
+import csv
 import io
 import json
+import os
+import tempfile
 import unittest
 import urllib.error
 
@@ -71,6 +74,14 @@ class TestBuildPrompt(unittest.TestCase):
         self.assertNotIn("搜尋查證", p)
         # 這句才是吃重的：擋掉「次月10日前申報」這種常識推算——猜出來的日期會通過窗過濾
         self.assertIn("不可以推測", p)
+
+    def test_warns_that_a_dead_url_fails_the_whole_task(self):
+        """2026-08-27 收緊：m_txt 命中若帶 URL 卻打不開，crawl_task 現在整筆判 failed
+        （見 TestCrawlTaskDropsHallucinatedUrl），不再只是清掉 url、留住日期。
+        把代價寫進 prompt，讓模型不確定就回 NONE，別隨手編一個。"""
+        p = gw.build_prompt("2330", "台積電", 109, 1)
+        self.assertIn("不要編造", p)
+        self.assertIn("整個判定失敗", p)
 
 
 # --- 信任分級 --------------------------------------------------------------
@@ -561,10 +572,6 @@ class TestRunLoop(unittest.TestCase):
         self.assertEqual(tally[gw.SRC_CHUNK], 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestExtractUrl(unittest.TestCase):
     """
     模型自報的出處。三支 worker 裡就這支的 url 是模型「說」的，不是頁面上讀到的
@@ -727,6 +734,21 @@ class TestVerifyUrl(unittest.TestCase):
 
 
 class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
+    """
+    ⚠️ 2026-08-27 收緊：m_txt（模型合成文字）命中若帶了 URL、但那個 URL 打不開，
+    整筆改判 failed，不再是「清掉 url、日期照留」。
+
+    舊行為（見 git blame）是「日期是 revlib.parse 通過窗過濾＋名稱錨點抽出來的，
+    跟網址真不真無關」，出自 1216 統一實測案例（URL 假但日期對）。但那個案例是
+    特例，多數情況模型連 URL 都編的話，日期本身的可信度也該打問號——m_txt 這層
+    本來就是三支 worker裡信任度最低的一層，沒有比對象時不該再放行「連自己給的
+    唯一佐證都是假的」這種結果。
+
+    m_src（groundingChunks 檢索原文）不受影響：那條路徑的 url 依 extract() 的規則
+    恆為 None（見 TestExtractUrl.test_chunk_path_refuses_the_model_url），根本不會
+    走到 verify_url 這一步。
+    """
+
     def setUp(self):
         self._call, self._verify = gw.call_gemini, gw.verify_url
 
@@ -738,14 +760,291 @@ class TestCrawlTaskDropsHallucinatedUrl(unittest.TestCase):
         gw.call_gemini = lambda *a, **k: (p, None)
         return gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(10, 0))
 
-    def test_dead_url_becomes_none_but_the_date_still_counts(self):
+    def test_dead_url_on_model_text_fails_the_whole_task(self):
         gw.verify_url = lambda u, **k: False
         r, fatal = self._run()
-        self.assertEqual(r["status"], "success")     # ⚠️ 日期不受影響
-        self.assertEqual(r["date"], "2020-02-10")
-        self.assertIsNone(r["url"])
+        self.assertFalse(fatal)
+        self.assertEqual(r["status"], "failed")
+        # 整筆判 failed：不該再帶 date/url——跟 status='failed' 的其他來源一致，
+        # 避免呼叫端誤以為還有可信的日期可用。
+        self.assertNotIn("date", r)
+        self.assertNotIn("url", r)
 
     def test_live_url_is_kept(self):
         gw.verify_url = lambda u, **k: True
         r, _ = self._run()
+        self.assertEqual(r["status"], "success")
         self.assertEqual(r["url"], "https://a.tw/x")
+
+    def test_dead_url_on_chunk_source_still_only_drops_the_url(self):
+        """防呆：就算未來 extract() 哪天不小心讓 m_src 帶出非 None 的 url，
+        也不該被這條新規則波及——新規則明確只鎖 m_txt（見類別 docstring）。
+        直接假造一個 extract() 回傳來驗證這個 src 判斷確實有在做，而不是
+        「反正 m_src 的 url 恆為 None」這個巧合在保護它。"""
+        self._extract = gw.extract
+        gw.extract = lambda *a, **k: ("2020-02-10", gw.SRC_CHUNK, "title", "https://a.tw/x")
+        gw.verify_url = lambda u, **k: False
+        try:
+            gw.call_gemini = lambda *a, **k: (_payload(text="x"), None)
+            r, fatal = gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(10, 0))
+        finally:
+            gw.extract = self._extract
+        self.assertEqual(r["status"], "success")
+        self.assertIsNone(r["url"])
+
+
+# --- 審核模式（--review-one / --review-verdict）-----------------------------
+class TestJudgeIsSharedWithBatchMode(unittest.TestCase):
+    """
+    ⚠️ judge() 存在的唯一理由：批次模式與審核模式必須用**同一份**判準。
+
+    審核模式印給人看的 worker_verdict，若跟批次模式真的會回報的東西不一樣，
+    審核者就是在對著另一套規則做判斷——那比沒有審核更糟（看起來把過關了）。
+    所以 crawl_task 不可以自己再寫一遍判斷，只能呼叫 judge。
+    """
+
+    def setUp(self):
+        self._call, self._verify = gw.call_gemini, gw.verify_url
+
+    def tearDown(self):
+        gw.call_gemini, gw.verify_url = self._call, self._verify
+
+    def test_same_payload_gives_same_status_as_crawl_task(self):
+        p = _payload(text=_titled(), chunks=["moneydj.com"])
+        gw.call_gemini = lambda *a, **k: (p, None)
+        batch, _ = gw.crawl_task(TASK, backend=None, model="m", budget=gw.Budget(0))
+        judged, _ = gw.judge(TASK, p)
+        self.assertEqual(batch, judged)
+
+    def test_evidence_keeps_the_date_even_when_verdict_is_failed(self):
+        """⚠️ 審核模式的全部價值：URL 假、整筆判 failed 的那一筆，審核者仍然要
+        看得到模型講了什麼日期、給了哪個假網址。judge 的 result 依規則不帶 date
+        （見 TestCrawlTaskDropsHallucinatedUrl），所以那份資訊只能靠 evidence 帶出來。"""
+        gw.verify_url = lambda u, **k: False
+        p = _payload(text=_titled() + "\nURL: https://a.tw/x")
+        result, ev = gw.judge(TASK, p)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(ev["extracted"]["date"], "2020-02-10")
+        self.assertEqual(ev["extracted"]["url"], "https://a.tw/x")
+        self.assertIs(ev["url_check"], False)
+
+    def test_no_url_leaves_url_check_unknown(self):
+        """沒有 url 可驗 ≠ 驗過沒通過。前者是 None，後者是 False——CSV 稽核時
+        這兩個混在一起就分不出「模型誠實回 NONE」與「模型編了一個死網址」。"""
+        _, ev = gw.judge(TASK, _payload(text=_titled()))
+        self.assertIsNone(ev["url_check"])
+
+
+class TestReviewOne(unittest.TestCase):
+    """
+    --review-one：租一筆、打一次 Gemini、把證據倒出來，⚠️ **絕不回報**。
+
+    「不回報」是這個模式唯一不可以寫錯的地方：一旦它自己回報了，Claude 的審核就
+    退化成事後補章（日期已經在 DB 裡了），整個模式的存在意義歸零。租約沒回報會在
+    LEASE_TTL 後被 server 惰性回收，這是安全的預設。
+    """
+
+    def setUp(self):
+        self._call, self._verify = gw.call_gemini, gw.verify_url
+
+    def tearDown(self):
+        gw.call_gemini, gw.verify_url = self._call, self._verify
+
+    def _one(self, payload_or_err, budget=None):
+        gw.call_gemini = lambda *a, **k: payload_or_err
+        client = _FakeClient([_tasks(1)])
+        dump, code = gw.review_one(client, backend=None, model="m",
+                                  budget=budget or gw.Budget(0))
+        return dump, code, client
+
+    def test_never_reports_to_server(self):
+        dump, code, client = self._one((_payload(text=_titled()), None))
+        self.assertEqual(client.reported, [])
+        self.assertEqual(code, gw.EXIT_REVIEW)
+        self.assertEqual(dump["recommend"], "review")
+
+    def test_dump_carries_the_evidence_that_the_db_never_keeps(self):
+        """chunks／searches／模型原文是這個模式要回答的那個問題（「gemini 是從哪裡
+        找到的」），DB 沒有任何欄位裝得下它們——不倒出來就是隨程序結束消失。"""
+        p = _payload(text=_titled(), chunks=["moneydj.com", "cnyes.com"],
+                     searches=["台泥 109年1月營收", "台泥 2020年1月 營收"])
+        dump, _, _ = self._one((p, None))
+        self.assertEqual(dump["chunks"], ["moneydj.com", "cnyes.com"])
+        self.assertEqual(len(dump["searches"]), 2)
+        self.assertIn("109年1月營收", dump["text"])
+        self.assertEqual(dump["extracted"]["source"], gw.SRC_TEXT)
+        self.assertEqual(dump["worker_verdict"], "success")
+
+    def test_approvable_body_is_verbatim_what_batch_mode_would_report(self):
+        """Claude 核准時送出去的東西必須是 worker 算出來的那一份，不是 Claude
+        重打一遍——這條就是「Claude 不可以自己送日期進 DB」的機制保障。"""
+        dump, _, _ = self._one((_payload(text=_titled()), None))
+        self.assertEqual(dump["report_if_approved"],
+                         {"id": 1, "status": "success", "date": "2020-02-10",
+                          "source": gw.SRC_TEXT, "title": dump["extracted"]["title"],
+                          "url": None})
+
+    def test_nothing_to_approve_when_worker_says_failed(self):
+        gw.verify_url = lambda u, **k: False
+        dump, _, _ = self._one(
+            (_payload(text=_titled() + "\nURL: https://a.tw/x"), None))
+        self.assertEqual(dump["worker_verdict"], "failed")
+        self.assertIsNone(dump["report_if_approved"])
+        self.assertEqual(dump["extracted"]["date"], "2020-02-10")   # 但看得到
+
+    def test_nosearch_recommends_retry_and_is_not_reviewable(self):
+        """⚠️ 模型沒去搜 → 這一筆根本沒查過，沒有東西可審，也不可以判 failed。"""
+        dump, code, client = self._one((None, gw.ERR_NOSEARCH))
+        self.assertEqual(dump["error"], gw.ERR_NOSEARCH)
+        self.assertEqual(dump["recommend"], "retry")
+        self.assertEqual(dump["worker_verdict"], "rate_limited")
+        self.assertIsNone(dump["extracted"])
+        self.assertEqual(code, gw.EXIT_REVIEW)
+        self.assertEqual(client.reported, [])
+
+    def test_fatal_recommends_abort_with_its_own_exit_code(self):
+        """設定錯誤對每一筆都會重演：loop 要看得出「停下來，別再叫我」。"""
+        dump, code, _ = self._one((None, gw.ERR_FATAL))
+        self.assertEqual(dump["recommend"], "abort")
+        self.assertEqual(code, gw.EXIT_ABORT)
+
+    def test_empty_queue_has_its_own_exit_code(self):
+        gw.call_gemini = lambda *a, **k: (_payload(), None)
+        client = _FakeClient([[]])
+        dump, code = gw.review_one(client, None, "m", gw.Budget(0))
+        self.assertIsNone(dump["task"])
+        self.assertEqual(dump["recommend"], "empty")
+        self.assertEqual(code, gw.EXIT_EMPTY)
+
+    def test_empty_queue_does_not_call_the_paid_api(self):
+        calls = []
+        gw.call_gemini = lambda *a, **k: (calls.append(1), (_payload(), None))[1]
+        gw.review_one(_FakeClient([[]]), None, "m", gw.Budget(0))
+        self.assertEqual(calls, [])
+
+    def test_budget_counts_searches_and_is_reported(self):
+        b = gw.Budget(0)
+        dump, _, _ = self._one(
+            (_payload(text=_titled(), searches=["a", "b", "c"]), None), budget=b)
+        self.assertEqual(b.used, 3)
+        self.assertEqual(dump["searches_used"], 3)
+        self.assertIn("搜尋 3/", dump["cost_note"])
+
+
+def _dump(status="success", **over):
+    """組一份 review_one 的產出，供 review_verdict 的測試使用。"""
+    d = {"mode": "review-one", "worker": "claude-review-1",
+         "task": dict(TASK), "error": None, "recommend": "review",
+         "searches": ["q1"], "chunks": ["moneydj.com", "cnyes.com"],
+         "text": "DATE: 2020-02-10", "url_check": None,
+         "extracted": {"date": "2020-02-10", "source": gw.SRC_TEXT,
+                       "title": "台積電109年1月營收…", "url": None},
+         "worker_verdict": status,
+         "report_if_approved": ({"id": 1, "status": "success",
+                                 "date": "2020-02-10", "source": gw.SRC_TEXT,
+                                 "title": "台積電109年1月營收…", "url": None}
+                                if status == "success" else None),
+         "searches_used": 1, "cost_note": "搜尋 1/∞ 次（約 $0.01）"}
+    d.update(over)
+    return d
+
+
+class TestReviewVerdict(unittest.TestCase):
+    """
+    --review-verdict：把 Claude 的判斷落地。Claude 只交出 approve/reject 與一段
+    理由，**所有資料欄位都由程式從 dump 裡填**——它不經手日期、來源、網址。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.csv = os.path.join(self.dir, "gemini_review.csv")
+
+    def _rows(self):
+        with io.open(self.csv, encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def test_approve_posts_exactly_the_dump_body(self):
+        c = _FakeClient([])
+        gw.review_verdict(c, _dump(), "approve", "MoneyDJ 標題三要素齊全", self.csv)
+        self.assertEqual(c.reported, [[_dump()["report_if_approved"]]])
+
+    def test_reject_reports_failed(self):
+        """gemini 是升級鏈最後一棒，failed 就是終點——語意上跟 worker 自己判
+        failed 完全一致，不新增第四種狀態。"""
+        c = _FakeClient([])
+        gw.review_verdict(c, _dump(), "reject", "標題是股東常會通知不是營收公告", self.csv)
+        self.assertEqual(c.reported, [[{"id": 1, "status": "failed"}]])
+
+    def test_retry_reports_rate_limited_and_writes_no_row(self):
+        """沒查過的那一筆不是「審過」，不該留下審核紀錄。"""
+        c = _FakeClient([])
+        gw.review_verdict(c, _dump(status="rate_limited", error=gw.ERR_NOSEARCH,
+                                   recommend="retry", extracted=None),
+                          "retry", "", self.csv)
+        self.assertEqual(c.reported, [[{"id": 1, "status": "rate_limited"}]])
+        self.assertFalse(os.path.exists(self.csv))
+
+    def test_row_fields_are_machine_filled_from_the_dump(self):
+        gw.review_verdict(_FakeClient([]), _dump(), "approve",
+                          "標題含金額且與 revenue 對得上", self.csv)
+        r = self._rows()[0]
+        self.assertEqual(r["stock_id"], "2330")
+        self.assertEqual(r["announce_date"], "2020-02-10")
+        self.assertEqual(r["source"], gw.SRC_TEXT)
+        self.assertEqual(r["chunks"], "moneydj.com;cnyes.com")
+        self.assertEqual(r["verdict"], "approve")
+        self.assertEqual(r["note"], "標題含金額且與 revenue 對得上")
+
+    def test_header_matches_the_schema_stamp_verified_validates(self):
+        gw.review_verdict(_FakeClient([]), _dump(), "approve", "理由甲", self.csv)
+        with io.open(self.csv, encoding="utf-8") as f:
+            self.assertEqual(tuple(csv.DictReader(f).fieldnames), gw.REVIEW_FIELDS)
+
+    def test_appends_without_rewriting_the_header(self):
+        gw.review_verdict(_FakeClient([]), _dump(), "approve", "理由甲", self.csv)
+        d2 = _dump()
+        d2["task"] = dict(TASK, id=2, roc_month=2)
+        gw.review_verdict(_FakeClient([]), d2, "reject", "理由乙", self.csv)
+        self.assertEqual([r["note"] for r in self._rows()], ["理由甲", "理由乙"])
+
+    def test_approve_refused_when_there_is_nothing_to_approve(self):
+        """⚠️ worker 判 failed 的那一筆沒有「可核准的內容」。允許核准就等於讓
+        審核者繞過 URL 幻覺那條規則，而且日期會變成 Claude 手打的——一律拒絕。"""
+        c = _FakeClient([])
+        with self.assertRaises(gw.ReviewError):
+            gw.review_verdict(c, _dump(status="failed"), "approve", "看起來對", self.csv)
+        self.assertEqual(c.reported, [])
+        self.assertFalse(os.path.exists(self.csv))
+
+    def test_note_is_required(self):
+        """判斷是主觀的，沒有理由的章沒有稽核價值（與 title_review.csv 同一條規則）。"""
+        for v in ("approve", "reject"):
+            with self.assertRaises(gw.ReviewError):
+                gw.review_verdict(_FakeClient([]), _dump(), v, "   ", self.csv)
+
+    def test_note_identical_to_the_previous_row_is_refused(self):
+        """⚠️ 擋套版：100 筆共用一句理由的 CSV 對稽核者毫無價值（2026-08-25 的
+        title 審核就是這樣失敗的）。逐筆讀過的人不會寫出跟上一筆一字不差的理由。"""
+        gw.review_verdict(_FakeClient([]), _dump(), "approve", "同一句話", self.csv)
+        d2 = _dump()
+        d2["task"] = dict(TASK, id=2, roc_month=2)
+        with self.assertRaises(gw.ReviewError):
+            gw.review_verdict(_FakeClient([]), d2, "approve", "同一句話", self.csv)
+
+    def test_unknown_verdict_is_refused(self):
+        with self.assertRaises(gw.ReviewError):
+            gw.review_verdict(_FakeClient([]), _dump(), "maybe", "理由", self.csv)
+
+    def test_csv_is_written_after_the_report_so_no_row_claims_an_unapplied_change(self):
+        """回報失敗時不留下「已核准」的紀錄：稽核檔寧可漏一列，也不可以宣稱一件
+        沒發生的事（漏的那列重跑就補回來，假的那列會一直說謊）。"""
+        class _Boom(_FakeClient):
+            def report(self, results):
+                raise urllib.error.URLError("down")
+        with self.assertRaises(urllib.error.URLError):
+            gw.review_verdict(_Boom([]), _dump(), "approve", "理由", self.csv)
+        self.assertFalse(os.path.exists(self.csv))
+
+
+if __name__ == "__main__":
+    unittest.main()

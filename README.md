@@ -49,6 +49,7 @@
 | `data/active_stocks.txt` | 1848 檔股票代號（一行一個）|
 | `data/name_overrides.csv` | 已下市/ISIN 查無者的人工補名（目前 3426 台興、6806 森崴能源）|
 | `data/date_overrides.csv` | 人工確認的**遲交**公布日（窗外個案，目前 1 筆；見下）|
+| `data/gemini_review.csv` | 逐筆審核 `gemini_worker` 證據的判斷（含**模型讀過的網域**，DB 沒地方存；見「gemini_worker → 審核模式」）|
 | `apply_date_overrides.py` | 把上面那份 CSV 套進 DB（冪等；DB 不進版控，重建後要重跑）|
 | `stocks.csv` | 產生的對照表（進版控）|
 | `init_tasks.py` | 展開 1848×73 成 tasks 寫入 SQLite（冪等）|
@@ -547,6 +548,54 @@ worker 結束時會印出兩者比例。實務上 Gemini API 的 `groundingChunk
 > 已經記過 `google` 批
 > 日期系統性偏早占 8% 且沒有外部基準可驗；grounding 這批只會更需要這道檢查。
 
+### 審核模式：一次一筆，先看證據再決定要不要進 DB
+
+上面那條「`m_txt` 併入主資料前要先對照」的提醒有個現實問題：**要對照的證據批次模式沒有留下來。**
+模型憑什麼這麼說——它實際讀了哪些網域（`groundingChunks`）、發了哪些搜尋——`tasks`
+一個欄位都裝不下，程序一結束就沒了。`raw_title` 只剩模型自己寫的那行標題。
+
+所以有第二種跑法，把順序倒過來：**先把整份證據交出來，等人看完才決定要不要落地。**
+
+```bash
+# ① 租 1 筆、打一次 API、把證據印成 JSON。⚠️ 刻意【不回報】——日期還沒進 DB
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --review-one
+
+# ② 看完再落地（不打 API、不需要 --project）
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
+    --review-verdict approve --note "這一筆為什麼撐得起這個日期"
+#   reject = 撐不起 → 回報 failed（gemini 是最後一棒，那就是終點）
+#   retry  = 模型根本沒去搜 → 放回佇列，不算審過、不寫稽核檔
+
+# ③ 蓋章（讀 data/gemini_review.csv，只送 approve 的列，可重跑）
+python3 -m mops.stamp_verified --from gemini-review --server http://127.0.0.1:8000
+```
+
+`--review-one` 的 exit code 就是行動指示：`0` 有東西可審／`3` gemini 佇列空的／
+`4` 設定層級錯誤（每一筆都會重演，該停下來修）。⚠️ 沒回報的租約會在 `LEASE_TTL`
+（600s）後被 server 惰性回收放回 `undone`——**中斷是安全的**，代價是這一筆下次要再付一次錢。
+
+配 `.claude/skills/gemini-review`（`/loop /gemini-review` 一輪一筆）就是「Claude 逐筆審」
+的跑法。判準與 `title-review` 同一套，多一條只有這個模式看得到的：
+
+> ⚠️ **`chunks` 全是 `goodinfo` / PTT / 不明網域、或空的，就算標題看起來漂亮也要打問號。**
+> 那代表這個日期是模型「講」的而不是「讀」的。`searches` 裡沒有一條真的搜到「這家公司
+> 這個月」卻給出肯定答案，是更強的幻覺訊號。
+
+**兩條界線是機制擋著的，不是靠自律：**
+
+1. **審核者只能否決，不能無中生有。** `approve` 送出去的是 `judge()` 算好的那一份
+   （逐字），審核者不經手 date/source/title/url——手打日期的路徑不存在。
+   `worker_verdict=failed` 的那一筆**不能 approve**（沒有可核准的內容），程式直接拒收：
+   要放行請去改判準，不要在單筆繞過。
+2. **審核模式與批次模式共用 `judge()`。** 不可以各寫一套判準，否則審核者看到的
+   `worker_verdict` 跟批次真的會回報的東西不一樣，等於在審另一套規則。
+
+`--note` 與稽核檔上一列**一字不差會被拒收**。這條看似瑣碎，但 2026-08-25 的 title 審核
+就是用共用 note 蓋了十萬筆章、後來全部撤銷——共用理由的稽核檔對稽核者毫無價值。
+
+⚠️ 蓋的章是 **`verified='claude'` 不是 `gemini`**：審核者讀的是模型自己回的那段文字，
+沒有引入第二個獨立來源，那是循環（見「出處與驗證 → `claude` 不是驗證」）。
+
 ### 怎麼走到 Vertex 這條路的（2026-08-24 實測）
 
 寫這節的理由跟上面「踩過的雷」一樣：下一個人看到「Gemini grounding」四個字，會很自然地
@@ -866,6 +915,18 @@ tbd     看過了，但不是高信心
 python3 -m mops.stamp_verified --from claude --server http://127.0.0.1:8000
 python3 -m mops.stamp_verified --from tbd    --server http://127.0.0.1:8000
 ```
+
+`claude` 這個章有兩條來源，判準相同（都是「這段佐證文字撐不撐得起這個日期」），
+差別只在讀的是什麼：
+
+| 來源 CSV | 讀的是 | 跑法 |
+|---|---|---|
+| `data/title_review.csv` | DB 裡已經落地的 `raw_title`（事後審）| `--from claude` |
+| `data/gemini_review.csv` | `gemini_worker --review-one` 交回的**完整證據**，含模型讀過的網域（**寫入前**審，見「gemini_worker → 審核模式」）| `--from gemini-review` |
+
+⚠️ `--from gemini-review` 蓋的是 `claude` **不是 `gemini`**——判斷者是讀 gemini 證據的人，
+不是第二個獨立來源。蓋成 `gemini` 會讓它在 `VERIFIER_RANK` 裡爬到 `claude` 之上、
+覆蓋掉不該覆蓋的章，而且對外宣稱了一個不存在的獨立確認。
 
 ### ⚠️ `verified='mops'` 不全是「兩個獨立來源同意」
 

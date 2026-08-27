@@ -10,6 +10,10 @@
 兩個來源，可信度不同：
   --from mops    MOPS 公開資訊觀測站的官方申報日（t05st01）。這是**官方原始文件**，
                  是這個 repo 裡最硬的基準；重疊區約 2,376 筆 / 49 檔。
+  --from gemini-review
+                 Claude 逐筆審 gemini_worker --review-one 交回的證據（data/gemini_review.csv）。
+                 ⚠️ 蓋的章是 **claude** 不是 gemini：判斷者讀的是模型自己回的那段文字，
+                 沒有引入新證據（循環，見 README「claude 不是驗證」）。
   --from gemini  gemini 對照實驗的結果（gemini_benchmark.csv）。⚠️ 弱一階：那是模型
                  grounding 查出來的，而且實測 m_src 為 0（全靠模型合成文字，見 README
                  「對照實驗」）。只有「gemini 與 MOPS 都同意 DB 的日期」才蓋。
@@ -41,10 +45,16 @@ import urllib.request
 
 import revlib
 from mops.mops_validate import load_baseline
+# ⚠️ 跨套件 import 是刻意的：gemini_review.csv 的表頭只有【一份】定義，由寫的人
+# （gemini_worker）宣告、讀的人驗。各抄一份遲早會漂，而漂掉的症狀是整批無聲跳過。
+from worker.gemini_worker import REVIEW_FIELDS as GEMINI_REVIEW_FIELDS
 
 DEFAULT_BASELINE = "mops_baseline.csv"
 DEFAULT_BENCH = "gemini_benchmark.csv"
 DEFAULT_REVIEW = "data/title_review.csv"
+DEFAULT_GEMINI_REVIEW = "data/gemini_review.csv"
+# --from 的名字通常就是 verified 要蓋的值；gemini-review 是唯一的例外（見下）。
+VERIFIER_FOR = {"gemini-review": "claude"}
 CHUNK = 500          # 一次送幾筆；分批只是別讓單一請求太肥，server 端本來就是一個交易
 
 
@@ -80,6 +90,67 @@ def items_from_gemini(path):
                         "roc_year": int(r["roc_year"]),
                         "roc_month": int(r["roc_month"]),
                         "date": g})
+    return out
+
+
+def verifier_for(src):
+    """--from 的來源名 → verified 要蓋的值。
+
+    ⚠️ gemini-review 蓋的是 `claude`，不是 `gemini`。那條路的判斷者是 Claude 讀
+    gemini 交回的證據（模型自己寫的那段文字＋它讀過的網域），沒有第二個獨立來源
+    出現過——蓋成 `gemini` 會讓它在 VERIFIER_RANK 裡爬到 claude 之上，覆蓋掉不該
+    覆蓋的章，而且對外宣稱了一個不存在的獨立確認。
+    """
+    return VERIFIER_FOR.get(src, src)
+
+
+GEMINI_REVIEW_VERDICTS = ("approve", "reject")
+
+
+def items_from_gemini_review(path):
+    """
+    Claude 逐筆審 gemini 證據的判斷 → 候選清單（只取 approve）。
+
+    ⚠️ reject 的列不送、但一定要留在 CSV 裡：那些筆在 DB 裡是 state='failed'、沒有
+    announce_date 可核對，可是「被否決的證據長什麼樣」只有這張表記得住（DB 不留、
+    模型回應也不留）。這是這張表相對 title_review.csv 多出來的價值，別為了送出方便
+    把它們刪掉。
+
+    ⚠️ approve 卻沒有日期 → 直接失敗，不靜默跳過：那是自相矛盾（核准了什麼？），
+    多半代表寫檔的那一步出了錯，而靜默跳過看起來跟「這批沒有 approve」一模一樣。
+    """
+    if not os.path.exists(path):
+        sys.exit(f"⚠️ 讀不到 {path}"
+                 f"（先跑 python3 -m worker.gemini_worker --review-one 並落地判斷）。")
+    with open(path, encoding="utf-8-sig") as f:
+        rd = csv.DictReader(f)
+        if tuple(rd.fieldnames or ()) != GEMINI_REVIEW_FIELDS:
+            sys.exit(f"⚠️ {path} 表頭應為 {','.join(GEMINI_REVIEW_FIELDS)}，"
+                     f"實得 {','.join(rd.fieldnames or ())}")
+        rows = list(rd)
+
+    out, seen = [], set()
+    for i, r in enumerate(rows, start=2):
+        v = (r.get("verdict") or "").strip()
+        if v not in GEMINI_REVIEW_VERDICTS:
+            sys.exit(f"⚠️ 第 {i} 行 verdict='{v}' 不合法；"
+                     f"可用：{list(GEMINI_REVIEW_VERDICTS)}")
+        if not (r.get("note") or "").strip():
+            sys.exit(f"⚠️ 第 {i} 行缺 note。判斷是主觀的，一定要寫下理由。")
+        try:
+            key = (r["stock_id"], int(r["roc_year"]), int(r["roc_month"]))
+        except (TypeError, ValueError, KeyError):
+            sys.exit(f"⚠️ 第 {i} 行的 stock_id/roc_year/roc_month 有問題。")
+        if key in seen:
+            sys.exit(f"⚠️ 第 {i} 行重複：{key} 已經出現過。")
+        seen.add(key)
+        if v != "approve":
+            continue
+        date = (r.get("announce_date") or "").strip()
+        if not date:
+            sys.exit(f"⚠️ 第 {i} 行 approve 但沒有 announce_date——核准了什麼？")
+        out.append({"stock_id": key[0], "roc_year": key[1],
+                    "roc_month": key[2], "date": date})
     return out
 
 
@@ -150,23 +221,30 @@ def main():
     revlib.load_env()
     ap = argparse.ArgumentParser(description="蓋 tasks.verified")
     ap.add_argument("--from", dest="src", required=True,
-                    choices=("mops", "gemini") + REVIEW_VERDICTS)
+                    choices=("mops", "gemini", "gemini-review") + REVIEW_VERDICTS)
     ap.add_argument("--server", required=True, help="server base URL")
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"))
     ap.add_argument("--baseline", default=DEFAULT_BASELINE)
     ap.add_argument("--bench", default=DEFAULT_BENCH)
     ap.add_argument("--review", default=DEFAULT_REVIEW,
                     help="人工讀 title 的判斷 CSV（--from claude/tbd 用）")
+    ap.add_argument("--gemini-review", default=DEFAULT_GEMINI_REVIEW,
+                    dest="gemini_review",
+                    help="Claude 審 gemini 證據的判斷 CSV（--from gemini-review 用）")
     ap.add_argument("--dry-run", action="store_true", help="只印候選數，不送出")
     args = ap.parse_args()
 
+    by = verifier_for(args.src)          # ⚠️ 來源名 ≠ 蓋的章（見 verifier_for）
     if args.src == "mops":
         items = items_from_mops(args.baseline)
     elif args.src == "gemini":
         items = items_from_gemini(args.bench)
+    elif args.src == "gemini-review":
+        items = items_from_gemini_review(args.gemini_review)
     else:
         items = items_from_review(args.review, args.src)
-    print(f"來源 {args.src}：候選 {len(items)} 筆")
+    print(f"來源 {args.src}：候選 {len(items)} 筆"
+          + (f"（蓋的章是 verified='{by}'）" if by != args.src else ""))
     if args.dry_run:
         for it in items[:5]:
             print(f"  {it['stock_id']} {it['roc_year']}/{it['roc_month']} {it['date']}")
@@ -177,7 +255,7 @@ def main():
              "not_success": 0, "unknown": 0}
     for i in range(0, len(items), CHUNK):
         try:
-            applied = post(args.server, args.token, args.src, items[i:i + CHUNK])
+            applied = post(args.server, args.token, by, items[i:i + CHUNK])
         except urllib.error.HTTPError as e:
             sys.exit(f"⚠️ HTTP {e.code}：{e.read()[:200]!r}")
         except (urllib.error.URLError, TimeoutError) as e:
@@ -186,7 +264,7 @@ def main():
             total[k] += applied.get(k, 0)
         print(f"  {i + len(items[i:i + CHUNK])}/{len(items)} …{total}")
 
-    print(f"\n蓋章 {total['verified']} 筆（verified='{args.src}'）")
+    print(f"\n蓋章 {total['verified']} 筆（verified='{by}'）")
     # ⚠️ mismatch 才是這支跑完最值得看的數字：那是兩個來源對同一個月份給出不同日期。
     # 蓋章數漂亮但 mismatch 一堆，代表資料有系統性問題，不是「大部分都驗過了」。
     print(f"日期不一致 {total['mismatch']} 筆 ← 兩個來源打架，值得逐筆看")

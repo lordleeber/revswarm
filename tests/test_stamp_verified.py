@@ -139,6 +139,83 @@ class TestItemsFromReview(unittest.TestCase):
             sv.items_from_review(os.path.join(self.dir, "nope.csv"), "claude")
 
 
+class TestItemsFromGeminiReview(unittest.TestCase):
+    """
+    Claude 逐筆審 gemini 交回的證據 → 候選清單（data/gemini_review.csv）。
+
+    ⚠️ 這條路蓋的章是 `claude` 不是 `gemini`：判斷者讀的是 gemini 自己回的那段文字，
+    沒有引入新證據——那是循環，不是第二個獨立來源（見 README「claude 不是驗證」）。
+    蓋成 `gemini` 會讓它在 VERIFIER_RANK 裡爬到 claude 之上、覆蓋不該覆蓋的章。
+
+    reject 的列**不送**：那些筆在 DB 裡是 state='failed'、沒有 announce_date 可核對。
+    但它們留在 CSV 裡才是這張表的重點——被否決的證據長什麼樣，只有這裡記得住。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "g.csv")
+
+    def tearDown(self):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        os.rmdir(self.dir)
+
+    def _write(self, body):
+        io.open(self.path, "w", encoding="utf-8").write(
+            ",".join(sv.GEMINI_REVIEW_FIELDS) + "\n" + body)
+
+    def test_takes_only_approved_rows(self):
+        self._write("1101,109,1,2020-02-10,m_txt,,moneydj.com,approve,標題含金額\n"
+                    "2330,109,1,,m_txt,,goodinfo.tw,reject,模型回 NONE\n")
+        self.assertEqual(sv.items_from_gemini_review(self.path),
+                         [{"stock_id": "1101", "roc_year": 109,
+                           "roc_month": 1, "date": "2020-02-10"}])
+
+    def test_stamps_as_claude_not_gemini(self):
+        self.assertEqual(sv.verifier_for("gemini-review"), "claude")
+        self.assertEqual(sv.verifier_for("mops"), "mops")
+
+    def test_unknown_verdict_is_rejected(self):
+        self._write("1101,109,1,2020-02-10,m_txt,,x.com,approv,打錯字\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_gemini_review(self.path)
+
+    def test_note_is_required(self):
+        self._write("1101,109,1,2020-02-10,m_txt,,x.com,approve,\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_gemini_review(self.path)
+
+    def test_approved_row_without_a_date_is_rejected(self):
+        """⚠️ 沒有日期的 approve 是自相矛盾（核准了什麼？），不可以靜默跳過。"""
+        self._write("1101,109,1,,m_txt,,x.com,approve,看起來對\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_gemini_review(self.path)
+
+    def test_duplicate_key_is_rejected(self):
+        self._write("1101,109,1,2020-02-10,m_txt,,x.com,approve,第一次\n"
+                    "1101,109,1,2020-02-10,m_txt,,x.com,reject,第二次\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_gemini_review(self.path)
+
+    def test_wrong_header_exits(self):
+        io.open(self.path, "w", encoding="utf-8").write(
+            "stock_id,roc_year,roc_month,announce_date,verdict,note\n")
+        with self.assertRaises(SystemExit):
+            sv.items_from_gemini_review(self.path)
+
+    def test_header_is_the_writers_schema_not_a_copy(self):
+        """⚠️ 表頭只有一份定義：寫的人（gemini_worker）宣告，讀的人驗。
+        各抄一份就會漂——而漂掉的症狀是「整批無聲跳過」或「硬錯」。"""
+        from worker.gemini_worker import REVIEW_FIELDS
+        self.assertIs(sv.GEMINI_REVIEW_FIELDS, REVIEW_FIELDS)
+
+    def test_missing_file_exits(self):
+        with self.assertRaises(SystemExit):
+            sv.items_from_gemini_review(os.path.join(self.dir, "nope.csv"))
+
+
 class TestPostPayload(unittest.TestCase):
     """送出去的形狀要跟 server 的 /verify 對得上（by + items）。"""
 
