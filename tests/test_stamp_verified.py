@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mops.stamp_verified 的候選挑選邏輯回歸測試。純標準庫 unittest，不連網、不碰真 DB。
+stamp_verified 的候選挑選邏輯回歸測試。純標準庫 unittest，不連網、不碰真 DB。
 
 守的是這支唯一容易寫錯、且錯了會靜默污染 verified 欄位的地方：
   ⚠️ gemini 那條路**必須**同時要求「status=ok」「gemini_date == mops_date」。
@@ -17,7 +17,7 @@ import os
 import tempfile
 import unittest
 
-from mops import stamp_verified as sv
+import stamp_verified as sv
 from mops.gemini_benchmark import FIELDS
 
 

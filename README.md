@@ -64,7 +64,7 @@
 | `goodinfo/goodinfo_worker.py` | 補 goodinfo 的四板日期（上市/上櫃/興櫃/公開發行），拿到**已畢業公司的早年日期**，官方現況快照沒有 |
 | `mark_prelisting.py` | 用首次公開日把「公司當時還沒公開發行」的任務標成 `prelisting`；`--demote-success` 連上市前的假 success 一起降級（見「資料品質」）|
 | `mops/mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
-| `mops/stamp_verified.py` | 把「兩個獨立來源同意」的列蓋上 `verified` 欄（見「出處與驗證」）|
+| `stamp_verified.py` | 把「兩個獨立來源同意」的列蓋上 `verified` 欄（見「出處與驗證」）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
 **核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。worker 機器 `git clone` 本 repo 就能跑，不必額外安裝任何東西。
@@ -567,7 +567,7 @@ python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
 #   retry  = 模型根本沒去搜 → 放回佇列，不算審過、不寫稽核檔
 
 # ③ 蓋章（讀 data/gemini_review.csv，只送 approve 的列，可重跑）
-python3 -m mops.stamp_verified --from gemini-review --server http://127.0.0.1:8000
+python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
 ```
 
 `--review-one` 的 exit code 就是行動指示：`0` 有東西可審／`3` gemini 佇列空的／
@@ -912,8 +912,8 @@ tbd     看過了，但不是高信心
 `mismatch` 不蓋章——判斷是對著舊日期做的，不該套到新日期上。
 
 ```bash
-python3 -m mops.stamp_verified --from claude --server http://127.0.0.1:8000
-python3 -m mops.stamp_verified --from tbd    --server http://127.0.0.1:8000
+python3 -m stamp_verified --from claude --server http://127.0.0.1:8000
+python3 -m stamp_verified --from tbd    --server http://127.0.0.1:8000
 ```
 
 `claude` 這個章有兩條來源，判準相同（都是「這段佐證文字撐不撐得起這個日期」），
@@ -955,11 +955,11 @@ SELECT COUNT(*) FROM tasks WHERE verified='mops' AND source != 'mops';
 
 ```bash
 # server 要跑著（蓋章走 /verify，server 是這個 DB 的唯一寫入者）
-python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000 --dry-run
-python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000
+python3 -m stamp_verified --from mops --server http://127.0.0.1:8000 --dry-run
+python3 -m stamp_verified --from mops --server http://127.0.0.1:8000
 
 # gemini 那條要先跑完對照實驗；只收「gemini 與 MOPS 都同意」的列
-python3 -m mops.stamp_verified --from gemini --server http://127.0.0.1:8000
+python3 -m stamp_verified --from gemini --server http://127.0.0.1:8000
 ```
 
 ⚠️ 一列只有一個 `verified` 欄，**裝不下「兩個來源都同意」**。所以 server 端有強弱排序

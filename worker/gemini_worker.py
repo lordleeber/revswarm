@@ -56,7 +56,7 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
      ✗ 審核模式與批次模式共用 judge()，不可以各寫一套判準——不然審核者看的
        worker_verdict 跟批次真的會回報的東西不一樣，等於在審另一套規則。
    逐筆判斷寫進版控的 data/gemini_review.csv（含 chunks），再由
-   mops.stamp_verified --from gemini-review 蓋 verified='claude'。
+   stamp_verified --from gemini-review 蓋 verified='claude'。
 
 三道防污染原封不動沿用（沒有任何一道因為換了資料源而放寬）：
    窗過濾 + 名稱錨點（revlib.parse）→ title_year_conflict 再擋一次錯年 → server 端再驗窗。
@@ -139,7 +139,7 @@ ERR_NOSEARCH = "nosearch"  # 模型沒發出任何搜尋 → 見模組開頭 1.�
 # 日期被寫進 DB」。gitignored（是執行期產物，且回報完就刪）。
 REVIEW_PENDING = ".gemini_review_pending.json"
 REVIEW_CSV = "data/gemini_review.csv"
-# ⚠️ 這份表頭 mops.stamp_verified 會逐字驗（它 import 這個常數，不自己抄一份）。
+# ⚠️ 這份表頭 stamp_verified 會逐字驗（它 import 這個常數，不自己抄一份）。
 # chunks 是這張表比 title_review.csv 多的那一欄：模型實際讀了哪些網域，DB 沒有
 # 地方存，不寫進來就沒了（見模組開頭 4.）。
 REVIEW_FIELDS = ("stock_id", "roc_year", "roc_month", "announce_date",
@@ -1004,7 +1004,7 @@ def main():
             print(f"  已記入 {args.review_csv}：{row['announce_date'] or '(無日期)'} "
                   f"{row['source']}  chunks={row['chunks'] or '(無)'}")
             print(f"  ⚠️ 還沒蓋章。要蓋 verified='claude' 請跑："
-                  f"python3 -m mops.stamp_verified --from gemini-review "
+                  f"python3 -m stamp_verified --from gemini-review "
                   f"--server {args.server}")
         return
 

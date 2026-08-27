@@ -113,7 +113,7 @@ PY
 `verdict=claude`，`note` 寫**這一筆**的理由。然後：
 
 ```bash
-python3 -m mops.stamp_verified --from claude --server http://127.0.0.1:8000
+python3 -m stamp_verified --from claude --server http://127.0.0.1:8000
 ```
 
 `announce_date` 要填你讀的當下看到的值——它在 `/verify` 當樂觀鎖，那列之後若被

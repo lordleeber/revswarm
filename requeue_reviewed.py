@@ -30,7 +30,7 @@ import urllib.error
 
 import revlib
 from audit_wrong_company import post_requeue
-from mops.stamp_verified import DEFAULT_REVIEW, REVIEW_VERDICTS, items_from_review
+from stamp_verified import DEFAULT_REVIEW, REVIEW_VERDICTS, items_from_review
 
 CHUNK = 500          # 分批只是別讓單一請求太肥；server 端每批本來就是一個交易
 

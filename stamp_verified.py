@@ -30,9 +30,9 @@
 多開一個寫入者就得自己處理鎖競爭，而且 mops/ 底下的工具一向是唯讀的，不該破例。
 
 跑法（repo 根目錄，server 要跑著）：
-  python3 -m mops.stamp_verified --from mops   --server http://127.0.0.1:8000 --dry-run
-  python3 -m mops.stamp_verified --from mops   --server http://127.0.0.1:8000
-  python3 -m mops.stamp_verified --from gemini --server http://127.0.0.1:8000
+  python3 -m stamp_verified --from mops   --server http://127.0.0.1:8000 --dry-run
+  python3 -m stamp_verified --from mops   --server http://127.0.0.1:8000
+  python3 -m stamp_verified --from gemini --server http://127.0.0.1:8000
 """
 
 import argparse

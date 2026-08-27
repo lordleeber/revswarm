@@ -159,7 +159,7 @@ python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --review-verdict 
 ## 5. 蓋章（只有 approve 需要）
 
 ```bash
-python3 -m mops.stamp_verified --from gemini-review --server http://127.0.0.1:8000
+python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
 ```
 
 蓋的是 `verified='claude'`（不是 `gemini`）：你讀的是模型自己回的那段文字，沒有引入
