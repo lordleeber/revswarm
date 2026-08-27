@@ -12,9 +12,11 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
   ✓ 零第三方依賴（純 urllib 打 REST），也不需要圖形環境／Chrome／人工解驗證碼
     ——這是它相對 google_worker 唯一明確的優勢，可以跑在無頭機器上、可以多開。
   ✗ 要錢，且回的是**模型合成的文字**，不是搜尋結果原文（見 3. 的信任分級）。
-    ⚠️ 按「模型實際發出的搜尋次數」計費，不是按 prompt。而【實測一個任務會發 4~11 次
-       搜尋、平均約 7 次】（2026-08-24 於 Vertex 量測 5 筆：4/4/8/8/11）——不是直覺的
-       1 次。所以成本上限用 webSearchQueries 的長度累加，不是用任務數（見 --max-searches）。
+    ⚠️ 按「模型實際發出的搜尋次數」計費，不是按 prompt。而【實測一個任務會發 4~37 次
+       搜尋、平均約 12 次】（2026-08-24 量測 5 筆：4/4/8/8/11；2026-08-27 又 3 筆：
+       6/10/37）——不是直覺的 1 次，而且**單筆上限不可控**：一次呼叫發幾次由模型決定，
+       那 37 次的是它抱著一個候選答案逐日／逐金額回頭驗證，驗不到才回 NONE，錢照算。
+       所以成本上限用 webSearchQueries 的長度累加，不是用任務數（見 --max-searches）。
 
 走 Vertex AI（Agent Platform API），Bearer OAuth，額度算在【正常的 Google Cloud 帳單】。
   ⚠️ 另一道門（AI Studio / Gemini Developer API，x-goog-api-key）已經【刻意移除】，
@@ -1078,8 +1080,8 @@ def main():
     # ⚠️ 預設值刻意保守：這支會花錢，寧可多跑幾次也不要一個迴圈燒穿額度。
     ap.add_argument("--max-searches", type=int, default=300,
                     help="本次最多發出幾次「搜尋」就停（0=不限）。⚠️ 不是任務數："
-                         "計費按搜尋次數，而【實測一個任務會發 4~11 次搜尋、平均約 7 次】"
-                         "（2026-08-24 於 Vertex 量測），所以 300 大約只夠 40 筆任務。"
+                         "計費按搜尋次數，而【實測一個任務會發 4~37 次搜尋、平均約 12 次】"
+                         "（2026-08-24 與 08-27 共量測 8 筆），所以 300 大約只夠 25 筆任務。"
                          "預設刻意設小；要跑整批請顯式加大")
     ap.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS,
                     help=f"最多呼叫 API 幾次就停（0=不限，預設 {DEFAULT_MAX_CALLS}）。"

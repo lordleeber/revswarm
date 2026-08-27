@@ -488,7 +488,7 @@ curl -s "https://aiplatform.googleapis.com/v1/projects/$PROJ/locations/global\
 curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
   "http://<SERVER>:8000/admin/requeue-failed?engine=gemini"
 
-# 先小額試跑（預設 --max-searches 300 ≈ 40 筆任務，就是為此）
+# 先小額試跑（預設 --max-searches 300 ≈ 25 筆任務，就是為此）
 python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
     --project <你的專案ID> --once
 
@@ -512,10 +512,12 @@ python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
 ```
 
 > ⚠️ **`--max-searches` 算的是搜尋次數，不是任務數**，而兩者差了一個數量級。
-> 計費按「模型實際發出的搜尋查詢」，**實測一個任務會發 4~11 次搜尋、平均約 7 次**
+> 計費按「模型實際發出的搜尋查詢」，**實測一個任務會發 4~37 次搜尋、平均約 12 次**
 > （2026-08-24 於 Vertex 量測 5 筆：4/4/8/8/11）——不是直覺的 1 次。
 > worker 累加回應裡 `groundingMetadata.webSearchQueries` 的長度，超過上限就把剩餘租約
-> 放回佇列並結束。預設 300 因此大約只夠 **40 筆任務**。
+> 放回佇列並結束。預設 300 因此大約只夠 **25 筆任務**。
+> ⚠️ 單筆上限不可控：一次呼叫發幾次搜尋由模型決定。2026-08-27 實測有一筆發了 **37 次**
+> （$0.52）——它抱著一個候選答案逐日／逐金額回頭驗證，驗不到才誠實回 NONE，錢照算。
 > 預設值刻意設得小：另外兩支跑錯只是浪費時間，這支跑錯是刷 Google Cloud 帳單。
 
 ### 三道防污染原封不動，外加一條新戒律
@@ -670,7 +672,7 @@ service account，selector 才會出現。
 
 有效 5/5，與 MOPS 一致 4/5。兩個發現：
 
-- ⚠️ **一個任務會發 4~11 次搜尋、平均約 7 次**，不是直覺的 1 次。計費按搜尋次數，
+- ⚠️ **一個任務會發 4~37 次搜尋、平均約 12 次**，不是直覺的 1 次。計費按搜尋次數，
   所以成本是原估的 7 倍 —— `--max-searches` 的預設值已照這個修正。
 - ⚠️ **命中全部是 `m_txt`，`m_src` = 0/4。** `groundingChunks` 只有 1~2 筆且是網域名
   → 日期是模型「講」出來的，不是從檢索原文抽出來的。樣本放大後要重看這個比例。
@@ -689,7 +691,7 @@ service account，selector 才會出現。
 間接證據去推論，無法直接算對錯。
 
 先打「已經知道答案」的那批 —— MOPS 有官方申報日、`yahoo` 也已經成功的重疊區
-（目前 **2,376 筆 / 49 檔**，`yahoo` 對 MOPS 的一致率是 **99.83%**，這就是要打敗的基準線；200 筆抽樣約發 800~2,200 次搜尋，實測每筆 4~11 次）：
+（目前 **2,376 筆 / 49 檔**，`yahoo` 對 MOPS 的一致率是 **99.83%**，這就是要打敗的基準線；200 筆抽樣約發 800~7,400 次搜尋，實測每筆 4~37 次）：
 
 ```bash
 python3 -m mops.gemini_benchmark --dry-run     # 不呼叫 API，看抽樣組成與預估花費
