@@ -49,6 +49,7 @@
 | `data/active_stocks.txt` | 1848 檔股票代號（一行一個）|
 | `data/name_overrides.csv` | 已下市/ISIN 查無者的人工補名（目前 3426 台興、6806 森崴能源）|
 | `data/date_overrides.csv` | 人工確認的**遲交**公布日（窗外個案，目前 1 筆；見下）|
+| `data/gemini_review.csv` | 逐筆審核 `gemini_worker` 證據的判斷（含**模型讀過的網域**，DB 沒地方存；見「gemini_worker → 審核模式」）|
 | `apply_date_overrides.py` | 把上面那份 CSV 套進 DB（冪等；DB 不進版控，重建後要重跑）|
 | `stocks.csv` | 產生的對照表（進版控）|
 | `init_tasks.py` | 展開 1848×73 成 tasks 寫入 SQLite（冪等）|
@@ -63,7 +64,7 @@
 | `goodinfo/goodinfo_worker.py` | 補 goodinfo 的四板日期（上市/上櫃/興櫃/公開發行），拿到**已畢業公司的早年日期**，官方現況快照沒有 |
 | `mark_prelisting.py` | 用首次公開日把「公司當時還沒公開發行」的任務標成 `prelisting`；`--demote-success` 連上市前的假 success 一起降級（見「資料品質」）|
 | `mops/mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
-| `mops/stamp_verified.py` | 把「兩個獨立來源同意」的列蓋上 `verified` 欄（見「出處與驗證」）|
+| `stamp_verified.py` | 把「兩個獨立來源同意」的列蓋上 `verified` 欄（見「出處與驗證」）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
 
 **核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。worker 機器 `git clone` 本 repo 就能跑，不必額外安裝任何東西。
@@ -487,7 +488,7 @@ curl -s "https://aiplatform.googleapis.com/v1/projects/$PROJ/locations/global\
 curl -X POST -H "Authorization: Bearer $REVSWARM_TOKEN" \
   "http://<SERVER>:8000/admin/requeue-failed?engine=gemini"
 
-# 先小額試跑（預設 --max-searches 300 ≈ 40 筆任務，就是為此）
+# 先小額試跑（預設 --max-searches 300 ≈ 25 筆任務，就是為此）
 python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
     --project <你的專案ID> --once
 
@@ -511,10 +512,12 @@ python3 -m worker.gemini_worker --server http://<SERVER>:8000 \
 ```
 
 > ⚠️ **`--max-searches` 算的是搜尋次數，不是任務數**，而兩者差了一個數量級。
-> 計費按「模型實際發出的搜尋查詢」，**實測一個任務會發 4~11 次搜尋、平均約 7 次**
+> 計費按「模型實際發出的搜尋查詢」，**實測一個任務會發 4~37 次搜尋、平均約 12 次**
 > （2026-08-24 於 Vertex 量測 5 筆：4/4/8/8/11）——不是直覺的 1 次。
 > worker 累加回應裡 `groundingMetadata.webSearchQueries` 的長度，超過上限就把剩餘租約
-> 放回佇列並結束。預設 300 因此大約只夠 **40 筆任務**。
+> 放回佇列並結束。預設 300 因此大約只夠 **25 筆任務**。
+> ⚠️ 單筆上限不可控：一次呼叫發幾次搜尋由模型決定。2026-08-27 實測有一筆發了 **37 次**
+> （$0.52）——它抱著一個候選答案逐日／逐金額回頭驗證，驗不到才誠實回 NONE，錢照算。
 > 預設值刻意設得小：另外兩支跑錯只是浪費時間，這支跑錯是刷 Google Cloud 帳單。
 
 ### 三道防污染原封不動，外加一條新戒律
@@ -546,6 +549,57 @@ worker 結束時會印出兩者比例。實務上 Gemini API 的 `groundingChunk
 > `google` 批做過的同一套檢查（週末率、偏早分布）。「資料品質 → 沒修掉、要知道的殘留風險」
 > 已經記過 `google` 批
 > 日期系統性偏早占 8% 且沒有外部基準可驗；grounding 這批只會更需要這道檢查。
+
+### 審核模式：一次一筆，先看證據再決定要不要進 DB
+
+上面那條「`m_txt` 併入主資料前要先對照」的提醒有個現實問題：**要對照的證據批次模式沒有留下來。**
+模型憑什麼這麼說——它實際讀了哪些網域（`groundingChunks`）、發了哪些搜尋——`tasks`
+一個欄位都裝不下，程序一結束就沒了。`raw_title` 只剩模型自己寫的那行標題。
+
+所以有第二種跑法，把順序倒過來：**先把整份證據交出來，等人看完才決定要不要落地。**
+
+```bash
+# ① 租 1 筆、打一次 API、把證據印成 JSON。⚠️ 刻意【不回報】——日期還沒進 DB
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --review-one
+
+# ② 看完再落地（不打 API、不需要 --project）
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
+    --review-verdict approve --note "這一筆為什麼撐得起這個日期"
+#   reject = 撐不起 → 回報 failed（gemini 是最後一棒，那就是終點）
+#   retry  = 模型根本沒去搜 → 放回佇列，不算審過、不寫稽核檔
+
+# ③ 蓋章（讀 data/gemini_review.csv，只送 approve 的列，可重跑）
+python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
+```
+
+`--review-one` 的 exit code 就是行動指示：`0` 有東西可審／`2` 上一筆的判斷還沒落地
+（交接檔還在，先把它審完；要丟掉那份已付費的證據得加 `--force`）／`3` gemini 佇列空的／
+`4` 設定層級錯誤（每一筆都會重演，該停下來修）。`--review-verdict` 另有 `2`（指令不合法，
+例如對「根本沒查過」的那一筆下 reject）與 `5`（判斷已回報 server、但稽核列沒寫進 CSV
+——它會把那一列印出來讓人手動補，⚠️ 不要重跑，會重複回報）。⚠️ 沒回報的租約會在 `LEASE_TTL`
+（600s）後被 server 惰性回收放回 `undone`——**中斷是安全的**，代價是這一筆下次要再付一次錢。
+
+配 `.claude/skills/gemini-review`（`/loop /gemini-review` 一輪一筆）就是「Claude 逐筆審」
+的跑法。判準與 `title-review` 同一套，多一條只有這個模式看得到的：
+
+> ⚠️ **`chunks` 全是 `goodinfo` / PTT / 不明網域、或空的，就算標題看起來漂亮也要打問號。**
+> 那代表這個日期是模型「講」的而不是「讀」的。`searches` 裡沒有一條真的搜到「這家公司
+> 這個月」卻給出肯定答案，是更強的幻覺訊號。
+
+**兩條界線是機制擋著的，不是靠自律：**
+
+1. **審核者只能否決，不能無中生有。** `approve` 送出去的是 `judge()` 算好的那一份
+   （逐字），審核者不經手 date/source/title/url——手打日期的路徑不存在。
+   `worker_verdict=failed` 的那一筆**不能 approve**（沒有可核准的內容），程式直接拒收：
+   要放行請去改判準，不要在單筆繞過。
+2. **審核模式與批次模式共用 `judge()`。** 不可以各寫一套判準，否則審核者看到的
+   `worker_verdict` 跟批次真的會回報的東西不一樣，等於在審另一套規則。
+
+`--note` 與稽核檔上一列**一字不差會被拒收**。這條看似瑣碎，但 2026-08-25 的 title 審核
+就是用共用 note 蓋了十萬筆章、後來全部撤銷——共用理由的稽核檔對稽核者毫無價值。
+
+⚠️ 蓋的章是 **`verified='claude'` 不是 `gemini`**：審核者讀的是模型自己回的那段文字，
+沒有引入第二個獨立來源，那是循環（見「出處與驗證 → `claude` 不是驗證」）。
 
 ### 怎麼走到 Vertex 這條路的（2026-08-24 實測）
 
@@ -618,7 +672,7 @@ service account，selector 才會出現。
 
 有效 5/5，與 MOPS 一致 4/5。兩個發現：
 
-- ⚠️ **一個任務會發 4~11 次搜尋、平均約 7 次**，不是直覺的 1 次。計費按搜尋次數，
+- ⚠️ **一個任務會發 4~37 次搜尋、平均約 12 次**，不是直覺的 1 次。計費按搜尋次數，
   所以成本是原估的 7 倍 —— `--max-searches` 的預設值已照這個修正。
 - ⚠️ **命中全部是 `m_txt`，`m_src` = 0/4。** `groundingChunks` 只有 1~2 筆且是網域名
   → 日期是模型「講」出來的，不是從檢索原文抽出來的。樣本放大後要重看這個比例。
@@ -637,7 +691,7 @@ service account，selector 才會出現。
 間接證據去推論，無法直接算對錯。
 
 先打「已經知道答案」的那批 —— MOPS 有官方申報日、`yahoo` 也已經成功的重疊區
-（目前 **2,376 筆 / 49 檔**，`yahoo` 對 MOPS 的一致率是 **99.83%**，這就是要打敗的基準線；200 筆抽樣約發 800~2,200 次搜尋，實測每筆 4~11 次）：
+（目前 **2,376 筆 / 49 檔**，`yahoo` 對 MOPS 的一致率是 **99.83%**，這就是要打敗的基準線；200 筆抽樣約發 800~7,400 次搜尋，實測每筆 4~37 次）：
 
 ```bash
 python3 -m mops.gemini_benchmark --dry-run     # 不呼叫 API，看抽樣組成與預估花費
@@ -863,9 +917,25 @@ tbd     看過了，但不是高信心
 `mismatch` 不蓋章——判斷是對著舊日期做的，不該套到新日期上。
 
 ```bash
-python3 -m mops.stamp_verified --from claude --server http://127.0.0.1:8000
-python3 -m mops.stamp_verified --from tbd    --server http://127.0.0.1:8000
+python3 -m stamp_verified --from claude --server http://127.0.0.1:8000
+python3 -m stamp_verified --from tbd    --server http://127.0.0.1:8000
 ```
+
+`claude` 這個章有兩條來源，判準相同（都是「這段佐證文字撐不撐得起這個日期」），
+差別只在讀的是什麼：
+
+| 來源 CSV | 讀的是 | 跑法 |
+|---|---|---|
+| `data/title_review.csv` | DB 裡已經落地的 `raw_title`（事後審）| `--from claude` |
+| `data/gemini_review.csv` | `gemini_worker --review-one` 交回的**完整證據**，含模型讀過的網域（**寫入前**審，見「gemini_worker → 審核模式」）| `--from gemini-review` |
+
+⚠️ 這兩張判斷 CSV 都是 append-only 的，同一個月份**可以**有第二列判斷（`tbd` 重讀後改判
+`claude`、reject 的那一筆被 `requeue-failed` 排回來重審…）。`stamp_verified` 一律**以最後
+一列為準**並把覆蓋情形印出來；先前已經蓋上的章不會因為後來改判 reject 就被撤掉。
+
+⚠️ `--from gemini-review` 蓋的是 `claude` **不是 `gemini`**——判斷者是讀 gemini 證據的人，
+不是第二個獨立來源。蓋成 `gemini` 會讓它在 `VERIFIER_RANK` 裡爬到 `claude` 之上、
+覆蓋掉不該覆蓋的章，而且對外宣稱了一個不存在的獨立確認。
 
 ### ⚠️ `verified='mops'` 不全是「兩個獨立來源同意」
 
@@ -894,11 +964,11 @@ SELECT COUNT(*) FROM tasks WHERE verified='mops' AND source != 'mops';
 
 ```bash
 # server 要跑著（蓋章走 /verify，server 是這個 DB 的唯一寫入者）
-python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000 --dry-run
-python3 -m mops.stamp_verified --from mops --server http://127.0.0.1:8000
+python3 -m stamp_verified --from mops --server http://127.0.0.1:8000 --dry-run
+python3 -m stamp_verified --from mops --server http://127.0.0.1:8000
 
 # gemini 那條要先跑完對照實驗；只收「gemini 與 MOPS 都同意」的列
-python3 -m mops.stamp_verified --from gemini --server http://127.0.0.1:8000
+python3 -m stamp_verified --from gemini --server http://127.0.0.1:8000
 ```
 
 ⚠️ 一列只有一個 `verified` 欄，**裝不下「兩個來源都同意」**。所以 server 端有強弱排序

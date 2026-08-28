@@ -12,9 +12,11 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
   ✓ 零第三方依賴（純 urllib 打 REST），也不需要圖形環境／Chrome／人工解驗證碼
     ——這是它相對 google_worker 唯一明確的優勢，可以跑在無頭機器上、可以多開。
   ✗ 要錢，且回的是**模型合成的文字**，不是搜尋結果原文（見 3. 的信任分級）。
-    ⚠️ 按「模型實際發出的搜尋次數」計費，不是按 prompt。而【實測一個任務會發 4~11 次
-       搜尋、平均約 7 次】（2026-08-24 於 Vertex 量測 5 筆：4/4/8/8/11）——不是直覺的
-       1 次。所以成本上限用 webSearchQueries 的長度累加，不是用任務數（見 --max-searches）。
+    ⚠️ 按「模型實際發出的搜尋次數」計費，不是按 prompt。而【實測一個任務會發 4~37 次
+       搜尋、平均約 12 次】（2026-08-24 量測 5 筆：4/4/8/8/11；2026-08-27 又 3 筆：
+       6/10/37）——不是直覺的 1 次，而且**單筆上限不可控**：一次呼叫發幾次由模型決定，
+       那 37 次的是它抱著一個候選答案逐日／逐金額回頭驗證，驗不到才回 NONE，錢照算。
+       所以成本上限用 webSearchQueries 的長度累加，不是用任務數（見 --max-searches）。
 
 走 Vertex AI（Agent Platform API），Bearer OAuth，額度算在【正常的 Google Cloud 帳單】。
   ⚠️ 另一道門（AI Studio / Gemini Developer API，x-goog-api-key）已經【刻意移除】，
@@ -46,6 +48,18 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
    實務上 Gemini API 的 groundingChunks.title 常常只給網域名（moneydj.com）而不是文章
    標題，所以 m_src 命中率可能很低——那本身就是一個結論，不是 bug。
 
+4. 審核模式（--review-one / --review-verdict）：把「要不要讓這個日期進 DB」交給人/Claude。
+   ⚠️ 動機直接來自 3.：m_txt 是三支 worker 裡信任度最低的一層，而它的佐證（模型讀了
+   哪些網域＝groundingChunks、發了哪些搜尋）**DB 一個欄位都裝不下**，批次模式跑完就
+   隨程序結束消失。審核模式把整份證據倒成 JSON、且【刻意不回報】，等審核者看完才落地。
+   兩個不可以放寬的界線：
+     ✗ 審核者不能自己送日期進來。approve 送出去的是 judge() 算好的那一份（逐字），
+       所以審核只能【否決】一個 success，不能無中生有一個 success（見 review_verdict）。
+     ✗ 審核模式與批次模式共用 judge()，不可以各寫一套判準——不然審核者看的
+       worker_verdict 跟批次真的會回報的東西不一樣，等於在審另一套規則。
+   逐筆判斷寫進版控的 data/gemini_review.csv（含 chunks），再由
+   stamp_verified --from gemini-review 蓋 verified='claude'。
+
 三道防污染原封不動沿用（沒有任何一道因為換了資料源而放寬）：
    窗過濾 + 名稱錨點（revlib.parse）→ title_year_conflict 再擋一次錯年 → server 端再驗窗。
    模型回什麼日期都沒有特權，一律要通過 revlib.parse 才算數。
@@ -61,9 +75,17 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
 跑法（repo 根目錄）：
   python3 -m worker.gemini_worker --server http://SERVER:8000 \
       --project YOUR_GCP_PROJECT --max-searches 300
+
+審核模式（一次一筆，給 .claude/skills/gemini-review 用）：
+  python3 -m worker.gemini_worker --server http://SERVER:8000 \
+      --project YOUR_GCP_PROJECT --review-one          # 倒證據，不回報
+  python3 -m worker.gemini_worker --server http://SERVER:8000 \
+      --review-verdict approve --note "這一筆為什麼撐得起這個日期"
 """
 
 import argparse
+import csv
+import io
 import json
 import os
 import random
@@ -107,10 +129,78 @@ TOKEN_TTL = 3000
 SRC_CHUNK = "m_src"        # 日期在 groundingChunks 的來源標題裡 → 真實檢索文字
 SRC_TEXT = "m_txt"         # 日期只在模型自己寫的回答裡 → 合成文字，存疑
 
+# check_url() 的三態（見該函式與 judge()）。⚠️ DEAD 與 UNKNOWN 絕對不可以合成一個
+# 布林：judge() 只對 DEAD 把 m_txt 整筆判 failed，而 gemini 是升級鏈最後一棒、failed
+# 就是終點。把「對方今天擋我們的 UA」跟「這篇文章不存在」混在一起，等於拿一次連線
+# 抖動去永久丟掉一個可能正確的日期。
+URL_OK = "ok"            # 2xx/3xx（有給 name 就還確認過頁面上有這家公司）
+URL_DEAD = "dead"        # 對方明確說沒有這份文件，或那個網址本身不可能是出處
+URL_UNKNOWN = "unknown"  # 確認不了：403/429/5xx/逾時/連不上/頁面裡找不到公司名
+# ⚠️ 只有這兩個狀態碼算「明確說沒有這份文件」。403 不算：實測 chinatimes 對非瀏覽器
+# UA 就回 403（見 URL_CHECK_UA），而 401 是付費牆、429/5xx 是對方的狀況，都不是答案。
+_DEAD_STATUS = (404, 410)
+
 # fetch() 的失敗原因。全部一律 rate_limited（放回佇列），差別只在要不要立刻停整個 worker。
 ERR_RETRY = "retry"        # 429/5xx/連線問題 → 退避重試
 ERR_FATAL = "fatal"        # 金鑰/權限/配額/請求格式 → 設定錯了，停掉讓人去修
 ERR_NOSEARCH = "nosearch"  # 模型沒發出任何搜尋 → 見模組開頭 1.，絕不可當 failed
+
+# --- 審核模式（見模組開頭 4.）------------------------------------------------
+# 兩個模式之間的交接檔。⚠️ 走檔案而不是叫審核者把 JSON 貼回來：approve 要送出去的
+# date/source/title/url 一律由程式從這裡讀，審核者只交出 verdict 與一段理由，
+# 不經手任何資料欄位——手打就有打錯的可能，而打錯的方向剛好是「一個沒人查過的
+# 日期被寫進 DB」。gitignored（是執行期產物，且回報完就刪）。
+REVIEW_PENDING = ".gemini_review_pending.json"
+REVIEW_CSV = "data/gemini_review.csv"
+# ⚠️ 這份表頭 stamp_verified 會逐字驗（它 import 這個常數，不自己抄一份）。
+# chunks 是這張表比 title_review.csv 多的那一欄：模型實際讀了哪些網域，DB 沒有
+# 地方存，不寫進來就沒了（見模組開頭 4.）。
+# ⚠️ chunks 那格存的是 JSON 陣列，不是 ";" 串接：grounding 的來源標題是自由文字、
+# 真的會出現分號（新聞標題、站名），串接後就切不回原本的清單——一個進版控的稽核
+# 欄位「大部分時候切得回來」等於不能用。
+REVIEW_FIELDS = ("stock_id", "roc_year", "roc_month", "announce_date",
+                 "source", "url", "chunks", "verdict", "note")
+# approve = 這個日期撐得起，讓它進 DB；reject = 撐不起，回報 failed（gemini 是升級鏈
+# 最後一棒，failed 就是終點，語意與 worker 自己判 failed 一致）；
+# retry = 這一筆根本沒查過（模型沒搜／連線失敗），沒有東西可審，放回佇列。
+REVIEW_VERDICTS = ("approve", "reject", "retry")
+EXIT_REVIEW = 0            # 證據已倒出，等審核
+EXIT_REFUSED = 2           # 審核者的指令本身不合法（見 ReviewError）
+EXIT_EMPTY = 3             # gemini 佇列空的，這一輪沒事可做
+EXIT_ABORT = 4             # 設定錯誤，每一筆都會重演 → loop 該停
+EXIT_ROWLOST = 5           # 判斷已經回報給 server，但稽核列沒寫進 CSV（見 ReviewRowLost）
+
+
+class ReviewError(Exception):
+    """審核指令不合法（沒有可核准的內容、缺理由、理由與上一列一字不差…）。
+
+    刻意用例外而不是印個警告繼續：這條路徑的每一次執行都會改到 DB，
+    「指令有問題但我猜你的意思」在這裡等於靜默污染。
+    """
+
+class ReviewRowLost(Exception):
+    """判斷【已經】回報給 server 了，但稽核列沒能寫進 CSV。
+
+    ⚠️ 為什麼要專門一種例外：review_verdict 刻意先回報、後寫檔（回報失敗時不留下
+    「已核准」的假紀錄）。但寫檔失敗的時候狀態是不對稱的——server 那邊已經生效，
+    呼叫端若把這個例外當成「整件事沒發生」就會重跑同一道指令，於是重複回報，
+    而那個 approve 對 stamp_verified 永遠隱形（CSV 沒有那一列＝沒人會去蓋章）。
+    所以把「已經落地了什麼」和「那一列長什麼樣」一起帶出來，讓人補得回來。
+    """
+
+    def __init__(self, applied, row, csv_path, err):
+        self.applied, self.row, self.csv_path, self.err = applied, row, csv_path, err
+        super().__init__(f"判斷已回報 server（applied={applied}），"
+                         f"但稽核列寫不進 {csv_path}：{err}")
+
+    def csv_line(self):
+        """那一列的 CSV 原文（含表頭），可以直接貼回稽核檔。"""
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=REVIEW_FIELDS, lineterminator="\n")
+        w.writeheader()
+        w.writerow(self.row)
+        return buf.getvalue()
+
 
 # 400 的兩種意義完全不同：金鑰無效是 fatal，其餘（例如偶發的內容過濾參數問題）當可重試。
 _FATAL_400 = re.compile(r"API key not valid|API_KEY_INVALID|not supported|PERMISSION_DENIED", re.I)
@@ -233,6 +323,11 @@ def build_prompt(sid, name, roc_year, roc_month):
     grounding 由模型自己決定發幾次搜尋、自己會做同義擴展，分兩次打只是把成本乘二。
     也沿用另外兩支的禁忌：不在查詢裡塞「營收」以外的引導詞去限定來源（例如 moneydj），
     實測那會把其他來源的命中排擠掉。
+
+    ⚠️ 2026-08-27 加了 URL 的代價提醒：judge() 現在把「m_txt 命中但 URL 確認為
+    不存在」整筆判 failed，不再是「日期照留、只清 url」。之前的寬容縱容模型
+    隨手編一個看起來合理的網址反正頂多被清掉；代價提高後，把它寫進 prompt 讓模型
+    自己知道不確定就該回 NONE，別賭。
     """
     ad_year = roc_year + 1911
     return (
@@ -241,8 +336,9 @@ def build_prompt(sid, name, roc_year, roc_month):
         f"只回覆下面三行，不要有其他文字、不要解釋：\n"
         f"DATE: YYYY-MM-DD\n"
         f"TITLE: <你引用的那篇新聞或公告的原始標題，逐字複製，不要改寫或翻譯>\n"
-        f"URL: <該篇的網址>\n"
+        f"URL: <該篇報導的網址；不確定是否真實存在就回 NONE，不要編造>\n"
         f"公布日必須是新聞／公告裡實際寫出來的日期，不可以推測、估算或用慣例推算。\n"
+        f"URL 若打不開或是編造的，這筆會被整個判定失敗、連日期也不會保留。\n"
         f"查不到就只回 DATE: NONE。"
     )
 
@@ -399,9 +495,9 @@ def extract(payload, name, roc_year, roc_month):
 
 
 # --- 模型自報 URL 的驗證 ----------------------------------------------------
-def verify_url(url, name=None, timeout=URL_CHECK_TIMEOUT):
+def check_url(url, name=None, timeout=URL_CHECK_TIMEOUT):
     """
-    確認模型回的 URL 真的打得開、而且真的是**這一檔**的報導。打不開或確認不了一律 False。
+    確認模型回的 URL 真的打得開、而且真的是**這一檔**的報導。回傳三態（見常數）。
 
     ⚠️ 為什麼非驗不可：實測 1216 統一 109/2 那筆，模型回的
     chinatimes.com/newspapers/20200311000404-260204 格式完全正確（日期碼、版面碼
@@ -409,9 +505,13 @@ def verify_url(url, name=None, timeout=URL_CHECK_TIMEOUT):
     旁證是對的，但出處是編的——一個 404 的網址看起來像有憑有據，比沒有出處更危險，
     而 revlib.clean_url 只擋格式、擋不了幻覺。
 
-    取捨刻意不對稱：**確認不了就丟掉**。存到假網址的代價高（正是要防的失效模式），
-    漏掉真網址的代價低（就是 NULL，跟沒有這欄之前一樣）。所以只有 2xx/3xx 才留，
-    403（擋機器人）、429、5xx、逾時、連不上全部當作沒有。
+    ⚠️ 為什麼要分三態、不是回真假：**url 欄位**的取捨可以不對稱（只有 URL_OK 才存，
+    存到假網址的代價高、漏掉真網址的代價低，就是 NULL），但 judge() 現在拿這個結果
+    決定**整筆任務**的生死——m_txt 命中若 URL 是 DEAD 就整筆判 failed，而 gemini 是
+    升級鏈最後一棒，failed 沒有下一個引擎會再試。所以「確認不了」必須跟「確認不存在」
+    分開：403（擋機器人，正是 URL_CHECK_UA 那條註解記的 chinatimes 案例）、429、5xx、
+    逾時、連不上、頁面裡找不到公司名，全部是 URL_UNKNOWN，只會讓 url 存 NULL，
+    不會把日期一起帶走。只有 404/410 與「根本是首頁」才是 URL_DEAD。
 
     用 GET 不用 HEAD：實測不少新聞站對 HEAD 直接回 403。只讀狀態碼、不讀 body。
 
@@ -426,33 +526,97 @@ def verify_url(url, name=None, timeout=URL_CHECK_TIMEOUT):
     <a href> 讀出來的那種。
     """
     if not url:
-        return False
+        return URL_UNKNOWN
     # ⚠️ 光禿禿的首頁不可能是「某公司某月的公告」，當出處毫無用處，先擋掉再說。
     # 實測 2906 高林 111/9 那筆模型給的是 https://www.masterlink.com.tw/（元富證券
     # 首頁）——它當然打得開，於是通過了「網址活著」這道檢查，卻證明不了任何事。
     # 擋在發請求之前：省一次 HTTP，也省得被自己的檢查騙過。
+    # 算 DEAD 不算 UNKNOWN：這裡沒有任何「對方站台今天如何」的成分，純粹從網址本身
+    # 就斷定「這不是一篇報導」——跟 404 一樣是確定的事實。
     if urllib.parse.urlparse(url).path.strip("/") == "":
-        return False
+        return URL_DEAD
     try:
         req = urllib.request.Request(
             url, method="GET",
             headers={"User-Agent": URL_CHECK_UA,
                      "Accept": "text/html", "Accept-Language": "zh-TW,zh;q=0.9"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if not 200 <= getattr(resp, "status", 0) < 400:
-                return False
+            status = getattr(resp, "status", 0)
+            if not 200 <= status < 400:
+                # 有些路徑不丟 HTTPError、直接把非 2xx 回進來；分級要與下面一致。
+                return URL_DEAD if status in _DEAD_STATUS else URL_UNKNOWN
             if not name:
-                return True
+                return URL_OK
             try:
                 body = resp.read(URL_CHECK_BYTES).decode("utf-8", "replace")
             except Exception:
                 # body 讀不到是「確認不了名字」，不是「這頁不存在」——狀態碼那關已經
                 # 過了，不該因此把一個好網址判死。
-                return True
-            return name in body
+                return URL_OK
+            # ⚠️ 找不到公司名是 UNKNOWN 不是 DEAD：那篇可能真的是別家公司的報導
+            # （4113 聯上那個案例），但也可能只是 DB 存的簡稱與內文全稱不同
+            # （「台積電」vs「台灣積體電路」）、或整頁是 JS 算出來的。不足以把整筆判死。
+            return URL_OK if name in body else URL_UNKNOWN
+    except urllib.error.HTTPError as e:
+        return URL_DEAD if e.code in _DEAD_STATUS else URL_UNKNOWN
     except Exception:
         # ⚠️ 一律吞掉。驗證是附屬動作，絕不可以讓一筆好好的任務因為它炸掉。
-        return False
+        return URL_UNKNOWN
+
+
+# --- 判準（批次與審核模式共用）----------------------------------------------
+def judge(task, payload):
+    """
+    把一份**已經拿到的**回應判成回報用的 result。不打 API、不碰佇列。
+
+    ⚠️ 為什麼要獨立成一個函式：批次模式（crawl_task）與審核模式（review_one）必須用
+    同一份判準。審核模式印給人看的 worker_verdict 若跟批次真的會回報的東西不一樣，
+    審核者就是在對著另一套規則做判斷——那比沒有審核更糟（看起來把過關了）。
+    所以 crawl_task 不再自己寫一遍判斷，只呼叫這裡。
+
+    回傳 (result, evidence)：
+      result   = {id, status, date?, source?, title?, url?}，status ∈ success|failed
+      evidence = {extracted, url_check}，只給審核模式用（批次模式丟掉）
+        extracted = extract() 原本抽到的東西，⚠️ **即使 result 判 failed 也照樣帶著**：
+                    「模型講了哪個日期、給了哪個假網址」正是審核者要看的，result 依規則
+                    不能帶（見下面 URL 那段），只能走這條路出去。
+        url_check = check_url() 的三態，沒有 url 可驗時是 None。
+                    ⚠️ 這四個值稽核時都是不同的事，不可以混：None 是模型誠實回
+                    NONE，URL_DEAD 是它編了一個死網址，URL_UNKNOWN 是我們自己
+                    確認不了（對方擋／逾時／頁面沒寫公司名），URL_OK 是驗過了。
+    """
+    name = task["name"]
+    ry, rm = task["roc_year"], task["roc_month"]
+    hit = extract(payload, name, ry, rm)
+    if not hit:
+        # 模型確實搜了、正常回話了、仍無窗內日期 → 這才是真的 failed。
+        return ({"id": task["id"], "status": "failed"},
+                {"extracted": None, "url_check": None})
+    date, src, title, url = hit
+    ev = {"extracted": {"date": date, "source": src, "title": title, "url": url},
+          "url_check": None}
+    if url:
+        ev["url_check"] = check_url(url, name=name)
+        if ev["url_check"] != URL_OK:
+            why = ("打不開（對方明確說沒這頁／根本是首頁）"
+                   if ev["url_check"] == URL_DEAD else "確認不了（擋機器人／逾時／頁面沒寫公司名）")
+            print(f"  ⚠️ 模型給的 URL {why}，不存：{url}", file=sys.stderr)
+            # ⚠️ 2026-08-27 收緊：m_txt（模型合成文字）這層本來就是三支 worker 裡
+            # 信任度最低的一層，URL 是它唯一自己交出來、還算能查證的佐證——那個
+            # 佐證也是假的，代表這篇引用整個站不住腳，不能再像以前那樣「只清
+            # url、日期照留」。整筆當 failed，跟其他來源判 failed 一致看待。
+            # ⚠️ 但**只有 URL_DEAD 才算「佐證是假的」**。URL_UNKNOWN 是我們沒能
+            # 確認（403 擋機器人、429、5xx、逾時、body 裡找不到公司名），那不是
+            # 模型的錯；判 failed 就是拿一次連線抖動永久丟掉一個可能正確的日期
+            # ——gemini 是升級鏈最後一棒，failed 之後沒有引擎會再試。這一態維持
+            # 收緊之前的行為：清掉 url、日期照留。
+            # m_src 不受影響：那條路的 url 依 extract() 的規則恆為 None，不會
+            # 走到這裡；這裡仍判斷 src 是為了不讓這條規則意外波及 m_src。
+            if ev["url_check"] == URL_DEAD and src == SRC_TEXT:
+                return {"id": task["id"], "status": "failed"}, ev
+            url = None
+    return ({"id": task["id"], "status": "success",
+             "date": date, "source": src, "title": title, "url": url}, ev)
 
 
 # --- 單筆任務 ---------------------------------------------------------------
@@ -465,13 +629,10 @@ def crawl_task(task, backend, model, budget):
     budget 是 Budget 實例；呼叫前先問它還能不能花，回來後把實際發出的搜尋次數記進去
     （⚠️ Gemini 3 按 search 計費，一個 prompt 可能發多次，見模組開頭）。
     """
-    name = task["name"]
-    sid = task["stock_id"]
-    ry, rm = task["roc_year"], task["roc_month"]
-
     budget.attempt()          # ⚠️ 呼叫前就記，成功與否都算（見 Budget.attempt）
     payload, err = call_gemini(
-        build_prompt(sid, name, ry, rm), backend, model=model)
+        build_prompt(task["stock_id"], task["name"],
+                     task["roc_year"], task["roc_month"]), backend, model=model)
     if err == ERR_FATAL:
         return {"id": task["id"], "status": "rate_limited"}, True
     if err is not None:
@@ -479,19 +640,8 @@ def crawl_task(task, backend, model, budget):
         return {"id": task["id"], "status": "rate_limited"}, False
 
     budget.spend(len(payload["searches"]))
-
-    hit = extract(payload, name, ry, rm)
-    if hit:
-        date, src, title, url = hit
-        if url and not verify_url(url, name=name):
-            # 模型編出來的網址：丟掉，但日期照算——日期是 revlib.parse 通過窗過濾
-            # 與名稱錨點抽出來的，跟這個網址真不真沒有關係。
-            print(f"  ⚠️ 模型給的 URL 打不開，不存：{url}", file=sys.stderr)
-            url = None
-        return {"id": task["id"], "status": "success",
-                "date": date, "source": src, "title": title, "url": url}, False
-    # 模型確實搜了、正常回話了、仍無窗內日期 → 這才是真的 failed。
-    return {"id": task["id"], "status": "failed"}, False
+    result, _ = judge(task, payload)
+    return result, False
 
 
 # --- 花費上限 ---------------------------------------------------------------
@@ -570,6 +720,245 @@ class Client:
     def report(self, results):
         return self._req("POST", "/result",
                          {"worker": self.worker_id, "results": results})
+
+
+# --- 審核模式：一次一筆，把證據交出來（見模組開頭 4.）----------------------
+def review_one(client, backend, model, budget):
+    """
+    租一筆 gemini 任務、打一次 API、把整份證據組成 dump，⚠️ **絕不回報**。
+
+    回傳 (dump, exit_code)。「不回報」是這個模式唯一不可以寫錯的地方：一旦它自己
+    回報了，審核就退化成事後補章（日期已經在 DB 裡了），整個模式的意義歸零。
+    沒回報的租約會在 server 的 LEASE_TTL（600s）後被惰性回收放回 undone——所以
+    審核中斷、當掉、關掉終端機都是安全的，最壞的結果是這一筆下次重跑（要再付一次錢）。
+
+    dump 的 recommend 是給呼叫端（skill）看的行動建議，不是判斷：
+      review = 有東西可審（worker_verdict 告訴你批次模式會怎麼判）
+      retry  = 這一筆根本沒查過（模型沒搜／連線失敗），沒有東西可審，該放回
+      abort  = 設定層級的錯誤，每一筆都會重演，loop 要停下來讓人去修
+      empty  = gemini 佇列空的（記得先 requeue-failed?engine=gemini）
+    """
+    resp = client.lease(1)
+    dump = {"mode": "review-one", "worker": getattr(client, "worker_id", None),
+            "lease_ttl": resp.get("lease_ttl"), "task": None, "error": None,
+            "recommend": "empty", "searches": [], "chunks": [], "text": "",
+            "extracted": None, "url_check": None, "worker_verdict": None,
+            "report_if_approved": None, "searches_used": 0,
+            "cost_note": budget.note()}
+    tasks = resp.get("tasks") or []
+    if not tasks:
+        # ⚠️ 佇列空的時候不可以打 API：這支是按搜尋次數計費的，空轉一次就是白花錢。
+        return dump, EXIT_EMPTY
+
+    task = tasks[0]
+    dump["task"] = task
+    budget.attempt()          # ⚠️ 呼叫前就記，成功與否都算（見 Budget.attempt）
+    payload, err = call_gemini(
+        build_prompt(task["stock_id"], task["name"],
+                     task["roc_year"], task["roc_month"]), backend, model=model)
+    if err is not None:
+        dump["error"] = err
+        dump["worker_verdict"] = "rate_limited"
+        dump["cost_note"] = budget.note()
+        # ⚠️ ERR_NOSEARCH 走的是 retry 不是 reject：沒查過不可以記成「查過但沒有」
+        # （見模組開頭 1.）。這條在審核模式更容易寫錯——證據看起來「空的」很像
+        # 一筆該否決的結果，但它其實是一筆還沒發生的查詢。
+        dump["recommend"] = "abort" if err == ERR_FATAL else "retry"
+        return dump, EXIT_ABORT if err == ERR_FATAL else EXIT_REVIEW
+
+    budget.spend(len(payload["searches"]))
+    result, ev = judge(task, payload)
+    dump.update({
+        "recommend": "review",
+        "searches": payload["searches"],
+        "chunks": payload["chunks"],
+        "text": payload["text"],
+        "extracted": ev["extracted"],
+        "url_check": ev["url_check"],
+        "worker_verdict": result["status"],
+        # ⚠️ 核准時要送出去的那一份，逐字就是 judge() 算出來的 result。審核者不重打
+        # 任何欄位（見模組開頭 4. 的第一條界線）。worker 判 failed 時這裡是 None
+        # ——那代表「沒有可核准的內容」，不是「還沒填」。
+        "report_if_approved": result if result["status"] == "success" else None,
+        "searches_used": len(payload["searches"]),
+        "cost_note": budget.note(),
+    })
+    return dump, EXIT_REVIEW
+
+
+def check_no_pending(path, force=False):
+    """--review-one 之前的守門：交接檔還在就不要再租新的一筆。
+
+    ⚠️ 交接檔還在＝上一筆的判斷還沒落地（多半是 server 掉線、client.report 丟了
+    例外）。再跑一次 --review-one 會覆蓋掉那份證據——而那份證據是付過錢的（實測
+    一筆發 4~11 次搜尋），覆蓋掉就只能再付一次；那筆租約也會被丟在那裡等 600s TTL。
+    原本這條只寫在 SKILL.md 第 0 步的文字裡，靠自律擋不住一次手滑或一個 loop。
+    """
+    if force or not os.path.exists(path):
+        return
+    raise ReviewError(
+        f"{path} 還在：上一筆的判斷還沒落地。先把它審完（--review-verdict），"
+        f"不要再租新的一筆——再跑 --review-one 會覆蓋掉那份已經付過錢的證據。"
+        f"真的要丟掉請加 --force。")
+
+
+def should_save_pending(dump):
+    """這份 dump 值不值得存成交接檔。
+
+    ⚠️ abort（ERR_FATAL）不存：那份 dump 裡沒有任何證據（extracted=None、chunks 空），
+    存下來只會讓 SKILL 第 0 步把下一輪導去「有未完成的：先審它」，而它唯一合法的
+    判斷是 retry——白跑一趟，還誘人在沒有證據的情況下 reject。
+    retry（ERR_NOSEARCH／ERR_RETRY）要存：--review-verdict retry 得靠交接檔才知道
+    是哪一筆任務。
+    """
+    return dump.get("task") is not None and dump.get("recommend") != "abort"
+
+
+def save_pending(path, dump):
+    with io.open(path, "w", encoding="utf-8") as f:
+        json.dump(dump, f, ensure_ascii=False, indent=2)
+
+
+def load_pending(path):
+    if not os.path.exists(path):
+        sys.exit(f"⚠️ 找不到 {path}：--review-verdict 只能接在 --review-one 之後。"
+                 f"（回報完會刪掉，避免同一筆被回報兩次）")
+    with io.open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _last_note(csv_path):
+    """CSV 最後一列的 note，沒有檔／沒有列就 None。給套版偵測用（見 review_verdict）。
+
+    ⚠️ 讀不到（權限、路徑是目錄…）不可以當成 None：那會靜默關掉「擋套版」那道檢查，
+    而那道檢查的存在理由是 2026-08-25 用共用 note 蓋掉十萬筆章。一律拒收，讓人去修
+    ——這時還沒回報，什麼都還沒發生。
+    """
+    if not os.path.exists(csv_path):
+        return None
+    try:
+        with io.open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except OSError as e:
+        raise ReviewError(f"讀不到稽核檔 {csv_path}：{e}。"
+                          f"沒讀到就無法確認 --note 有沒有跟上一列一字不差"
+                          f"（擋套版那道檢查），先把檔案修好再落地。")
+    return (rows[-1].get("note") if rows else None)
+
+
+def _review_row(dump, verdict, note):
+    """把這一筆的判斷組成稽核列。資料欄位一律從 dump 填，不從審核者手上拿。
+
+    ⚠️ 組列與寫檔刻意分開：寫檔失敗時呼叫端還拿得到這一列的內容，才有得補
+    （見 ReviewRowLost）。
+    """
+    task = dump["task"]
+    ex = dump.get("extracted") or {}
+    return {"stock_id": task["stock_id"], "roc_year": task["roc_year"],
+            "roc_month": task["roc_month"],
+            "announce_date": ex.get("date") or "",
+            "source": ex.get("source") or "",
+            "url": ex.get("url") or "",
+            # 模型實際讀了哪些網域。DB 沒有欄位裝它，這是唯一的留存處。
+            # ⚠️ 存 JSON 不是 ";" 串接：來源標題裡真的會有分號（見 REVIEW_FIELDS）。
+            "chunks": json.dumps(dump.get("chunks") or [], ensure_ascii=False),
+            "verdict": verdict, "note": note}
+
+
+def _append_review_row(csv_path, row):
+    """把稽核列追加進版控的檔案。
+
+    ⚠️ 自己把目錄建起來：全新 clone 沒有 data/、--review-csv 也可能指到別的子目錄，
+    而這一步噴例外的時候 server 已經套用了判斷（見 ReviewRowLost），能少一個失敗
+    原因就少一個。
+    """
+    parent = os.path.dirname(csv_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    with io.open(csv_path, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=REVIEW_FIELDS)
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+    return row
+
+
+def review_verdict(client, dump, verdict, note, csv_path=REVIEW_CSV):
+    """
+    把審核者的判斷落地：回報給 server，並把理由追加進 data/gemini_review.csv。
+
+    ⚠️ 審核者只交出 verdict 與 note，**所有資料欄位都由程式從 dump 填**。approve 送出去
+    的是 review_one 存下來的 report_if_approved（judge 算的那一份），所以審核只能
+    【否決】一個 success，不能無中生有一個 success——手打日期的路徑根本不存在。
+
+    三道拒絕（都用 ReviewError，不猜意思）：
+      1. worker 判 failed 的那一筆沒有可核准的內容。允許核准等於讓審核者繞過 URL
+         幻覺那條規則，而且日期會變成人打的。要放行就去改規則，不要在單筆繞過。
+      2. 缺 note。判斷是主觀的，沒有理由的章沒有稽核價值（與 title_review.csv 同一條）。
+      3. note 與上一列一字不差。⚠️ 這是擋套版：2026-08-25 的 title 審核就是用共用
+         note 蓋了十萬筆章、後來全部撤銷。逐筆讀過的人不會寫出跟上一筆一樣的理由。
+      4. 這一筆根本沒查過（dump 帶 error：ERR_NOSEARCH／ERR_RETRY／ERR_FATAL）時只能
+         retry。⚠️ 這是模組開頭 1. 那條戒律的機制保障，不能只靠 SKILL.md 的文字：
+         沒查過的 dump 裡 extracted/chunks/text 全是空的，而「空證據」看起來非常像
+         一筆該否決的結果（「沒有任何證據支持這個日期」）。放它過去就是把一筆從未
+         被查詢過的任務寫成終點 failed（gemini 是最後一棒）——正是那種靜默污染。
+
+    ⚠️ 先回報、後寫 CSV：回報失敗（server 沒跑／掉線）時不留下「已核准」的紀錄。
+    稽核檔寧可漏一列（重跑就補回來），也不可以宣稱一件沒發生的事（那列會一直說謊）。
+    反過來那一半（回報成功、寫檔失敗）狀態是不對稱的，所以走 ReviewRowLost，
+    不讓 OSError 裸奔出去被當成「整件事沒發生」。
+
+    回傳 (applied, row)：applied 是 server /result 回的計數，row 是寫進 CSV 的那一列
+    （retry 沒有列，是 None）。
+    """
+    if verdict not in REVIEW_VERDICTS:
+        raise ReviewError(f"verdict='{verdict}' 不合法；可用：{list(REVIEW_VERDICTS)}")
+    task = dump.get("task")
+    if not task:
+        raise ReviewError("這份 dump 沒有任務（上一次 --review-one 租不到任務）。")
+
+    if verdict == "retry":
+        # 沒查過的那一筆不算「審過」，不留稽核紀錄——留了就是把一次沒發生的判斷
+        # 記成判斷過。放回佇列，下次重打。
+        return client.report([{"id": task["id"], "status": "rate_limited"}]), None
+
+    # ⚠️ 見 docstring 第 4 條。放在 note 檢查之前：理由寫得多好都不改變「這一筆
+    # 沒有被查詢過」這件事。
+    if dump.get("error"):
+        raise ReviewError(
+            f"這份 dump 的查詢沒有成功（error={dump['error']}），"
+            f"裡面沒有任何證據可審——空證據不等於「查過但沒有」。"
+            f"唯一合法的判斷是 retry（放回佇列，下次重打）。")
+
+    note = (note or "").strip()
+    if not note:
+        raise ReviewError("缺 --note。判斷是主觀的，一定要寫下【這一筆】的理由。")
+    if note == _last_note(csv_path):
+        raise ReviewError("--note 與上一列一字不差。逐筆讀過的理由不會長一樣；"
+                          "共用理由的稽核檔沒有價值（見本函式 docstring 第 3 條）。")
+
+    if verdict == "approve":
+        body = dump.get("report_if_approved")
+        if not body:
+            raise ReviewError(
+                f"這一筆 worker 判 {dump.get('worker_verdict')}，沒有可核准的內容"
+                f"（URL 驗證沒過／根本沒抽到窗內日期）。只能 reject 或 retry；"
+                f"要放行請去改判準，不要在單筆繞過。")
+        results = [body]
+    else:
+        # gemini 是升級鏈最後一棒 → server 會落 state='failed' 當終點。
+        results = [{"id": task["id"], "status": "failed"}]
+
+    # server 的 /result 回的是 {"applied": {...}}，這裡只留裡面那份計數。
+    applied = client.report(results).get("applied")
+    row = _review_row(dump, verdict, note)
+    try:
+        _append_review_row(csv_path, row)
+    except OSError as e:
+        # ⚠️ 不可以就這樣讓例外穿出去：server 已經套用了（見 ReviewRowLost）。
+        raise ReviewRowLost(applied, row, csv_path, e)
+    return applied, row
 
 
 # --- 主迴圈 -----------------------------------------------------------------
@@ -691,8 +1080,8 @@ def main():
     # ⚠️ 預設值刻意保守：這支會花錢，寧可多跑幾次也不要一個迴圈燒穿額度。
     ap.add_argument("--max-searches", type=int, default=300,
                     help="本次最多發出幾次「搜尋」就停（0=不限）。⚠️ 不是任務數："
-                         "計費按搜尋次數，而【實測一個任務會發 4~11 次搜尋、平均約 7 次】"
-                         "（2026-08-24 於 Vertex 量測），所以 300 大約只夠 40 筆任務。"
+                         "計費按搜尋次數，而【實測一個任務會發 4~37 次搜尋、平均約 12 次】"
+                         "（2026-08-24 與 08-27 共量測 8 筆），所以 300 大約只夠 25 筆任務。"
                          "預設刻意設小；要跑整批請顯式加大")
     ap.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS,
                     help=f"最多呼叫 API 幾次就停（0=不限，預設 {DEFAULT_MAX_CALLS}）。"
@@ -715,14 +1104,88 @@ def main():
     ap.add_argument("--idle-sleep", type=float, default=30.0, help="佇列空時的等待秒數")
     ap.add_argument("--once", action="store_true", help="只跑一批就結束（試跑用）")
     ap.add_argument("--max-batches", type=int, default=0, help="跑幾批後結束(0=不限)")
+    # --- 審核模式（見模組開頭 4.）---
+    ap.add_argument("--review-one", action="store_true",
+                    help="審核模式：租 1 筆、打一次 API、把整份證據印成 JSON，"
+                         "⚠️ 不回報。exit 0=有東西可審／2=上一筆還沒落地（先審它）／"
+                         "3=佇列空／4=設定錯該停")
+    ap.add_argument("--review-verdict", choices=REVIEW_VERDICTS, default=None,
+                    help="把 --review-one 那一筆的判斷落地："
+                         "approve=讓日期進 DB／reject=回報 failed／"
+                         "retry=沒查過，放回佇列。不打 API、不用 --project")
+    ap.add_argument("--note", default="",
+                    help="這一筆的判斷理由（approve/reject 必填，會進版控的稽核檔）")
+    ap.add_argument("--review-csv", default=REVIEW_CSV,
+                    help=f"逐筆判斷的稽核檔（預設 {REVIEW_CSV}）")
+    ap.add_argument("--pending", default=REVIEW_PENDING,
+                    help=f"兩個審核模式之間的交接檔（預設 {REVIEW_PENDING}）")
+    ap.add_argument("--force", action="store_true",
+                    help="⚠️ 允許 --review-one 覆蓋還沒落地的交接檔"
+                         "（＝丟掉那筆已經付過錢的證據，見 check_no_pending）")
     args = ap.parse_args()
 
-    args.backend = make_backend(args)
-
-    worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}-m"
+    # 審核模式共用一個固定的 worker_id：它會被寫進 tasks.worker_id，看板上該看得出
+    # 「這一筆是審過才進來的」，而不是一個隨機 pid。
+    review = args.review_one or args.review_verdict
+    worker_id = args.worker_id or (
+        "claude-review" if review else f"{socket.gethostname()}-{os.getpid()}-m")
     client = Client(args.server, args.token, worker_id)
+
+    if args.review_verdict:
+        # ⚠️ 這條路不打 API，所以【不建 backend】：落地一個判斷不該因為這台機器
+        # 沒設 --project / 沒裝 gcloud 而失敗。
+        dump = load_pending(args.pending)
+        try:
+            applied, row = review_verdict(client, dump, args.review_verdict,
+                                          args.note, args.review_csv)
+        except ReviewError as e:
+            # ⚠️ 用 EXIT_REFUSED 而不是 sys.exit(str) 的 1：「指令不合法」與「程式掛了」
+            # 對 loop 是兩件事（前者改一下指令重下，後者該停）。
+            print(f"⚠️ {e}", file=sys.stderr)
+            sys.exit(EXIT_REFUSED)
+        except ReviewRowLost as e:
+            # server 已經套用了，所以【不要】重跑這道指令（會重複回報）。把那一列
+            # 印出來讓人手動補進稽核檔——沒有那一列，這個 approve 對 stamp_verified
+            # 永遠隱形。
+            print(f"⚠️ {e}", file=sys.stderr)
+            print(f"⚠️ 請手動把下面這一列補進 {args.review_csv}（表頭只有第一次要）：",
+                  file=sys.stderr)
+            print(e.csv_line(), file=sys.stderr)
+            print(f"⚠️ 補完後刪掉 {args.pending}；不要重跑同一道 --review-verdict，"
+                  f"那會對 server 重複回報。", file=sys.stderr)
+            sys.exit(EXIT_ROWLOST)
+        # 回報成功才刪交接檔：失敗時留著，修好 server 再跑一次同一道指令即可。
+        os.remove(args.pending)
+        t = dump["task"]
+        print(f"{t['stock_id']} {t['name']} {t['roc_year']}/{t['roc_month']} "
+              f"→ {args.review_verdict}   server: {applied}")
+        if row:
+            print(f"  已記入 {args.review_csv}：{row['announce_date'] or '(無日期)'} "
+                  f"{row['source']}  chunks={row['chunks']}")
+            print(f"  ⚠️ 還沒蓋章。要蓋 verified='claude' 請跑："
+                  f"python3 -m stamp_verified --from gemini-review "
+                  f"--server {args.server}")
+        return
+
+    if args.review_one:
+        # ⚠️ 擋在建 backend 與打 API 之前：晚一步錢就已經花掉了。
+        try:
+            check_no_pending(args.pending, args.force)
+        except ReviewError as e:
+            print(f"⚠️ {e}", file=sys.stderr)
+            sys.exit(EXIT_REFUSED)
+
+    args.backend = make_backend(args)
     budget = Budget(args.max_searches, args.free_quota, args.unit_price,
                     args.max_calls)
+
+    if args.review_one:
+        dump, code = review_one(client, args.backend, args.model, budget)
+        if should_save_pending(dump):
+            save_pending(args.pending, dump)
+        print(json.dumps(dump, ensure_ascii=False, indent=2))
+        sys.exit(code)
+
     print(f"gemini_worker {worker_id} → {args.server}  {args.backend.describe()}  "
           f"model={args.model} batch={args.batch} "
           f"max_searches={args.max_searches or '∞'}")
