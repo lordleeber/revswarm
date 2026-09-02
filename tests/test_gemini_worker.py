@@ -22,6 +22,7 @@ import csv
 import io
 import json
 import os
+import sys
 import tempfile
 import types
 import unittest
@@ -1335,6 +1336,81 @@ class TestReviewerMustBeExplicit(unittest.TestCase):
         for name in gw.REVIEWERS:
             s = self._settings(review_one=True, reviewer=name)
             self.assertIn(name, s.worker_id)
+
+
+class TestBatchModeStillStarts(unittest.TestCase):
+    """⚠️ main() 的批次分支沒有任何測試蓋到，而它是這支 worker 的**主要用途**。
+
+    2026-09-02 的教訓：把審核模式的 worker_id 收進 review_settings 時，批次那條
+    路上還留著一個對舊區域變數的參照——整個批次 worker 每次啟動就 NameError，
+    149 個測試照樣全綠，因為沒有一個走過 main()。這裡只驗最低限度的那件事：
+    批次模式走得到 run()，而且帶著自己算出來的 worker_id。
+    """
+
+    def setUp(self):
+        self.argv = sys.argv
+        self.seen = {}
+
+        def fake_run(args, client, budget):
+            self.seen["worker"] = client.worker_id
+            return {}
+
+        self.run_orig, gw.run = gw.run, fake_run
+        self.backend_orig, gw.make_backend = gw.make_backend, lambda a: _FakeVertex("p")
+
+    def tearDown(self):
+        sys.argv = self.argv
+        gw.run = self.run_orig
+        gw.make_backend = self.backend_orig
+
+    def _main(self, *extra):
+        sys.argv = ["gemini_worker", "--server", "http://x", "--once"] + list(extra)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gw.main()
+
+    def test_batch_mode_reaches_the_loop(self):
+        self._main()
+        self.assertIn("worker", self.seen)
+
+    def test_batch_worker_id_is_host_and_pid_not_a_reviewer(self):
+        self._main()
+        self.assertTrue(self.seen["worker"].endswith("-m"), self.seen["worker"])
+        for r in gw.REVIEWERS.values():
+            self.assertNotEqual(self.seen["worker"], r.worker_id)
+
+    def test_an_explicit_worker_id_still_wins(self):
+        self._main("--worker-id", "box-7")
+        self.assertEqual(self.seen["worker"], "box-7")
+
+
+class TestEverySkillHandoffFileIsIgnored(unittest.TestCase):
+    """所有 skill 的交接檔都必須被 .gitignore 蓋到，不只 gemini-review 那兩支。
+
+    ⚠️ 交接檔存的是【已經付過錢】的證據，是執行期產物。中斷的那一輪會把它留在
+    工作區，下一次 git add -A 就順手提交上去。TestReviewerRegistry 已經守住
+    REVIEWERS 那兩個檔，但那只涵蓋這支 worker 自己；別的 skill 各自發明的交接檔
+    （.codex_search_pending.json…）一樣會漏。這裡直接掃 skill 文件裡出現的檔名，
+    新增 skill 時不必記得回來補測試。
+    """
+
+    def test_no_handoff_file_escapes_gitignore(self):
+        import fnmatch
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__)))
+        with io.open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            pats = [ln.strip() for ln in f
+                    if ln.strip() and not ln.startswith("#")]
+        names = set()
+        for d in (".claude", ".agents"):
+            for doc in glob.glob(os.path.join(root, d, "skills", "*", "SKILL.md")):
+                with io.open(doc, encoding="utf-8") as f:
+                    names |= set(re.findall(r"\.[a-z0-9_]+_pending[a-z0-9_.]*\.json",
+                                            f.read()))
+        self.assertTrue(names, "掃不到任何交接檔名，這個測試就沒在守東西了")
+        for n in sorted(names):
+            self.assertTrue(any(fnmatch.fnmatch(n, p) for p in pats),
+                            f"{n} 沒有被 .gitignore 蓋到")
 
 
 if __name__ == "__main__":

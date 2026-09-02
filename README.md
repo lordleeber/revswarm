@@ -622,7 +622,8 @@ python3 -m stamp_verified --from gemini-review --reviewer claude \
 | skill | `.claude/skills/gemini-review` | `.agents/skills/gemini-review` |
 
 ⚠️ **沒有預設審核者，缺 `--reviewer` 一律拒收**（worker exit 2、`stamp_verified` exit 1）。
-四樣東西是一組、一起從 `gemini_worker.REVIEWERS` 取，`stamp_verified` 也 import 同一份
+這些東西是一組、一起從 `gemini_worker.REVIEWERS` 取（連 title-review 那條路的稽核檔
+也在裡面），`stamp_verified` 也 import 同一份
 而不是自己抄——2026-09-02 出過的事就是它們能各自漂掉：稽核檔換成了另一條線的、蓋章值
 留在原地，程式照跑不報錯，兩條線混在一起才被發現。兩條線**同階**（見 `VERIFIER_RANK`），
 所以蓋錯不會被排名擋下來，只會靜默覆蓋掉另一個人的章——這是它必填的原因。

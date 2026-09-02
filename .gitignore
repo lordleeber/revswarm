@@ -48,6 +48,9 @@ goodinfo/basicInfo/
 # 見 gemini_worker 的 REVIEWERS），釘死單一檔名會漏掉新的線。
 .gemini_review_pending.json
 .gemini_review_pending.*.json
+# 其他 skill 的交接檔同理（codex-search…）。⚠️ 交接檔存的是已經付過錢的證據，
+# 中斷那一輪會把它留在工作區，下一次 git add -A 就順手提交上去。
+.codex_search_pending.json
 
 # Codex CLI 的本機設定（含 approval_policy/sandbox_mode，屬個人環境選擇，勿進版控）
 .codex/

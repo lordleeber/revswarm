@@ -58,7 +58,6 @@ from worker.gemini_worker import REVIEWERS
 
 DEFAULT_BASELINE = "mops_baseline.csv"
 DEFAULT_BENCH = "gemini_benchmark.csv"
-DEFAULT_REVIEW = "data/title_review.csv"
 CHUNK = 500          # 一次送幾筆；分批只是別讓單一請求太肥，server 端本來就是一個交易
 
 
@@ -121,6 +120,25 @@ def gemini_review_csv_for(reviewer):
     if reviewer not in REVIEWERS:
         sys.exit(f"⚠️ --reviewer 要是 {'|'.join(sorted(REVIEWERS))} 其中之一。")
     return REVIEWERS[reviewer].csv
+
+
+def title_review_csv_for(verdict):
+    """--from claude|codex|tbd → 那條線的 title 稽核檔。
+
+    ⚠️ 這是 gemini-review 那個 bug 的雙胞胎，而且更難看見：兩條線的 title 判斷
+    分別寫在自己的檔（claude → data/title_review.csv，codex →
+    data/title-review-codex.csv）。若 --from codex 沿用 claude 那一份，篩出來
+    必然是 0 筆、exit 0——與「真的沒東西可蓋」一模一樣，不會有人發現整批沒蓋到。
+    所以這裡跟 gemini_review_csv_for 一樣，只從 REVIEWERS 取。
+
+    tbd 不是一條審核線而是一種 verdict（看過了但沒把握），歷史上寫在 claude
+    那一份裡，沿用之。
+    """
+    if verdict == "tbd":
+        return REVIEWERS["claude"].title_csv
+    if verdict not in REVIEWERS:
+        sys.exit(f"⚠️ --from {verdict} 沒有對應的 title 稽核檔。")
+    return REVIEWERS[verdict].title_csv
 
 
 GEMINI_REVIEW_VERDICTS = ("approve", "reject")
@@ -282,8 +300,9 @@ def main():
     ap.add_argument("--token", default=os.environ.get("REVSWARM_TOKEN"))
     ap.add_argument("--baseline", default=DEFAULT_BASELINE)
     ap.add_argument("--bench", default=DEFAULT_BENCH)
-    ap.add_argument("--review", default=DEFAULT_REVIEW,
-                    help="人工讀 title 的判斷 CSV（--from codex/claude/tbd 用）")
+    ap.add_argument("--review", default=None,
+                    help="人工讀 title 的判斷 CSV"
+                         "（--from claude/codex/tbd 用；預設跟著那條線走）")
     ap.add_argument("--reviewer", choices=sorted(REVIEWERS), default=None,
                     help="⚠️ --from gemini-review 必填：哪一條審核線。"
                          "讀哪份稽核檔與蓋哪個章都由它決定（見 verifier_for）")
@@ -303,7 +322,8 @@ def main():
         items = items_from_gemini_review(
             args.gemini_review or gemini_review_csv_for(args.reviewer))
     else:
-        items = items_from_review(args.review, args.src)
+        items = items_from_review(
+            args.review or title_review_csv_for(args.src), args.src)
     print(f"來源 {args.src}：候選 {len(items)} 筆"
           + (f"（蓋的章是 verified='{by}'）" if by != args.src else ""))
     if args.dry_run:

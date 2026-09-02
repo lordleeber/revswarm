@@ -58,7 +58,8 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
      ✗ 審核模式與批次模式共用 judge()，不可以各寫一套判準——不然審核者看的
        worker_verdict 跟批次真的會回報的東西不一樣，等於在審另一套規則。
    審核線有兩條（claude／codex），由 --reviewer 指名——稽核檔、交接檔、worker_id
-   與蓋章值四樣一起換，見 Reviewer／REVIEWERS。逐筆判斷寫進該條線版控的稽核檔
+   與蓋章值一起換（還有 title-review 那條路的稽核檔），見 Reviewer／REVIEWERS。
+   逐筆判斷寫進該條線版控的稽核檔
    （含 chunks），再由 stamp_verified --from gemini-review --reviewer <同一條線>
    蓋上該審核者的章。
 
@@ -156,20 +157,25 @@ ERR_NOSEARCH = "nosearch"  # 模型沒發出任何搜尋 → 見模組開頭 1.�
 # 日期被寫進 DB」。gitignored（是執行期產物，且回報完就刪）。
 
 
-class Reviewer(collections.namedtuple("Reviewer",
-                                      "name csv pending worker_id stamp")):
+class Reviewer(collections.namedtuple(
+        "Reviewer", "name csv pending worker_id stamp title_csv")):
     """一條審核線的完整身分。
 
-    ⚠️ 這四樣東西**必須一起換**，所以綁成一個值而不是四個常數：
-      csv        這條線的稽核檔（進版控，事後要分得出哪一筆是誰審的）
+    ⚠️ 這幾樣東西**必須一起換**，所以綁成一個值而不是幾個各自獨立的常數：
+      csv        這條線審 gemini 證據的稽核檔（進版控，事後要分得出哪一筆是誰審的）
       pending    這條線的交接檔（兩條線同時跑時不可以互相覆蓋——那會丟掉
                  對方【已經付過錢】的證據，見 check_no_pending）
       worker_id  寫進 tasks.worker_id，看板上看得出這一筆是誰審過的
       stamp      stamp_verified 蓋進 tasks.verified 的值
+      title_csv  這條線審 raw_title 的稽核檔（title-review 那條路，見
+                 stamp_verified.title_review_csv_for）
 
     2026-09-02 的教訓：當時只有一組全域常數，把 csv 改成另一條線的檔案時，
     蓋章值留在原地，兩者指向不同的人——程式照跑、不報錯，直到有人去比對才發現。
-    現在四樣一起從這裡拿，拿錯只可能整組錯（會被 --reviewer 擋下），不會半組錯。
+    現在一起從這裡拿，拿錯只可能整組錯（會被 --reviewer 擋下），不會半組錯。
+    ⚠️ title_csv 是同一天 code review 抓出來的雙胞胎：--from codex 若沿用
+    claude 那份 title 稽核檔，篩出來必然是 0 筆、exit 0，與「真的沒東西可蓋」
+    完全無法區分——更難發現，所以一併收進這個值裡。
     """
     __slots__ = ()
 
@@ -179,10 +185,10 @@ class Reviewer(collections.namedtuple("Reviewer",
 REVIEWERS = {
     "claude": Reviewer("claude", "data/gemini_review.csv",
                        ".gemini_review_pending.claude.json",
-                       "claude-review", "claude"),
+                       "claude-review", "claude", "data/title_review.csv"),
     "codex": Reviewer("codex", "data/gemini-review-codex.csv",
                       ".gemini_review_pending.codex.json",
-                      "codex-review", "codex"),
+                      "codex-review", "codex", "data/title-review-codex.csv"),
 }
 # ⚠️ 這份表頭 stamp_verified 會逐字驗（它 import 這個常數，不自己抄一份）。
 # chunks 是這張表比 title_review.csv 多的那一欄：模型實際讀了哪些網域，DB 沒有
@@ -265,7 +271,7 @@ ReviewSettings = collections.namedtuple("ReviewSettings",
 
 
 def review_settings(args):
-    """把命令列收斂成這一輪要用的四樣東西（批次模式回傳 reviewer=None）。
+    """把命令列收斂成這一輪要用的路徑與身分（批次模式回傳 reviewer=None）。
 
     ⚠️ 審核模式沒有預設審核者，缺 --reviewer 一律拒收（ReviewError → EXIT_REFUSED）。
     「猜一條線」的代價是靜默的：判斷寫進另一條線的稽核檔、蓋上另一個人的章，
@@ -1178,7 +1184,7 @@ def main():
                     help="這一筆的判斷理由（approve/reject 必填，會進版控的稽核檔）")
     ap.add_argument("--reviewer", choices=sorted(REVIEWERS), default=None,
                     help="⚠️ 審核模式必填：這一輪是哪一條審核線。稽核檔、交接檔、"
-                         "worker_id 與蓋章值四樣一起由它決定（見 Reviewer）")
+                         "worker_id 與蓋章值一起由它決定（見 Reviewer）")
     ap.add_argument("--review-csv", default=None,
                     help="逐筆判斷的稽核檔（預設由 --reviewer 決定）")
     ap.add_argument("--pending", default=None,
@@ -1188,7 +1194,7 @@ def main():
                          "（＝丟掉那筆已經付過錢的證據，見 check_no_pending）")
     args = ap.parse_args()
 
-    # 稽核檔／交接檔／worker_id 四樣一起由 --reviewer 決定（見 Reviewer、
+    # 稽核檔／交接檔／worker_id 一起由 --reviewer 決定（見 Reviewer、
     # review_settings）。審核模式的 worker_id 是固定字串而不是隨機 pid：它會被
     # 寫進 tasks.worker_id，看板上該看得出「這一筆是誰審過才進來的」。
     try:
@@ -1255,7 +1261,7 @@ def main():
         print(json.dumps(dump, ensure_ascii=False, indent=2))
         sys.exit(code)
 
-    print(f"gemini_worker {worker_id} → {args.server}  {args.backend.describe()}  "
+    print(f"gemini_worker {rs.worker_id} → {args.server}  {args.backend.describe()}  "
           f"model={args.model} batch={args.batch} "
           f"max_searches={args.max_searches or '∞'}")
     try:

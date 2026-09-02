@@ -13,8 +13,9 @@ description: 使用 Codex 自己的網頁搜尋、MOPS 與 revswarm DB，逐筆�
 
 只在目前專案主工作目錄 `/home/poyi/GitHubLL/revswarm` 操作，不建立 worktree。
 每輪先檢查 `.codex_search_pending.json`：存在就只處理其中那一筆，不租新任務。
-這個檔案是本 skill 的交接檔；不要讀取、刪除或覆寫另一條流程的
-`.gemini_review_pending.json`。
+這個檔案是本 skill 的交接檔；不要讀取、刪除或覆寫 gemini-review 兩條線的交接檔
+`.gemini_review_pending.claude.json` 與 `.gemini_review_pending.codex.json`
+（⚠️ 它們存的是**已經付過錢**的 Gemini 證據，刪掉就要再付一次）。
 
 若沒有本 skill 的 pending，向 server 的 `gemini` 佇列租一筆，但只租任務，不呼叫
 Gemini：
@@ -105,5 +106,6 @@ Gemini 成本；若工具未提供費用就寫「成本不適用」）、以及�
 retry 不應作為一般 verdict：若搜尋工具或 API 沒有完成查詢，保留 pending、回報阻塞，
 不要把沒有證據的任務標成 reject 或 approve。
 
-收尾確認：只動到本 skill 的稽核檔與暫存交接檔的正常建立／刪除；`.gemini_review_pending.json`
+收尾確認：只動到本 skill 的稽核檔與暫存交接檔的正常建立／刪除；
+`.gemini_review_pending.claude.json`、`.gemini_review_pending.codex.json`
 與 `data/gemini-review-codex.csv` 不得被本 skill 改動。

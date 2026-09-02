@@ -369,5 +369,42 @@ class TestBothStampsAreLegalAndEqualRank(unittest.TestCase):
                             server.VERIFIER_RANK["gemini"], r.stamp)
 
 
+class TestTitleReviewCsvFollowsTheLine(unittest.TestCase):
+    """--from claude / codex 各自的預設稽核檔要跟著那條線走。
+
+    ⚠️ 這是 --from gemini-review 那個 bug 的雙胞胎，只是更難看見：兩條線的
+    title 判斷分別在 data/title_review.csv（全是 verdict=claude）與
+    data/title-review-codex.csv（全是 verdict=codex）。若 --from codex 仍舊
+    預設讀前者，篩出來的候選必然是 0 筆、exit 0——與「真的沒東西可蓋」一模一樣，
+    是**靜默**的錯，不會有人發現自己整批沒蓋到。
+    """
+
+    def test_each_line_defaults_to_its_own_csv(self):
+        seen = {}
+        for v in ("claude", "codex"):
+            seen[v] = sv.title_review_csv_for(v)
+        self.assertNotEqual(seen["claude"], seen["codex"])
+
+    def test_tbd_shares_the_claude_file(self):
+        # tbd 是「看過了但沒把握」，跟 claude 那條線寫在同一份檔（歷史如此）。
+        self.assertEqual(sv.title_review_csv_for("tbd"),
+                         sv.title_review_csv_for("claude"))
+
+    def test_the_default_actually_contains_that_verdict(self):
+        """⚠️ 真的去讀檔：預設值對不對，只有對著實際資料才驗得出來。
+
+        指到一份「格式正確但完全沒有這個 verdict」的檔案，程式一路綠燈跑完、
+        候選 0 筆——這正是要擋的那個症狀。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(sv.__file__)))
+        for v in ("claude", "codex"):
+            path = os.path.join(root, sv.title_review_csv_for(v))
+            if not os.path.exists(path):        # 稽核檔不一定每台機器都有
+                continue
+            with io.open(path, encoding="utf-8-sig") as f:
+                verdicts = {r["verdict"] for r in csv.DictReader(f)}
+            self.assertIn(v, verdicts, f"{path} 裡沒有任何 verdict={v} 的列")
+
+
 if __name__ == "__main__":
     unittest.main()
