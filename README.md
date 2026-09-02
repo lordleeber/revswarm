@@ -49,7 +49,8 @@
 | `data/active_stocks.txt` | 1848 檔股票代號（一行一個）|
 | `data/name_overrides.csv` | 已下市/ISIN 查無者的人工補名（目前 3426 台興、6806 森崴能源）|
 | `data/date_overrides.csv` | 人工確認的**遲交**公布日（窗外個案，目前 1 筆；見下）|
-| `data/gemini_review.csv` | 逐筆審核 `gemini_worker` 證據的判斷（含**模型讀過的網域**，DB 沒地方存；見「gemini_worker → 審核模式」）|
+| `data/gemini_review.csv` | **claude 線**逐筆審核 `gemini_worker` 證據的判斷（含**模型讀過的網域**，DB 沒地方存；見「gemini_worker → 審核模式」）|
+| `data/gemini-review-codex.csv` | 同上，**codex 線**的那一份。兩條線各寫各的，事後分得出哪一筆是誰審的 |
 | `apply_date_overrides.py` | 把上面那份 CSV 套進 DB（冪等；DB 不進版控，重建後要重跑）|
 | `stocks.csv` | 產生的對照表（進版控）|
 | `init_tasks.py` | 展開 1848×73 成 tasks 寫入 SQLite（冪等）|
@@ -559,17 +560,22 @@ worker 結束時會印出兩者比例。實務上 Gemini API 的 `groundingChunk
 所以有第二種跑法，把順序倒過來：**先把整份證據交出來，等人看完才決定要不要落地。**
 
 ```bash
+# ⚠️ --reviewer 必填，且三道指令要是【同一條線】：它同時決定稽核檔、交接檔、
+#    worker_id 與蓋章值（見下方「兩條審核線」）。下面以 claude 線為例。
+
 # ① 租 1 筆、打一次 API、把證據印成 JSON。⚠️ 刻意【不回報】——日期還沒進 DB
-python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --review-one
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
+    --reviewer claude --review-one
 
 # ② 看完再落地（不打 API、不需要 --project）
-python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --reviewer claude \
     --review-verdict approve --note "這一筆為什麼撐得起這個日期"
 #   reject = 撐不起 → 回報 failed（gemini 是最後一棒，那就是終點）
 #   retry  = 模型根本沒去搜 → 放回佇列，不算審過、不寫稽核檔
 
-# ③ 蓋章（讀 data/gemini_review.csv，只送 approve 的列，可重跑）
-python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
+# ③ 蓋章（讀該條線自己的稽核檔，只送 approve 的列，可重跑）
+python3 -m stamp_verified --from gemini-review --reviewer claude \
+    --server http://127.0.0.1:8000
 ```
 
 `--review-one` 的 exit code 就是行動指示：`0` 有東西可審／`2` 上一筆的判斷還沒落地
@@ -579,8 +585,10 @@ python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
 ——它會把那一列印出來讓人手動補，⚠️ 不要重跑，會重複回報）。⚠️ 沒回報的租約會在 `LEASE_TTL`
 （600s）後被 server 惰性回收放回 `undone`——**中斷是安全的**，代價是這一筆下次要再付一次錢。
 
-配 `.claude/skills/gemini-review`（`/loop /gemini-review` 一輪一筆）就是「Claude 逐筆審」
-的跑法。判準與 `title-review` 同一套，多一條只有這個模式看得到的：
+配 `.claude/skills/gemini-review` 或 `.agents/skills/gemini-review`
+（`/loop /gemini-review` 一輪一筆）就是「逐筆審」的跑法——前者是 claude 線、
+後者是 codex 線，兩份 skill 內容相同，只差 `--reviewer`。
+判準與 `title-review` 同一套，多一條只有這個模式看得到的：
 
 > ⚠️ **`chunks` 全是 `goodinfo` / PTT / 不明網域、或空的，就算標題看起來漂亮也要打問號。**
 > 那代表這個日期是模型「講」的而不是「讀」的。`searches` 裡沒有一條真的搜到「這家公司
@@ -598,8 +606,29 @@ python3 -m stamp_verified --from gemini-review --server http://127.0.0.1:8000
 `--note` 與稽核檔上一列**一字不差會被拒收**。這條看似瑣碎，但 2026-08-25 的 title 審核
 就是用共用 note 蓋了十萬筆章、後來全部撤銷——共用理由的稽核檔對稽核者毫無價值。
 
-⚠️ 蓋的章是 **`verified='claude'` 不是 `gemini`**：審核者讀的是模型自己回的那段文字，
-沒有引入第二個獨立來源，那是循環（見「出處與驗證 → `claude` 不是驗證」）。
+⚠️ 蓋的章是**審核者自己的名字**（`claude` 或 `codex`）**不是 `gemini`**：審核者讀的是
+模型自己回的那段文字，沒有引入第二個獨立來源，那是循環（見「出處與驗證」那節）。
+
+#### 兩條審核線（claude / codex）
+
+同一支 worker、同一套 `judge()`，用 `--reviewer` 分成兩條各自獨立的線：
+
+| | `--reviewer claude` | `--reviewer codex` |
+|---|---|---|
+| 稽核檔 | `data/gemini_review.csv` | `data/gemini-review-codex.csv` |
+| 交接檔 | `.gemini_review_pending.claude.json` | `.gemini_review_pending.codex.json` |
+| `tasks.worker_id` | `claude-review` | `codex-review` |
+| 蓋的章 | `verified='claude'` | `verified='codex'` |
+| skill | `.claude/skills/gemini-review` | `.agents/skills/gemini-review` |
+
+⚠️ **沒有預設審核者，缺 `--reviewer` 一律拒收**（worker exit 2、`stamp_verified` exit 1）。
+這些東西是一組、一起從 `gemini_worker.REVIEWERS` 取（連 title-review 那條路的稽核檔
+也在裡面），`stamp_verified` 也 import 同一份
+而不是自己抄——2026-09-02 出過的事就是它們能各自漂掉：稽核檔換成了另一條線的、蓋章值
+留在原地，程式照跑不報錯，兩條線混在一起才被發現。兩條線**同階**（見 `VERIFIER_RANK`），
+所以蓋錯不會被排名擋下來，只會靜默覆蓋掉另一個人的章——這是它必填的原因。
+交接檔分開則是另一件事：共用的話，兩條線同時跑時後租的那筆會覆蓋掉前一筆
+**已經付過錢**的證據。
 
 ### 怎麼走到 Vertex 這條路的（2026-08-24 實測）
 
@@ -839,7 +868,7 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 | 欄位 | 意義 |
 | --- | --- |
 | `url` | 這個 `announce_date` 是從哪一篇讀到的。worker 回報 success 時附上，server 端再驗一次格式（非 `http`/`https` 一律存 NULL）|
-| `verified` | 誰核對過這個日期、且**日期一致**才蓋章：`mops` \| `gemini` \| `claude` \| `tbd`。NULL = 沒人看過（**不是**「驗過但錯」）|
+| `verified` | 誰核對過這個日期、且**日期一致**才蓋章：`mops` \| `gemini` \| `claude` \| `codex` \| `tbd`。NULL = 沒人看過（**不是**「驗過但錯」）|
 
 ### 為什麼需要 `url`
 
@@ -886,16 +915,17 @@ watch -n5 "curl -s -H \"Authorization: Bearer $REVSWARM_TOKEN\" http://<server�
 就退化成「有人碰過」——欄位裡照樣有值，只是不再代表任何事。日期不一致的會被回報成
 `mismatch` 但**不蓋章也不改資料**：那是兩個來源打架的訊號，值得人逐筆去看。
 
-### 四個值的強弱不同，別混著算
+### 這些值的強弱不同，別混著算
 
 ```
-mops    官方申報文件（公開資訊觀測站 t05st01）——最硬
-gemini  模型 grounding 獨立查出同一個日期
-claude  ⚠️ 人工讀 raw_title 的判斷，不是第二個獨立來源
-tbd     看過了，但不是高信心
+mops            官方申報文件（公開資訊觀測站 t05st01）——最硬
+gemini          模型 grounding 獨立查出同一個日期
+claude / codex  ⚠️ 逐筆讀證據的判斷，不是第二個獨立來源。兩者【同階】，
+                只是兩條各自獨立的審核線，判準完全相同
+tbd             看過了，但不是高信心
 ```
 
-⚠️ **`claude` 不是驗證，是篩選。** `raw_title` 正是產生 `announce_date` 的那段文字
+⚠️ **`claude`／`codex` 不是驗證，是篩選。** `raw_title` 正是產生 `announce_date` 的那段文字
 （`revlib.parse` 從它附近抽日期），再讀一次同一段字沒有引入任何新證據——這是循環。
 它能回答的只有一件事：**這段佐證文字撐不撐得起這個日期**。實際抓到的問題長這樣：
 
@@ -907,8 +937,12 @@ tbd     看過了，但不是高信心
   title：「新鉅科 2024年5月","yptydevice":"desktop"…」← Yahoo 頁面的內嵌 JSON
 ```
 
-所以排序上 `claude`/`tbd` 墊底（`tbd < claude < gemini < mops`），永遠不會覆蓋
+所以排序上這幾個墊底（`tbd < claude = codex < gemini < mops`），永遠不會覆蓋
 `mops` 或 `gemini` 的章。算「被獨立驗證的量」時**一律排除**它們。
+
+⚠️ `claude` 與 `codex` **同階**是刻意的：它們的證據強度一樣（都是「讀一段文字」），
+沒有理由誰壓過誰。代價是兩條線審到同一個月份時，後蓋的會**靜默**覆蓋前一個——排名
+擋不住，所以每一條指令都必須指名 `--reviewer`（見下）。
 
 判斷寫在版控的 `data/title_review.csv`，不直接寫 DB：`mops`/`gemini` 那兩條路隨時可以
 重跑重現，這條不行——留檔才有得稽核「當初為什麼判高信心」，DB 重建後也補得回來。
@@ -921,21 +955,28 @@ python3 -m stamp_verified --from claude --server http://127.0.0.1:8000
 python3 -m stamp_verified --from tbd    --server http://127.0.0.1:8000
 ```
 
-`claude` 這個章有兩條來源，判準相同（都是「這段佐證文字撐不撐得起這個日期」），
-差別只在讀的是什麼：
+這個章有**兩種讀法 × 兩條審核線**，判準完全相同（都是「這段佐證文字撐不撐得起這個
+日期」），差別只在讀的是什麼、以及誰讀的：
 
 | 來源 CSV | 讀的是 | 跑法 |
 |---|---|---|
 | `data/title_review.csv` | DB 裡已經落地的 `raw_title`（事後審）| `--from claude` |
-| `data/gemini_review.csv` | `gemini_worker --review-one` 交回的**完整證據**，含模型讀過的網域（**寫入前**審，見「gemini_worker → 審核模式」）| `--from gemini-review` |
+| `data/title-review-codex.csv` | 同上，codex 線那一份 | `--from codex` |
+| `data/gemini_review.csv` | `gemini_worker --review-one` 交回的**完整證據**，含模型讀過的網域（**寫入前**審，見「gemini_worker → 審核模式」）| `--from gemini-review --reviewer claude` |
+| `data/gemini-review-codex.csv` | 同上，codex 線那一份 | `--from gemini-review --reviewer codex` |
 
-⚠️ 這兩張判斷 CSV 都是 append-only 的，同一個月份**可以**有第二列判斷（`tbd` 重讀後改判
-`claude`、reject 的那一筆被 `requeue-failed` 排回來重審…）。`stamp_verified` 一律**以最後
-一列為準**並把覆蓋情形印出來；先前已經蓋上的章不會因為後來改判 reject 就被撤掉。
+⚠️ 這些判斷 CSV 都是 append-only 的，同一個月份**可以**有第二列判斷（`tbd` 重讀後改判、
+reject 的那一筆被 `requeue-failed` 排回來重審…）。`stamp_verified` 一律**以最後一列為準**
+並把覆蓋情形印出來；先前已經蓋上的章不會因為後來改判 reject 就被撤掉。
 
-⚠️ `--from gemini-review` 蓋的是 `claude` **不是 `gemini`**——判斷者是讀 gemini 證據的人，
-不是第二個獨立來源。蓋成 `gemini` 會讓它在 `VERIFIER_RANK` 裡爬到 `claude` 之上、
-覆蓋掉不該覆蓋的章，而且對外宣稱了一個不存在的獨立確認。
+⚠️ `--from gemini-review` **必須帶 `--reviewer`**：它同時決定讀哪一份稽核檔、蓋哪一個章。
+沒有預設值——兩條線同階，猜錯不會被排名擋下來，會靜默蓋上另一個人的章（2026-09-02 就是
+這樣：稽核檔換成了另一條線的，蓋章值留在原地，程式照跑不報錯）。所以稽核檔與蓋章值只有
+**一份定義**，在 `gemini_worker.REVIEWERS`，`stamp_verified` import 它而不是自己抄。
+
+⚠️ 蓋的是**審核者自己的名字** **不是 `gemini`**——判斷者是讀 gemini 證據的人，不是第二個
+獨立來源。蓋成 `gemini` 會讓它在 `VERIFIER_RANK` 裡爬到審核者之上、覆蓋掉不該覆蓋的章，
+而且對外宣稱了一個不存在的獨立確認。
 
 ### ⚠️ `verified='mops'` 不全是「兩個獨立來源同意」
 

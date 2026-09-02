@@ -62,12 +62,15 @@ NEXT_ENGINE = {"yahoo": "google", "google": "gemini"}
 #   mops    官方申報文件（公開資訊觀測站 t05st01）——最硬
 #   gemini  模型 grounding 獨立查出同一個日期（實測 m_src 為 0，全靠模型合成文字，
 #           見 README「對照實驗」）
-#   claude  ⚠️ **人工讀 raw_title 的判斷，不是第二個獨立來源**。title 正是產生
-#           announce_date 的那段文字（revlib.parse 從它附近抽日期），再讀一次同一段
+#   claude  ⚠️ **逐筆讀證據的判斷，不是第二個獨立來源**。title 正是產生
+#   codex   announce_date 的那段文字（revlib.parse 從它附近抽日期），再讀一次同一段
 #           字沒有引入新證據——這是循環。它只回答「這段佐證文字撐不撐得起這個日期」，
 #           例如標題其實是股東會通知、或只是一段 JSON 碎片。當篩選線索用，不是驗證。
+#           ⚠️ claude 與 codex 是**兩條各自獨立的審核線**（見 gemini_worker.REVIEWERS），
+#           判準完全相同，所以**同階**：誰都不該壓過誰。代價是兩條線審到同一個月份
+#           時，後蓋的會靜默覆蓋前一個——所以那邊的指令一律要求指名 --reviewer。
 #   tbd     看過了、但不是高信心。與 NULL 的差別是「已經有人看過」，避免重複讀。
-VERIFIER_RANK = {"mops": 4, "gemini": 3, "claude": 2, "tbd": 1}
+VERIFIER_RANK = {"mops": 4, "gemini": 3, "codex": 2, "claude": 2, "tbd": 1}
 VERIFIERS = tuple(VERIFIER_RANK)
 
 SCHEMA = """

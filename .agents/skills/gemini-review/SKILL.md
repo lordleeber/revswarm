@@ -32,7 +32,7 @@ description: 一次審一筆 gemini_worker 的結果：跑 --review-one 拿到�
 ## 0. 先確認有沒有未完成的審核
 
 ```bash
-test -f .gemini_review_pending.claude.json && echo "有未完成的：先審它，不要再租新的" || echo "乾淨"
+test -f .gemini_review_pending.codex.json && echo "有未完成的：先審它，不要再租新的" || echo "乾淨"
 ```
 
 有的話**跳到第 2 步**審那一筆。⚠️ 程式也會擋：交接檔還在時 `--review-one` 直接
@@ -42,7 +42,7 @@ exit 2、不打 API（覆蓋掉的是一份已經付過錢的證據）。真的�
 
 ```bash
 python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
-  --reviewer claude --review-one
+  --reviewer codex --review-one
 ```
 
 ⚠️ **這一步會花錢，而且單筆上限不可控**：一次呼叫發幾次搜尋完全由模型決定，程式擋不住
@@ -73,7 +73,7 @@ Gemini API 端限速，不是這筆任務有問題——照表格規則 `retry` 
 ```bash
 python3 - <<'PY'
 import csv, datetime, json, os, sqlite3, statistics
-d = json.load(open(".gemini_review_pending.claude.json", encoding="utf-8"))
+d = json.load(open(".gemini_review_pending.codex.json", encoding="utf-8"))
 t = d["task"]; sid, ry, rm = t["stock_id"], t["roc_year"], t["roc_month"]
 c = sqlite3.connect("file:revswarm.db?mode=ro", uri=True); c.row_factory = sqlite3.Row
 r = c.execute("SELECT engine,state,attempts,fail_count FROM tasks WHERE id=?",
@@ -145,7 +145,7 @@ dump 裡真正要看的欄位：
 **最重要的側查技巧：累計金額交叉核對**（2026-08-27 全天實測：approve 11 筆裡有 7 筆
 靠這招過關——1313 聯成、2465 麗臺、1473 台南、1514 亞力、1717 長興、2035 唐榮、2640 大車隊）：
 若 TITLE 裡有「1—N月達W億元」這種年初至今累計數字，去 DB（或 `data/title_review.csv`）找
-同一檔**已經 verified='claude' 的前幾個月**金額，手動加總比對。實測誤差全部在 0.16% 以內，
+同一檔**已經 verified='codex' 的前幾個月**金額，手動加總比對。實測誤差全部在 0.16% 以內，
 最準的幾筆幾乎完全吻合（1717 長興差 0.007%、2035 唐榮誤差為 0——四個月全部驗證過的加總
 跟 TITLE 自稱的累計數字一字不差）：這種精確度很難是編的，是比單看 chunks 更硬的獨立佐證，
 **沒有 chunks 也能單靠這條 approve**（1717、2035 那兩筆 chunks 就是全空，靠累計數字過關）。
@@ -163,10 +163,10 @@ chunks 全空、無 YoY 無累計，量級吻合只是弱佐證，撐不起 appr
 明顯落在正常區間外。「沒有證據」跟「有證據且互相矛盾」要分開判斷：前者看其他判準，
 後者直接 reject，不必再找別的理由撐。
 
-⚠️ **累計核對不必等「verified='claude'」才能用**（2026-08-28 實測）：DB 裡 yahoo/google
+⚠️ **累計核對不必等「verified='codex'」才能用**（2026-08-28 實測）：DB 裡 yahoo/google
 獨立抓到但**還沒蓋章**的 raw_title（`state='success'`、`verified` 是 NULL）一樣可以當累計
 基準，反推出來的隱含值一樣可能精準到誤差 0.1~0.5%（5202 力新、5353 台林、8183 精星、
-4414 如興都是這樣過關的）。這種基準比「verified='claude'」弱一級（少了一次人工複核），
+4414 如興都是這樣過關的）。這種基準比「verified='codex'」弱一級（少了一次人工複核），
 但仍然是獨立來源，比單看 chunks 硬——只是 note 裡要老實寫「用的是未蓋章的獨立樣本」。
 
 **累計反推「缺幾個月」的門檻**（2026-08-28 實測歸納）：缺 1～2 個月、反推出來的隱含值
@@ -224,39 +224,39 @@ TITLE 這個名字。查得到就是改名（實測 2636 台驊控股：109/4 �
 
 ```bash
 # 撐得起
-python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --reviewer claude \
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --reviewer codex \
   --review-verdict approve --note "這一筆為什麼撐得起：具體寫 chunks/金額/與 MOPS 或鄰近月的對照"
 
 # 撐不起（回報 failed，終點）
-python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --reviewer claude \
+python3 -m worker.gemini_worker --server http://127.0.0.1:8000 --reviewer codex \
   --review-verdict reject  --note "這一筆的具體疑點"
 
 # 根本沒查過（recommend: retry）——不必寫理由，放回佇列
 python3 -m worker.gemini_worker --server http://127.0.0.1:8000 \
-  --reviewer claude --review-verdict retry
+  --reviewer codex --review-verdict retry
 ```
 
-- `approve`/`reject` 會把這一筆追加進版控的 `data/gemini_review.csv`（含 `chunks`）。
+- `approve`/`reject` 會把這一筆追加進版控的 `data/gemini-review-codex.csv`（含 `chunks`）。
   `retry` **不寫**——沒查過的那一筆不算審過。
 - ⚠️ `worker_verdict=failed` 的那一筆**不能 approve**，程式會拒收：沒有可核准的內容
   （URL 確認為不存在／根本沒抽到窗內日期）。要放行請去改判準，不要在單筆繞過。
 - ⚠️ dump 帶 `error`（`nosearch`／`retry`／`fatal`）的那一筆**只能 retry**，approve/reject
   都會被程式拒收：那份 dump 裡沒有任何證據，而空證據看起來很像「該否決」。
 - note 寫**這一筆**的理由。與上一列一字不差會被拒收（見上面的界線 ②）。
-- 回報成功才會刪 `.gemini_review_pending.claude.json`；server 掉線就原地重跑同一道指令。
+- 回報成功才會刪 `.gemini_review_pending.codex.json`；server 掉線就原地重跑同一道指令。
 - ⚠️ exit 5＝**判斷已經回報 server 了，但稽核列沒寫進 CSV**。它會把那一列印出來：
-  手動補進 `data/gemini_review.csv`、刪掉交接檔，**不要重跑**同一道指令（會重複回報）。
+  手動補進 `data/gemini-review-codex.csv`、刪掉交接檔，**不要重跑**同一道指令（會重複回報）。
 
 ## 5. 蓋章（只有 approve 需要）
 
 ```bash
-python3 -m stamp_verified --from gemini-review --reviewer claude \
+python3 -m stamp_verified --from gemini-review --reviewer codex \
   --server http://127.0.0.1:8000
 ```
 
-蓋的是 `verified='claude'`（不是 `gemini`）：你讀的是模型自己回的那段文字，沒有引入
-第二個獨立來源——那是循環，是**篩選不是驗證**（見 README「`claude` 不是驗證」）。
-它讀整份 `data/gemini_review.csv`、只送 approve 的列，已蓋過的會記成 `kept`，可以重跑。
+蓋的是 `verified='codex'`（不是 `gemini`）：你讀的是模型自己回的那段文字，沒有引入
+第二個獨立來源——那是循環，是**篩選不是驗證**（見 README「`codex` 不是驗證」）。
+它讀整份 `data/gemini-review-codex.csv`、只送 approve 的列，已蓋過的會記成 `kept`，可以重跑。
 同一個月份被審過兩次（`requeue-failed` 把 reject 的那筆排回來重審）一律**以最後一列為準**，
 覆蓋情形它會印出來——所以重審的判斷直接往後 append 就好，不要回頭改舊列。
 
@@ -265,7 +265,7 @@ python3 -m stamp_verified --from gemini-review --reviewer claude \
 ```
 1101 台泥 109/1 → approve  2020-02-10 [m_txt]  chunks=["moneydj.com","cnyes.com"]
   理由：<這一筆的理由>
-  這一筆 7 次搜尋（約 $0.10）；累計已審 <wc -l data/gemini_review.csv 減 1> 筆
+  這一筆 7 次搜尋（約 $0.10）；累計已審 <wc -l data/gemini-review-codex.csv 減 1> 筆
 ```
 
 - ⚠️ dump 裡的 `cost_note` 是**這一個程序**的花費，不是累計——每次 `--review-one` 都從
@@ -275,7 +275,7 @@ python3 -m stamp_verified --from gemini-review --reviewer claude \
 
 ## 收尾檢查
 
-- `git status` 應該只動到 `data/gemini_review.csv`
-- `.gemini_review_pending.claude.json` 應該已經不存在（gitignored，但留著代表這一筆沒落地）
+- `git status` 應該只動到 `data/gemini-review-codex.csv`
+- `.gemini_review_pending.codex.json` 應該已經不存在（gitignored，但留著代表這一筆沒落地）
 - ⚠️ server 沒跑的話 `--review-verdict` 與 `stamp_verified` 都會連不上。
   server 是這個 DB 的唯一寫入者，不要繞過它直接改

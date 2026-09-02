@@ -22,7 +22,9 @@ import csv
 import io
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 
@@ -1232,6 +1234,183 @@ class TestPendingGuards(unittest.TestCase):
     def test_an_empty_queue_is_not_saved(self):
         self.assertFalse(gw.should_save_pending(
             {"task": None, "recommend": "empty"}))
+
+
+class TestReviewerRegistry(unittest.TestCase):
+    """審核者身分是**一組**綁在一起的東西：稽核 CSV、交接檔、worker_id、蓋章值。
+
+    ⚠️ 這四樣任何一樣被單獨改掉，症狀都是靜默的——判斷寫進另一條線的稽核檔、
+    或蓋上另一個審核者的章，程式不會報錯，跑起來一切正常。2026-09-02 真的發生
+    過：文件寫 verified='claude'、工作區的程式寫死 'codex'，兩邊各跑各的，
+    直到有人去比對才發現。所以身分只准有一個定義處（REVIEWERS），這裡守住它。
+    """
+
+    def test_both_lines_are_registered(self):
+        self.assertEqual(set(gw.REVIEWERS), {"claude", "codex"})
+
+    def test_stamp_is_the_registry_key_itself(self):
+        # 蓋章值就是身分本身。能分開寫，遲早會分開——那正是上面說的那個 bug。
+        for name, r in gw.REVIEWERS.items():
+            self.assertEqual(r.stamp, name, name)
+
+    def test_no_two_reviewers_share_a_csv(self):
+        # 共用稽核檔＝兩條線的判斷混進同一份，事後分不出哪一筆是誰審的。
+        paths = [r.csv for r in gw.REVIEWERS.values()]
+        self.assertEqual(len(paths), len(set(paths)), paths)
+
+    def test_no_two_reviewers_share_a_pending_file(self):
+        # ⚠️ 共用交接檔＝兩條線同時跑時，後租的那筆會覆蓋掉前一筆**已經付過錢**
+        # 的證據（見 check_no_pending 的 --force 註解）。
+        paths = [r.pending for r in gw.REVIEWERS.values()]
+        self.assertEqual(len(paths), len(set(paths)), paths)
+
+    def test_no_two_reviewers_share_a_worker_id(self):
+        # worker_id 會寫進 tasks.worker_id：看板上要分得出這一筆是誰審過的。
+        ids = [r.worker_id for r in gw.REVIEWERS.values()]
+        self.assertEqual(len(ids), len(set(ids)), ids)
+
+    def test_every_pending_file_is_gitignored(self):
+        """⚠️ 交接檔是執行期產物，進版控等於把付費證據推上去。
+
+        .gitignore 從前釘死單一檔名 .gemini_review_pending.json；一旦每條線
+        各有自己的交接檔，那條規則就漏了——而漏掉是靜默的（git status 才看得到）。
+        """
+        import fnmatch
+        root = os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__)))
+        with io.open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            pats = [ln.strip() for ln in f
+                    if ln.strip() and not ln.startswith("#")]
+        for r in gw.REVIEWERS.values():
+            self.assertTrue(
+                any(fnmatch.fnmatch(r.pending, p) for p in pats),
+                f"{r.pending} 沒有被 .gitignore 蓋到")
+
+
+class TestReviewerMustBeExplicit(unittest.TestCase):
+    """審核模式一定要講清楚自己是誰，不准有預設值。
+
+    ⚠️ 預設值正是上面那個 bug 的溫床：忘了帶旗標時，程式會安靜地用「某一條線」
+    的檔案與章跑完，而那條線不見得是你以為的那條。寧可拒收也不要猜。
+    """
+
+    def _settings(self, **kw):
+        kw.setdefault("reviewer", None)
+        kw.setdefault("review_one", False)
+        kw.setdefault("review_verdict", None)
+        kw.setdefault("review_csv", None)
+        kw.setdefault("pending", None)
+        kw.setdefault("worker_id", None)
+        return gw.review_settings(types.SimpleNamespace(**kw))
+
+    def test_review_one_without_a_reviewer_is_refused(self):
+        with self.assertRaises(gw.ReviewError):
+            self._settings(review_one=True)
+
+    def test_review_verdict_without_a_reviewer_is_refused(self):
+        with self.assertRaises(gw.ReviewError):
+            self._settings(review_verdict="approve")
+
+    def test_batch_mode_needs_no_reviewer(self):
+        # 批次模式不寫稽核檔、不蓋章，不該被這條規則綁住。
+        self.assertIsNone(self._settings().reviewer)
+
+    def test_reviewer_supplies_all_four_coupled_values(self):
+        s = self._settings(review_one=True, reviewer="codex")
+        r = gw.REVIEWERS["codex"]
+        self.assertEqual((s.csv, s.pending, s.worker_id),
+                         (r.csv, r.pending, r.worker_id))
+
+    def test_the_two_lines_never_resolve_to_the_same_files(self):
+        a = self._settings(review_one=True, reviewer="claude")
+        b = self._settings(review_one=True, reviewer="codex")
+        self.assertNotEqual(a.csv, b.csv)
+        self.assertNotEqual(a.pending, b.pending)
+
+    def test_an_explicit_path_still_wins(self):
+        # 明講的路徑照舊蓋過預設（測試與一次性重跑都靠這個）。
+        s = self._settings(review_one=True, reviewer="claude",
+                           review_csv="/tmp/x.csv", pending="/tmp/x.json")
+        self.assertEqual((s.csv, s.pending), ("/tmp/x.csv", "/tmp/x.json"))
+
+    def test_worker_id_says_which_line_reviewed_it(self):
+        for name in gw.REVIEWERS:
+            s = self._settings(review_one=True, reviewer=name)
+            self.assertIn(name, s.worker_id)
+
+
+class TestBatchModeStillStarts(unittest.TestCase):
+    """⚠️ main() 的批次分支沒有任何測試蓋到，而它是這支 worker 的**主要用途**。
+
+    2026-09-02 的教訓：把審核模式的 worker_id 收進 review_settings 時，批次那條
+    路上還留著一個對舊區域變數的參照——整個批次 worker 每次啟動就 NameError，
+    149 個測試照樣全綠，因為沒有一個走過 main()。這裡只驗最低限度的那件事：
+    批次模式走得到 run()，而且帶著自己算出來的 worker_id。
+    """
+
+    def setUp(self):
+        self.argv = sys.argv
+        self.seen = {}
+
+        def fake_run(args, client, budget):
+            self.seen["worker"] = client.worker_id
+            return {}
+
+        self.run_orig, gw.run = gw.run, fake_run
+        self.backend_orig, gw.make_backend = gw.make_backend, lambda a: _FakeVertex("p")
+
+    def tearDown(self):
+        sys.argv = self.argv
+        gw.run = self.run_orig
+        gw.make_backend = self.backend_orig
+
+    def _main(self, *extra):
+        sys.argv = ["gemini_worker", "--server", "http://x", "--once"] + list(extra)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gw.main()
+
+    def test_batch_mode_reaches_the_loop(self):
+        self._main()
+        self.assertIn("worker", self.seen)
+
+    def test_batch_worker_id_is_host_and_pid_not_a_reviewer(self):
+        self._main()
+        self.assertTrue(self.seen["worker"].endswith("-m"), self.seen["worker"])
+        for r in gw.REVIEWERS.values():
+            self.assertNotEqual(self.seen["worker"], r.worker_id)
+
+    def test_an_explicit_worker_id_still_wins(self):
+        self._main("--worker-id", "box-7")
+        self.assertEqual(self.seen["worker"], "box-7")
+
+
+class TestEverySkillHandoffFileIsIgnored(unittest.TestCase):
+    """所有 skill 的交接檔都必須被 .gitignore 蓋到，不只 gemini-review 那兩支。
+
+    ⚠️ 交接檔存的是【已經付過錢】的證據，是執行期產物。中斷的那一輪會把它留在
+    工作區，下一次 git add -A 就順手提交上去。TestReviewerRegistry 已經守住
+    REVIEWERS 那兩個檔，但那只涵蓋這支 worker 自己；別的 skill 各自發明的交接檔
+    （.codex_search_pending.json…）一樣會漏。這裡直接掃 skill 文件裡出現的檔名，
+    新增 skill 時不必記得回來補測試。
+    """
+
+    def test_no_handoff_file_escapes_gitignore(self):
+        import fnmatch
+        import glob
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__)))
+        with io.open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            pats = [ln.strip() for ln in f
+                    if ln.strip() and not ln.startswith("#")]
+        names = set()
+        for d in (".claude", ".agents"):
+            for doc in glob.glob(os.path.join(root, d, "skills", "*", "SKILL.md")):
+                with io.open(doc, encoding="utf-8") as f:
+                    names |= set(re.findall(r"\.[a-z0-9_]+_pending[a-z0-9_.]*\.json",
+                                            f.read()))
+        self.assertTrue(names, "掃不到任何交接檔名，這個測試就沒在守東西了")
+        for n in sorted(names):
+            self.assertTrue(any(fnmatch.fnmatch(n, p) for p in pats),
+                            f"{n} 沒有被 .gitignore 蓋到")
 
 
 if __name__ == "__main__":
