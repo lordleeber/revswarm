@@ -57,8 +57,10 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
        所以審核只能【否決】一個 success，不能無中生有一個 success（見 review_verdict）。
      ✗ 審核模式與批次模式共用 judge()，不可以各寫一套判準——不然審核者看的
        worker_verdict 跟批次真的會回報的東西不一樣，等於在審另一套規則。
-   逐筆判斷寫進版控的 data/gemini_review.csv（含 chunks），再由
-   stamp_verified --from gemini-review 蓋 verified='claude'。
+   審核線有兩條（claude／codex），由 --reviewer 指名——稽核檔、交接檔、worker_id
+   與蓋章值四樣一起換，見 Reviewer／REVIEWERS。逐筆判斷寫進該條線版控的稽核檔
+   （含 chunks），再由 stamp_verified --from gemini-review --reviewer <同一條線>
+   蓋上該審核者的章。
 
 三道防污染原封不動沿用（沒有任何一道因為換了資料源而放寬）：
    窗過濾 + 名稱錨點（revlib.parse）→ title_year_conflict 再擋一次錯年 → server 端再驗窗。
@@ -76,14 +78,16 @@ revswarm gemini_worker：向 server 租 engine='gemini' 的任務，用 Gemini A
   python3 -m worker.gemini_worker --server http://SERVER:8000 \
       --project YOUR_GCP_PROJECT --max-searches 300
 
-審核模式（一次一筆，給 .claude/skills/gemini-review 用）：
-  python3 -m worker.gemini_worker --server http://SERVER:8000 \
+審核模式（一次一筆；claude 那條線在 .claude/skills/gemini-review，
+codex 那條在 .agents/skills/gemini-review，⚠️ --reviewer 必填）：
+  python3 -m worker.gemini_worker --server http://SERVER:8000 --reviewer claude \
       --project YOUR_GCP_PROJECT --review-one          # 倒證據，不回報
-  python3 -m worker.gemini_worker --server http://SERVER:8000 \
+  python3 -m worker.gemini_worker --server http://SERVER:8000 --reviewer claude \
       --review-verdict approve --note "這一筆為什麼撐得起這個日期"
 """
 
 import argparse
+import collections
 import csv
 import io
 import json
@@ -150,8 +154,36 @@ ERR_NOSEARCH = "nosearch"  # 模型沒發出任何搜尋 → 見模組開頭 1.�
 # date/source/title/url 一律由程式從這裡讀，審核者只交出 verdict 與一段理由，
 # 不經手任何資料欄位——手打就有打錯的可能，而打錯的方向剛好是「一個沒人查過的
 # 日期被寫進 DB」。gitignored（是執行期產物，且回報完就刪）。
-REVIEW_PENDING = ".gemini_review_pending.json"
-REVIEW_CSV = "data/gemini_review.csv"
+
+
+class Reviewer(collections.namedtuple("Reviewer",
+                                      "name csv pending worker_id stamp")):
+    """一條審核線的完整身分。
+
+    ⚠️ 這四樣東西**必須一起換**，所以綁成一個值而不是四個常數：
+      csv        這條線的稽核檔（進版控，事後要分得出哪一筆是誰審的）
+      pending    這條線的交接檔（兩條線同時跑時不可以互相覆蓋——那會丟掉
+                 對方【已經付過錢】的證據，見 check_no_pending）
+      worker_id  寫進 tasks.worker_id，看板上看得出這一筆是誰審過的
+      stamp      stamp_verified 蓋進 tasks.verified 的值
+
+    2026-09-02 的教訓：當時只有一組全域常數，把 csv 改成另一條線的檔案時，
+    蓋章值留在原地，兩者指向不同的人——程式照跑、不報錯，直到有人去比對才發現。
+    現在四樣一起從這裡拿，拿錯只可能整組錯（會被 --reviewer 擋下），不會半組錯。
+    """
+    __slots__ = ()
+
+
+# ⚠️ 沒有預設值、也刻意不留「主要那條線」的概念：審核模式一律要 --reviewer 指名
+# （見 review_settings）。猜錯的代價是靜默寫進別人的檔案、蓋上別人的章。
+REVIEWERS = {
+    "claude": Reviewer("claude", "data/gemini_review.csv",
+                       ".gemini_review_pending.claude.json",
+                       "claude-review", "claude"),
+    "codex": Reviewer("codex", "data/gemini-review-codex.csv",
+                      ".gemini_review_pending.codex.json",
+                      "codex-review", "codex"),
+}
 # ⚠️ 這份表頭 stamp_verified 會逐字驗（它 import 這個常數，不自己抄一份）。
 # chunks 是這張表比 title_review.csv 多的那一欄：模型實際讀了哪些網域，DB 沒有
 # 地方存，不寫進來就沒了（見模組開頭 4.）。
@@ -169,6 +201,7 @@ EXIT_REFUSED = 2           # 審核者的指令本身不合法（見 ReviewError
 EXIT_EMPTY = 3             # gemini 佇列空的，這一輪沒事可做
 EXIT_ABORT = 4             # 設定錯誤，每一筆都會重演 → loop 該停
 EXIT_ROWLOST = 5           # 判斷已經回報給 server，但稽核列沒寫進 CSV（見 ReviewRowLost）
+
 
 
 class ReviewError(Exception):
@@ -226,6 +259,34 @@ _FATAL_403 = re.compile(
     r"PERMISSION_DENIED|Permission .{0,80}denied|does not have permission", re.I)
 
 
+
+ReviewSettings = collections.namedtuple("ReviewSettings",
+                                        "reviewer csv pending worker_id")
+
+
+def review_settings(args):
+    """把命令列收斂成這一輪要用的四樣東西（批次模式回傳 reviewer=None）。
+
+    ⚠️ 審核模式沒有預設審核者，缺 --reviewer 一律拒收（ReviewError → EXIT_REFUSED）。
+    「猜一條線」的代價是靜默的：判斷寫進另一條線的稽核檔、蓋上另一個人的章，
+    而兩邊都不會報錯（2026-09-02 就是這樣過了一整天才被發現）。
+
+    明講的 --review-csv／--pending 仍然蓋過預設：一次性重跑與測試靠它。
+    """
+    reviewer = None
+    if args.review_one or args.review_verdict:
+        if not args.reviewer:
+            raise ReviewError(
+                "審核模式要指名審核線：--reviewer "
+                + "|".join(sorted(REVIEWERS))
+                + "（稽核檔、交接檔、worker_id、蓋章值都由它決定）")
+        reviewer = REVIEWERS[args.reviewer]
+    return ReviewSettings(
+        reviewer,
+        args.review_csv or (reviewer.csv if reviewer else None),
+        args.pending or (reviewer.pending if reviewer else None),
+        args.worker_id or (reviewer.worker_id if reviewer else
+                           f"{socket.gethostname()}-{os.getpid()}-m"))
 
 # --- Vertex 後端 ------------------------------------------------------------
 class VertexBackend:
@@ -884,7 +945,7 @@ def _append_review_row(csv_path, row):
     return row
 
 
-def review_verdict(client, dump, verdict, note, csv_path=REVIEW_CSV):
+def review_verdict(client, dump, verdict, note, csv_path):
     """
     把審核者的判斷落地：回報給 server，並把理由追加進 data/gemini_review.csv。
 
@@ -1115,29 +1176,35 @@ def main():
                          "retry=沒查過，放回佇列。不打 API、不用 --project")
     ap.add_argument("--note", default="",
                     help="這一筆的判斷理由（approve/reject 必填，會進版控的稽核檔）")
-    ap.add_argument("--review-csv", default=REVIEW_CSV,
-                    help=f"逐筆判斷的稽核檔（預設 {REVIEW_CSV}）")
-    ap.add_argument("--pending", default=REVIEW_PENDING,
-                    help=f"兩個審核模式之間的交接檔（預設 {REVIEW_PENDING}）")
+    ap.add_argument("--reviewer", choices=sorted(REVIEWERS), default=None,
+                    help="⚠️ 審核模式必填：這一輪是哪一條審核線。稽核檔、交接檔、"
+                         "worker_id 與蓋章值四樣一起由它決定（見 Reviewer）")
+    ap.add_argument("--review-csv", default=None,
+                    help="逐筆判斷的稽核檔（預設由 --reviewer 決定）")
+    ap.add_argument("--pending", default=None,
+                    help="兩個審核模式之間的交接檔（預設由 --reviewer 決定）")
     ap.add_argument("--force", action="store_true",
                     help="⚠️ 允許 --review-one 覆蓋還沒落地的交接檔"
                          "（＝丟掉那筆已經付過錢的證據，見 check_no_pending）")
     args = ap.parse_args()
 
-    # 審核模式共用一個固定的 worker_id：它會被寫進 tasks.worker_id，看板上該看得出
-    # 「這一筆是審過才進來的」，而不是一個隨機 pid。
-    review = args.review_one or args.review_verdict
-    worker_id = args.worker_id or (
-        "claude-review" if review else f"{socket.gethostname()}-{os.getpid()}-m")
-    client = Client(args.server, args.token, worker_id)
+    # 稽核檔／交接檔／worker_id 四樣一起由 --reviewer 決定（見 Reviewer、
+    # review_settings）。審核模式的 worker_id 是固定字串而不是隨機 pid：它會被
+    # 寫進 tasks.worker_id，看板上該看得出「這一筆是誰審過才進來的」。
+    try:
+        rs = review_settings(args)
+    except ReviewError as e:
+        print(f"⚠️ {e}", file=sys.stderr)
+        sys.exit(EXIT_REFUSED)
+    client = Client(args.server, args.token, rs.worker_id)
 
     if args.review_verdict:
         # ⚠️ 這條路不打 API，所以【不建 backend】：落地一個判斷不該因為這台機器
         # 沒設 --project / 沒裝 gcloud 而失敗。
-        dump = load_pending(args.pending)
+        dump = load_pending(rs.pending)
         try:
             applied, row = review_verdict(client, dump, args.review_verdict,
-                                          args.note, args.review_csv)
+                                          args.note, rs.csv)
         except ReviewError as e:
             # ⚠️ 用 EXIT_REFUSED 而不是 sys.exit(str) 的 1：「指令不合法」與「程式掛了」
             # 對 loop 是兩件事（前者改一下指令重下，後者該停）。
@@ -1148,29 +1215,31 @@ def main():
             # 印出來讓人手動補進稽核檔——沒有那一列，這個 approve 對 stamp_verified
             # 永遠隱形。
             print(f"⚠️ {e}", file=sys.stderr)
-            print(f"⚠️ 請手動把下面這一列補進 {args.review_csv}（表頭只有第一次要）：",
+            print(f"⚠️ 請手動把下面這一列補進 {rs.csv}（表頭只有第一次要）：",
                   file=sys.stderr)
             print(e.csv_line(), file=sys.stderr)
-            print(f"⚠️ 補完後刪掉 {args.pending}；不要重跑同一道 --review-verdict，"
+            print(f"⚠️ 補完後刪掉 {rs.pending}；不要重跑同一道 --review-verdict，"
                   f"那會對 server 重複回報。", file=sys.stderr)
             sys.exit(EXIT_ROWLOST)
         # 回報成功才刪交接檔：失敗時留著，修好 server 再跑一次同一道指令即可。
-        os.remove(args.pending)
+        os.remove(rs.pending)
         t = dump["task"]
         print(f"{t['stock_id']} {t['name']} {t['roc_year']}/{t['roc_month']} "
               f"→ {args.review_verdict}   server: {applied}")
         if row:
-            print(f"  已記入 {args.review_csv}：{row['announce_date'] or '(無日期)'} "
+            print(f"  已記入 {rs.csv}：{row['announce_date'] or '(無日期)'} "
                   f"{row['source']}  chunks={row['chunks']}")
-            print(f"  ⚠️ 還沒蓋章。要蓋 verified='claude' 請跑："
+            # ⚠️ 這行印的是【這一條線】的章與旗標，不是寫死的字串：抄錯一次就
+            # 會把判斷蓋成另一個審核者（見 Reviewer 的 2026-09-02 註解）。
+            print(f"  ⚠️ 還沒蓋章。要蓋 verified='{rs.reviewer.stamp}' 請跑："
                   f"python3 -m stamp_verified --from gemini-review "
-                  f"--server {args.server}")
+                  f"--reviewer {rs.reviewer.name} --server {args.server}")
         return
 
     if args.review_one:
         # ⚠️ 擋在建 backend 與打 API 之前：晚一步錢就已經花掉了。
         try:
-            check_no_pending(args.pending, args.force)
+            check_no_pending(rs.pending, args.force)
         except ReviewError as e:
             print(f"⚠️ {e}", file=sys.stderr)
             sys.exit(EXIT_REFUSED)
@@ -1182,7 +1251,7 @@ def main():
     if args.review_one:
         dump, code = review_one(client, args.backend, args.model, budget)
         if should_save_pending(dump):
-            save_pending(args.pending, dump)
+            save_pending(rs.pending, dump)
         print(json.dumps(dump, ensure_ascii=False, indent=2))
         sys.exit(code)
 

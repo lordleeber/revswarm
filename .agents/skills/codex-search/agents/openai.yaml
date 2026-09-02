@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Search"
+  short_description: "用獨立搜尋逐筆核對月營收公告"
+  default_prompt: "使用 $codex-search，不呼叫 Gemini，獨立查證一筆月營收任務。"

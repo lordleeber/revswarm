@@ -10,10 +10,13 @@
 兩個來源，可信度不同：
   --from mops    MOPS 公開資訊觀測站的官方申報日（t05st01）。這是**官方原始文件**，
                  是這個 repo 裡最硬的基準；重疊區約 2,376 筆 / 49 檔。
-  --from gemini-review
-                 Claude 逐筆審 gemini_worker --review-one 交回的證據（data/gemini_review.csv）。
-                 ⚠️ 蓋的章是 **claude** 不是 gemini：判斷者讀的是模型自己回的那段文字，
-                 沒有引入新證據（循環，見 README「claude 不是驗證」）。
+  --from gemini-review --reviewer claude|codex
+                 某一條審核線逐筆審 gemini_worker --review-one 交回的證據。
+                 兩條線各有自己的稽核檔（claude → data/gemini_review.csv，
+                 codex → data/gemini-review-codex.csv），--reviewer 同時決定
+                 讀哪一份與蓋哪個章（見 verifier_for）。
+                 ⚠️ 蓋的章是審核者自己的名字、不是 gemini：判斷者讀的是模型回的
+                 那段文字，沒有引入新證據（循環，見 README「不是驗證」那節）。
   --from gemini  gemini 對照實驗的結果（gemini_benchmark.csv）。⚠️ 弱一階：那是模型
                  grounding 查出來的，而且實測 m_src 為 0（全靠模型合成文字，見 README
                  「對照實驗」）。只有「gemini 與 MOPS 都同意 DB 的日期」才蓋。
@@ -48,13 +51,14 @@ from mops.mops_validate import load_baseline
 # ⚠️ 跨套件 import 是刻意的：gemini_review.csv 的表頭只有【一份】定義，由寫的人
 # （gemini_worker）宣告、讀的人驗。各抄一份遲早會漂，而漂掉的症狀是整批無聲跳過。
 from worker.gemini_worker import REVIEW_FIELDS as GEMINI_REVIEW_FIELDS
+# ⚠️ 同一條理由：審核線的身分（稽核檔＋蓋章值）也只有【一份】定義，在寫的人那邊。
+# 這裡抄一份的話，「讀哪個檔」與「蓋哪個章」就能各自漂掉——那正是 2026-09-02
+# 發生過的事（見 gemini_worker.Reviewer）。
+from worker.gemini_worker import REVIEWERS
 
 DEFAULT_BASELINE = "mops_baseline.csv"
 DEFAULT_BENCH = "gemini_benchmark.csv"
 DEFAULT_REVIEW = "data/title_review.csv"
-DEFAULT_GEMINI_REVIEW = "data/gemini_review.csv"
-# --from 的名字通常就是 verified 要蓋的值；gemini-review 是唯一的例外（見下）。
-VERIFIER_FOR = {"gemini-review": "claude"}
 CHUNK = 500          # 一次送幾筆；分批只是別讓單一請求太肥，server 端本來就是一個交易
 
 
@@ -93,15 +97,30 @@ def items_from_gemini(path):
     return out
 
 
-def verifier_for(src):
+def verifier_for(src, reviewer=None):
     """--from 的來源名 → verified 要蓋的值。
 
-    ⚠️ gemini-review 蓋的是 `claude`，不是 `gemini`。那條路的判斷者是 Claude 讀
-    gemini 交回的證據（模型自己寫的那段文字＋它讀過的網域），沒有第二個獨立來源
-    出現過——蓋成 `gemini` 會讓它在 VERIFIER_RANK 裡爬到 claude 之上，覆蓋掉不該
-    覆蓋的章，而且對外宣稱了一個不存在的獨立確認。
+    ⚠️ gemini-review 蓋的**不是** `gemini`，而是那條審核線自己的名字（claude／
+    codex）。判斷者讀的是 gemini 交回的證據（模型自己寫的那段文字＋它讀過的
+    網域），沒有第二個獨立來源出現過——蓋成 `gemini` 會讓它在 VERIFIER_RANK 裡
+    爬到審核者之上，覆蓋掉不該覆蓋的章，而且對外宣稱了一個不存在的獨立確認。
+
+    ⚠️ gemini-review 沒有預設審核者：兩條線的證據強度一樣（同階），所以猜錯不會
+    被排名擋下來，會**靜默**蓋上另一個人的章。缺 --reviewer 一律拒收。
     """
-    return VERIFIER_FOR.get(src, src)
+    if src != "gemini-review":
+        return src
+    if reviewer not in REVIEWERS:
+        sys.exit(f"⚠️ --from gemini-review 要指名 --reviewer "
+                 f"{'|'.join(sorted(REVIEWERS))}：它決定讀哪份稽核檔、蓋哪個章。")
+    return REVIEWERS[reviewer].stamp
+
+
+def gemini_review_csv_for(reviewer):
+    """審核線 → 它自己的稽核檔。與 verifier_for 同一個來源，不可能各指一邊。"""
+    if reviewer not in REVIEWERS:
+        sys.exit(f"⚠️ --reviewer 要是 {'|'.join(sorted(REVIEWERS))} 其中之一。")
+    return REVIEWERS[reviewer].csv
 
 
 GEMINI_REVIEW_VERDICTS = ("approve", "reject")
@@ -190,7 +209,7 @@ def _report_supersedes(winners, path):
 
 REVIEW_FIELDS = ("stock_id", "roc_year", "roc_month", "announce_date",
                  "verdict", "note")
-REVIEW_VERDICTS = ("claude", "tbd")
+REVIEW_VERDICTS = ("codex", "claude", "tbd")
 
 
 def items_from_review(path, verdict):
@@ -264,20 +283,25 @@ def main():
     ap.add_argument("--baseline", default=DEFAULT_BASELINE)
     ap.add_argument("--bench", default=DEFAULT_BENCH)
     ap.add_argument("--review", default=DEFAULT_REVIEW,
-                    help="人工讀 title 的判斷 CSV（--from claude/tbd 用）")
-    ap.add_argument("--gemini-review", default=DEFAULT_GEMINI_REVIEW,
-                    dest="gemini_review",
-                    help="Claude 審 gemini 證據的判斷 CSV（--from gemini-review 用）")
+                    help="人工讀 title 的判斷 CSV（--from codex/claude/tbd 用）")
+    ap.add_argument("--reviewer", choices=sorted(REVIEWERS), default=None,
+                    help="⚠️ --from gemini-review 必填：哪一條審核線。"
+                         "讀哪份稽核檔與蓋哪個章都由它決定（見 verifier_for）")
+    ap.add_argument("--gemini-review", default=None, dest="gemini_review",
+                    help="審 gemini 證據的判斷 CSV（預設由 --reviewer 決定）")
     ap.add_argument("--dry-run", action="store_true", help="只印候選數，不送出")
     args = ap.parse_args()
 
-    by = verifier_for(args.src)          # ⚠️ 來源名 ≠ 蓋的章（見 verifier_for）
+    # ⚠️ 來源名 ≠ 蓋的章（見 verifier_for）。gemini-review 缺 --reviewer 會在這裡
+    # 就結束，不會走到「讀了 A 的檔、蓋了 B 的章」那種半套狀態。
+    by = verifier_for(args.src, args.reviewer)
     if args.src == "mops":
         items = items_from_mops(args.baseline)
     elif args.src == "gemini":
         items = items_from_gemini(args.bench)
     elif args.src == "gemini-review":
-        items = items_from_gemini_review(args.gemini_review)
+        items = items_from_gemini_review(
+            args.gemini_review or gemini_review_csv_for(args.reviewer))
     else:
         items = items_from_review(args.review, args.src)
     print(f"來源 {args.src}：候選 {len(items)} 筆"

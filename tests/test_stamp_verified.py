@@ -194,8 +194,12 @@ class TestItemsFromGeminiReview(unittest.TestCase):
                          [{"stock_id": "1101", "roc_year": 109,
                            "roc_month": 1, "date": "2020-02-10"}])
 
-    def test_stamps_as_claude_not_gemini(self):
-        self.assertEqual(sv.verifier_for("gemini-review"), "claude")
+    def test_stamps_as_the_reviewer_never_as_gemini(self):
+        # ⚠️ 這條路蓋的是【審核者】的章。蓋成 gemini 等於宣稱有第二個獨立來源，
+        # 而且會在 VERIFIER_RANK 裡爬到審核者之上、覆蓋掉不該覆蓋的章。
+        for name in sv.REVIEWERS:
+            self.assertEqual(sv.verifier_for("gemini-review", name), name)
+            self.assertNotEqual(sv.verifier_for("gemini-review", name), "gemini")
         self.assertEqual(sv.verifier_for("mops"), "mops")
 
     def test_unknown_verdict_is_rejected(self):
@@ -301,6 +305,68 @@ class TestPostPayload(unittest.TestCase):
         self.assertEqual(seen["url"], "http://h:8000/verify")   # 尾斜線不可變成 //verify
         self.assertEqual(seen["auth"], "Bearer SECRET")
         self.assertIn(b'"by": "mops"', seen["body"])
+
+
+class TestReviewerDrivesTheStamp(unittest.TestCase):
+    """--from gemini-review 有兩條線（claude / codex），讀哪份檔與蓋哪個章
+    必須來自**同一個** Reviewer，不可以各自查表。
+
+    ⚠️ 這是 2026-09-02 那個 bug 的正臉：稽核檔換成了 codex 那份，蓋章值卻還是
+    另一個字——兩邊各改各的、程式不報錯。所以這裡不驗「值對不對」，驗的是
+    「兩個值是不是同一個來源給的」。
+    """
+
+    def test_the_registry_is_the_writers_not_a_copy(self):
+        # 表頭那條規矩（test_header_is_the_writers_schema_not_a_copy）同一個道理：
+        # 寫的人宣告，讀的人 import。抄一份就會漂。
+        from worker.gemini_worker import REVIEWERS
+        self.assertIs(sv.REVIEWERS, REVIEWERS)
+
+    def test_each_reviewer_stamps_its_own_name(self):
+        for name, r in sv.REVIEWERS.items():
+            self.assertEqual(sv.verifier_for("gemini-review", name), r.stamp)
+
+    def test_each_reviewer_reads_its_own_csv(self):
+        seen = set()
+        for name, r in sv.REVIEWERS.items():
+            path = sv.gemini_review_csv_for(name)
+            self.assertEqual(path, r.csv)
+            seen.add(path)
+        self.assertEqual(len(seen), len(sv.REVIEWERS))
+
+    def test_gemini_review_without_a_reviewer_is_refused(self):
+        # 猜錯的代價是「一整批蓋上別人的章」，寧可拒收。
+        with self.assertRaises(SystemExit):
+            sv.verifier_for("gemini-review", None)
+
+    def test_other_sources_are_unaffected(self):
+        self.assertEqual(sv.verifier_for("mops", None), "mops")
+        self.assertEqual(sv.verifier_for("claude", None), "claude")
+
+
+class TestBothStampsAreLegalAndEqualRank(unittest.TestCase):
+    """兩條線的章都必須是 server 認得的值，而且**同一階**。
+
+    ⚠️ 若其中一個排名較高，兩條線審同一個月份時，後蓋的會默默覆蓋前一個
+    ——但它們的證據強度其實一樣（都是「讀模型自己回的那段文字」）。
+    """
+
+    def test_every_stamp_is_on_the_server_whitelist(self):
+        import server
+        for r in sv.REVIEWERS.values():
+            self.assertIn(r.stamp, server.VERIFIERS, r.stamp)
+
+    def test_the_two_lines_rank_the_same(self):
+        import server
+        ranks = {server.VERIFIER_RANK[r.stamp] for r in sv.REVIEWERS.values()}
+        self.assertEqual(len(ranks), 1, ranks)
+
+    def test_neither_line_outranks_gemini_itself(self):
+        # 讀 gemini 交回的證據 ≠ 第二個獨立來源（見 verifier_for 的註解）。
+        import server
+        for r in sv.REVIEWERS.values():
+            self.assertLess(server.VERIFIER_RANK[r.stamp],
+                            server.VERIFIER_RANK["gemini"], r.stamp)
 
 
 if __name__ == "__main__":

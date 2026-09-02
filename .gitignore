@@ -44,4 +44,10 @@ tmp/
 goodinfo/basicInfo/
 
 # gemini_worker 審核模式的交接檔（執行期產物，回報完就刪；勿進版控）
+# ⚠️ 用萬用字元：每一條審核線各有自己的交接檔（.claude.json／.codex.json，
+# 見 gemini_worker 的 REVIEWERS），釘死單一檔名會漏掉新的線。
 .gemini_review_pending.json
+.gemini_review_pending.*.json
+
+# Codex CLI 的本機設定（含 approval_policy/sandbox_mode，屬個人環境選擇，勿進版控）
+.codex/
