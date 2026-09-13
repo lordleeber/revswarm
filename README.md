@@ -67,7 +67,7 @@
 | `mops/mops_validate.py` | 用 MOPS 官方申報日**交叉驗證** Yahoo 抓到的公布日（見下）|
 | `stamp_verified.py` | 把「兩個獨立來源同意」的列蓋上 `verified` 欄（見「出處與驗證」）|
 | `backfill_revenue.py` | 從既有 `raw_title` 回填 `revenue`/`yoy`（不重爬，見下）|
-| `export_publish_time.py` | 把 `verified` 蓋過章（`mops`/`gemini`/`claude`/`codex`，不含 `tbd`）的公布日寫進 my_stock_project 的 `data/raw/monthly_revenue/*/*/market.csv` 的 `publish_time`；只改既有 symbol 那一格，沒章的保留原本回填的截止日（冪等，先 `--dry-run`）|
+| `export_publish_time.py` | 把 `verified` 蓋過章（`mops`/`gemini`/`claude`/`codex`，不含 `tbd`）的公布日寫進 my_stock_project 的 `data/raw/monthly_revenue/*/*/market.csv` 的 `publish_time`；只改既有 symbol 那一格，沒章的保留原本回填的截止日；只處理到 2026M01（之後已是 scraper 的真實日，不覆蓋）（冪等，先 `--dry-run`）|
 
 **核心零第三方依賴**，只需 `python3`（3.8+）與 `curl`。worker 機器 `git clone` 本 repo 就能跑，不必額外安裝任何東西。
 唯一的例外是 `google_worker.py` 需要 playwright（`requirements.txt`），只在要跑 Google 補搜的機器上裝。

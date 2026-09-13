@@ -134,6 +134,19 @@ class TestApplyMonth(Base):
         self.assertEqual(res["later"], ["1101"])
         self.assertEqual(res["updated"], 2)
 
+    def test_file_that_does_not_round_trip_is_refused(self):
+        # 2026M02 起的檔是 scraper 直接寫的：無 BOM、LF。csv.writer 寫回會變成 BOM+CRLF，
+        # 等於整檔改寫，違反「只動那一格」→ 拒寫，檔案一個 byte 都不能變
+        d = os.path.join(self.root, "2026", "2026M02")
+        os.makedirs(d)
+        p = os.path.join(d, "market.csv")
+        raw = ",".join(HEADER).encode() + b"\n1101,x,1,-,SII,20260310\n"
+        with io.open(p, "wb") as f:
+            f.write(raw)
+        with self.assertRaises(ValueError):
+            ept.apply_month(p, {"1101": "20260309"})
+        self.assertEqual(io.open(p, "rb").read(), raw)
+
     def test_missing_publish_time_column_is_refused(self):
         d = os.path.join(self.root, "2020", "2020M01")
         os.makedirs(d)
@@ -158,6 +171,19 @@ class TestRun(Base):
         self.assertEqual(_read_market(tmp)[1][-1], "20200210")
         self.assertEqual(summary["updated"], 1)
         self.assertEqual(summary["missing_files"], [(2020, 2)])
+
+    def test_months_after_backfill_era_are_skipped(self):
+        # 2026M02 起 publish_time 是 scraper 抓到的真實日，不是回填的截止日 → 不覆蓋
+        _make_db(self.db, [
+            ("1101", 115, 1, "success", "2026-02-06", "claude"),
+            ("1101", 115, 2, "success", "2026-03-06", "claude"),
+        ])
+        p1 = _write_market(self.root, 2026, 1, [["1101", "x", "1", "-", "SII", "20260210"]])
+        p2 = _write_market(self.root, 2026, 2, [["1101", "x", "1", "-", "SII", "20260310"]])
+        summary = ept.run(self.db, self.root)
+        self.assertEqual(_read_market(p1)[1][-1], "20260206")
+        self.assertEqual(_read_market(p2)[1][-1], "20260310")
+        self.assertEqual(summary["skipped_months"], [(2026, 2)])
 
 
 if __name__ == "__main__":
